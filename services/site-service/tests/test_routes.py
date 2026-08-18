@@ -106,3 +106,107 @@ def test_delete_site_returns_404_when_missing():
 
     assert response.status_code == 404
     assert response.json() == {"detail": "Site not found"}
+
+
+def _create_site(name="CalSite"):
+    return client.post(SITES, json={"name": name, "url": "s3://v", "mode": "video"}).json()
+
+
+def test_unprefixed_calibrations_path_is_not_served():
+    site = _create_site()
+
+    assert client.get(f"/sites/{site['id']}/calibrations").status_code == 404
+
+
+def test_create_calibration_returns_201_with_version_one():
+    site = _create_site()
+
+    response = client.post(
+        f"{SITES}/{site['id']}/calibrations", json={"url": "s3://cal/v1.json"}
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["version"] == 1
+    assert body["site_id"] == site["id"]
+    assert body["url"] == "s3://cal/v1.json"
+
+
+def test_create_calibration_returns_404_for_unknown_site():
+    response = client.post(f"{SITES}/does-not-exist/calibrations", json={"url": "s3://a"})
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Site not found"}
+
+
+def test_create_calibration_returns_422_without_url():
+    site = _create_site()
+
+    response = client.post(f"{SITES}/{site['id']}/calibrations", json={})
+
+    assert response.status_code == 422
+
+
+def test_get_calibrations_returns_the_active_version():
+    site = _create_site()
+    client.post(f"{SITES}/{site['id']}/calibrations", json={"url": "s3://cal/v1.json"})
+    client.post(f"{SITES}/{site['id']}/calibrations", json={"url": "s3://cal/v2.json"})
+
+    response = client.get(f"{SITES}/{site['id']}/calibrations")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["version"] == 2
+    assert body["url"] == "s3://cal/v2.json"
+
+
+def test_get_calibrations_returns_404_when_site_has_none():
+    site = _create_site()
+
+    response = client.get(f"{SITES}/{site['id']}/calibrations")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Calibration not found"}
+
+
+def test_get_calibrations_returns_404_for_unknown_site():
+    response = client.get(f"{SITES}/does-not-exist/calibrations")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Site not found"}
+
+
+def test_get_calibration_by_id_returns_an_older_version():
+    site = _create_site()
+    first = client.post(
+        f"{SITES}/{site['id']}/calibrations", json={"url": "s3://cal/v1.json"}
+    ).json()
+    client.post(f"{SITES}/{site['id']}/calibrations", json={"url": "s3://cal/v2.json"})
+
+    response = client.get(f"{SITES}/{site['id']}/calibrations/{first['id']}")
+
+    assert response.status_code == 200
+    assert response.json()["version"] == 1
+
+
+def test_get_calibration_by_id_returns_404_for_another_sites_calibration():
+    owner = _create_site("owner")
+    stranger = _create_site("stranger")
+    calibration = client.post(
+        f"{SITES}/{owner['id']}/calibrations", json={"url": "s3://cal/v1.json"}
+    ).json()
+
+    response = client.get(f"{SITES}/{stranger['id']}/calibrations/{calibration['id']}")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Calibration not found"}
+
+
+def test_delete_site_with_calibrations_returns_204():
+    site = _create_site()
+    client.post(f"{SITES}/{site['id']}/calibrations", json={"url": "s3://cal/v1.json"})
+
+    response = client.delete(f"{SITES}/{site['id']}")
+
+    assert response.status_code == 204
+    assert client.get(f"{SITES}/{site['id']}").status_code == 404
