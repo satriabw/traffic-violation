@@ -1,0 +1,3 @@
+{
+    "extraPaths": ["shared/src", "services/site-service"]
+}
