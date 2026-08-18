@@ -24,6 +24,11 @@ Run site-service:
 PYTHONPATH=shared/src:services/site-service .venv/bin/uvicorn site_service.main:app --reload --port 8001
 ```
 
+Endpoints are served under `/api/v1` — e.g. `http://localhost:8001/api/v1/sites`.
+Services mount that prefix themselves and the gateway does not rewrite it, so the
+path is identical whether a request arrives through the gateway or goes directly to
+the service. `/health` is served at the root, outside the prefix.
+
 Site data is stored in a local DuckDB file at `./data/site_service.duckdb`
 (override with `SITE_SERVICE_DB_PATH`). No AWS/S3, queue, or docker required
 for this slice — site creation only persists metadata (status `created`);

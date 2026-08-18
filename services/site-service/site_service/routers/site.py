@@ -7,16 +7,16 @@ from shared.models.site import SiteCreate, SiteListResponse, SiteMode, SiteRespo
 from site_service import service
 from site_service.db import get_db
 
-router = APIRouter(tags=["site"])
+router = APIRouter(prefix="/sites", tags=["sites"])
 DbConnection = Annotated[duckdb.DuckDBPyConnection, Depends(get_db)]
 
 
-@router.post("/site", response_model=SiteResponse, status_code=201)
+@router.post("", response_model=SiteResponse, status_code=201)
 def create_site(data: SiteCreate, con: DbConnection):
     return service.create_site(con, data)
 
 
-@router.get("/site", response_model=SiteListResponse)
+@router.get("", response_model=SiteListResponse)
 def list_sites(
     con: DbConnection,
     limit: int = Query(20, ge=1, le=100),
@@ -33,7 +33,7 @@ def list_sites(
     )
 
 
-@router.get("/site/{site_id}", response_model=SiteResponse)
+@router.get("/{site_id}", response_model=SiteResponse)
 def get_site(site_id: str, con: DbConnection):
     site = service.get_site(con, site_id)
     if site is None:
@@ -41,7 +41,7 @@ def get_site(site_id: str, con: DbConnection):
     return site
 
 
-@router.delete("/site/{site_id}", status_code=204)
+@router.delete("/{site_id}", status_code=204)
 def delete_site(site_id: str, con: DbConnection):
     deleted = service.delete_site(con, site_id)
     if not deleted:

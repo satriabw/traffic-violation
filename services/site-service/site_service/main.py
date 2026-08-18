@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from shared.config import API_V1_PREFIX
 
 from site_service.db import get_db, init_app_db
 from site_service.routers.site import router as site_router
@@ -13,6 +14,11 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="site-service", lifespan=lifespan)
-app.include_router(site_router)
+app.include_router(site_router, prefix=API_V1_PREFIX)
+
+
+@app.get("/health", include_in_schema=False)
+def health():
+    return {"status": "ok"}
 
 __all__ = ["app", "get_db"]
