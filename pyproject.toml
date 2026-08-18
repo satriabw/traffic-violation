@@ -1,0 +1,2 @@
+[tool.pytest.ini_options]
+pythonpath = ["shared/src", "services/site-service"]
