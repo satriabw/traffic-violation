@@ -1,0 +1,4 @@
+# Test-only dependencies. Runtime deps come from the packages themselves
+# (shared/pyproject.toml, services/*/pyproject.toml).
+pytest>=8
+httpx>=0.27   # required by fastapi.testclient.TestClient
