@@ -4,7 +4,7 @@
 
 ```
 python3 -m venv .venv
-.venv/bin/pip install -e ./shared -e ./services/site-service
+.venv/bin/pip install -e ./shared -e ./services/site-service -e ./workers/detection-worker
 ```
 
 Note: on macOS, `pip install -e` can silently no-op — files it creates starting
@@ -50,10 +50,22 @@ writer, so site-service owns the file and every resource below lives in it —
 including files, which the LLD gives to a separate file-service. Splitting that
 out later is a gateway config change, since routing is by resource prefix.
 
-No queue or docker is required yet. Site creation only persists metadata (status
-`created`); video metadata extraction and job enqueueing are deferred to a later
-slice. Object storage (R2) is needed only for the file endpoints — the test suite
-never touches it.
+Redis is needed only to *run* detection jobs for real, and it runs in a container so
+nothing is installed on the host:
+
+```
+docker compose up -d redis     # from the repo root
+docker compose down            # when you are done
+```
+
+It holds no volume and persists nothing, so `down` takes the queue with it and no
+Redis is left running when you are not working on this. Any Docker-compatible runtime
+serves — Docker Desktop, Colima, OrbStack — or point `REDIS_URL` at one you already
+have and skip compose entirely.
+
+The test suite drives the queue through an injected fake and never connects to Redis,
+the same way it never touches R2. Object storage is likewise needed only for the file
+endpoints.
 
 ### Sites and sources
 
@@ -98,8 +110,82 @@ site that used to be a video and is now a stream reads as a stream site.
 Request bodies for sites and sources reject unknown fields. A client still sending the
 old top-level `mode`/`url` gets a 422 rather than a silently source-less site.
 
-`sites.metadata` extraction and job enqueueing — which the LLD hangs off `POST /sites`
-— are still deferred; both need real infrastructure.
+The LLD hangs job enqueueing off `POST /sites` itself. Here it is a separate
+`POST /sites/{id}/detect` (below): creating a site and asking for detection are
+different decisions, and a site whose video is uploaded later has nothing to enqueue at
+creation time.
+
+### Detection jobs
+
+Detection is asynchronous: the API accepts the work and a separate process does it.
+
+```
+POST /api/v1/sites/{site_id}/detect   {}                              -> 202
+POST /api/v1/sites/{site_id}/detect   {"types": ["red_light_running"]}
+```
+
+```json
+{
+  "id": "9f0c...",
+  "site_id": "3a1b...",
+  "frame_range": {"start": 0, "end": 27000},
+  "types": ["red_light_running", "pedestrian_right_of_way"]
+}
+```
+
+202 rather than 201: nothing was created — the work was accepted, and the `id` that
+comes back is what identifies it downstream. The response body *is* the queued message
+(`shared/models/detection.py`), which is the contract between site-service and
+detection-worker; the two share no database.
+
+`frame_range` is not something the client sends. It is derived from the active source's
+probed `total_frames`, in frame indices rather than seconds — variable-rate footage
+makes a time offset ambiguous, which is why the source keeps `fps` and `nominal_fps`
+apart. `types` defaults to every type the system knows, so the list can grow without
+updating callers.
+
+Everything that can go wrong is about the site's *state*, so it is 409 rather than 422 —
+the request is well formed, and the identical one succeeds once a video is attached:
+
+| Problem | Status |
+|---|---|
+| unknown site | 404 |
+| site has no source | 409 |
+| active source is a stream | 409 |
+| video was never successfully probed | 409 |
+
+A stream is rejected because a live feed has no frame count to bound a job with. The
+LLD gives streams to a supervisor worker that spawns long-running consumers, which is a
+different mechanism from enqueueing a bounded job.
+
+One job covers the whole video today. The LLD's 30-second chunks with 10-second overlap
+are what make violations at a chunk boundary detectable, and they arrive with the
+pipeline that needs them.
+
+### The queue and the worker
+
+A Redis list, not Celery or RQ: this hop needs push and pop, and a list keeps the
+worker's entrypoint ordinary Python rather than a framework's. `LPUSH` at the head,
+`BRPOP` at the tail — that pairing is what makes it FIFO.
+
+```
+PYTHONPATH=shared/src:workers/detection-worker .venv/bin/python -m detection_worker.worker
+```
+
+The worker logs each job and moves on. That is the whole stub — the pipeline the LLD
+describes (source → detect → track → evaluate → store) hangs off `handle` in
+`workers/detection-worker/detection_worker/worker.py` when it exists, and nothing
+writes violations yet.
+
+`shared/queue/` holds two implementations of one shape, `enqueue` / `consume`:
+`RedisQueue`, and an `InMemoryQueue` that lets the worker run a job through without
+Redis anywhere. The difference that matters is what `consume()` does when empty —
+`InMemoryQueue` returns `None`, `BRPOP` blocks — so the same loop in `run()` drains an
+in-memory queue once and keeps a deployed worker waiting indefinitely.
+
+A handler that raises stops the worker rather than dropping the job. Retry and a
+dead-letter queue are marked FUTURE in the LLD; until they exist, failing loudly beats
+losing work quietly.
 
 ### Calibrations and configurations
 

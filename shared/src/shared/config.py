@@ -31,6 +31,13 @@ S3_MAX_UPLOAD_BYTES = int(os.environ.get("S3_MAX_UPLOAD_BYTES", str(100 * 1024 *
 S3_PUBLIC_BASE_URL = os.environ.get("S3_PUBLIC_BASE_URL", "").rstrip("/")
 
 
+# --- Message queue --------------------------------------------------------
+# A Redis list carries detection jobs from site-service to detection-worker. Only a
+# real run needs it: the test suite drives the queue through an injected fake.
+REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+DETECTION_QUEUE_NAME = os.environ.get("DETECTION_QUEUE_NAME", "detection:jobs")
+
+
 # --- Video probing --------------------------------------------------------
 # How long ffprobe gets to read a video's header before we give up and call the
 # attempt transient. It runs inside a request, so this is also the worst case a

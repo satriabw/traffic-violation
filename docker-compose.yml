@@ -1,0 +1,19 @@
+# Development infrastructure. Only Redis for now — the services themselves still run
+# on the host (see the README), so this is the seed of the compose file the LLD
+# describes rather than the whole thing.
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    # No persistence and no volume: a detection job is a request to do work now, and
+    # a queue restored from a dump replays jobs whose video may be long gone. It also
+    # hides the fact that nothing ever consumed them.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      # Lets `docker compose up -d --wait` block until the queue actually accepts
+      # connections, rather than racing the worker's first BRPOP.
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
