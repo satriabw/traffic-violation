@@ -31,6 +31,13 @@ S3_MAX_UPLOAD_BYTES = int(os.environ.get("S3_MAX_UPLOAD_BYTES", str(100 * 1024 *
 S3_PUBLIC_BASE_URL = os.environ.get("S3_PUBLIC_BASE_URL", "").rstrip("/")
 
 
+# --- Video probing --------------------------------------------------------
+# How long ffprobe gets to read a video's header before we give up and call the
+# attempt transient. It runs inside a request, so this is also the worst case a
+# client waits on source creation.
+VIDEO_PROBE_TIMEOUT_SECONDS = float(os.environ.get("VIDEO_PROBE_TIMEOUT_SECONDS", "20"))
+
+
 def missing_s3_settings() -> list[str]:
     """Names of the object-storage settings that have no value.
 

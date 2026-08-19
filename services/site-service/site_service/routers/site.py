@@ -8,22 +8,25 @@ from shared.models.source import SourceKind, SourceStatus
 from site_service import service
 from site_service.db import get_db
 from site_service.routers.source import validate_source
+from site_service.storage import Storage
+from site_service.video import Probe
 
 router = APIRouter(prefix="/sites", tags=["sites"])
 DbConnection = Annotated[duckdb.DuckDBPyConnection, Depends(get_db)]
 
 
 @router.post("", response_model=SiteResponse, status_code=201)
-def create_site(data: SiteCreate, con: DbConnection):
+def create_site(data: SiteCreate, con: DbConnection, storage: Storage, probe: Probe):
     """Create a site, optionally pointing it at something in the same request.
 
     A site with no source is valid — the stream url can be added or changed later.
     """
+    metadata = None
     if data.source is not None:
-        # Same validation the dedicated source endpoint applies, so the two entry
-        # points cannot drift apart.
-        validate_source(con, data.source)
-    return service.create_site(con, data)
+        # Same validation and probing the dedicated source endpoint applies, so the
+        # two entry points cannot drift apart.
+        metadata = validate_source(con, storage, probe, data.source)
+    return service.create_site(con, data, metadata)
 
 
 @router.get("", response_model=SiteListResponse)

@@ -14,6 +14,11 @@ with `__` get the Finder "hidden" flag, and CPython's `site.py` skips hidden
 on `PYTHONPATH` as shown below (tests already do this via `pythonpath` in
 `pyproject.toml`, no install needed for running the test suite).
 
+`ffprobe` (part of ffmpeg) must be on `PATH` — the site-service shells out to it to
+read a video's metadata when a video source is created. `brew install ffmpeg` on
+macOS, `apt-get install ffmpeg` in a container. Without it, creating a video source
+returns 502; the probe tests skip rather than fail.
+
 Run tests:
 ```
 .venv/bin/pytest

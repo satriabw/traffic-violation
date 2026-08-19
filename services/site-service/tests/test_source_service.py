@@ -1,7 +1,9 @@
+import json
+
 import pytest
 from shared.models.file import FileCreate, FileType
 from shared.models.site import SiteCreate
-from shared.models.source import SourceCreate, SourceKind, SourceStatus
+from shared.models.source import SourceCreate, SourceKind, SourceMetadata, SourceStatus
 
 from site_service import service
 from tests.test_file_service import FakeStorage
@@ -150,3 +152,35 @@ def test_delete_site_removes_its_sources(con, site):
 
     assert service.delete_site(con, site.id) is True
     assert con.execute("SELECT COUNT(*) FROM site_sources").fetchone()[0] == 0
+
+
+def test_metadata_is_decoded_back_into_a_model(con, site):
+    # DuckDB returns a JSON column as a string, and Pydantic will not coerce a string
+    # into a nested model — without an explicit decode this is a 500 on every read of
+    # a source that has metadata.
+    source = service.create_source(con, site.id, _stream())
+    con.execute(
+        "UPDATE site_sources SET metadata = ? WHERE id = ?",
+        [json.dumps({"fps": 30.0, "nominal_fps": 30.0, "total_frames": 900}), source.id],
+    )
+
+    fetched = service.get_source(con, site.id, source.id)
+
+    assert fetched.metadata.fps == 30.0
+    assert fetched.metadata.total_frames == 900
+
+
+def test_a_source_without_metadata_reads_back_as_none(con, site):
+    source = service.create_source(con, site.id, _stream())
+
+    assert service.get_source(con, site.id, source.id).metadata is None
+
+
+def test_create_source_persists_the_metadata_it_is_given(con, site):
+    meta = SourceMetadata(fps=29.97, nominal_fps=30.0, total_frames=1000)
+
+    created = service.create_source(con, site.id, _stream(), metadata=meta)
+
+    assert created.metadata.fps == 29.97
+    assert created.metadata.nominal_fps == 30.0
+    assert service.get_source(con, site.id, created.id).metadata.total_frames == 1000

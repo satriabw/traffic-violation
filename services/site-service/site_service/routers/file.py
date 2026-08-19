@@ -7,13 +7,12 @@ from shared.models.file import FileCreate, FileResponse, FileUploadResponse
 
 from site_service import service
 from site_service.db import get_db
-from site_service.storage import get_storage
+from site_service.storage import Storage
 
 # Files are a top-level resource: a video belongs to a site, but a calibration or an
 # evidence frame does not, so nesting them under one would be wrong.
 router = APIRouter(prefix="/files", tags=["files"])
 DbConnection = Annotated[duckdb.DuckDBPyConnection, Depends(get_db)]
-Storage = Annotated[object, Depends(get_storage)]
 
 
 @router.post("", response_model=FileUploadResponse, status_code=201)

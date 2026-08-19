@@ -2,6 +2,12 @@
 
 Only presigning and existence checks live here: file bytes never pass through any
 service, so there is deliberately no upload() or download() call to reach for.
+
+One bounded exception exists outside this module. shared.video.probe hands a
+presigned URL to ffprobe, which range-requests a video's container header — a couple
+of megabytes whatever the object's size — to read its metadata once at source
+creation. That is a header read, not a transfer, and it is still no reason to add a
+download() here.
 """
 
 from functools import lru_cache

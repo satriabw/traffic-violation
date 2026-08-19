@@ -23,7 +23,13 @@ class SourceStatus(str, Enum):
 
 class SourceMetadata(BaseModel):
     total_frames: int | None = None
+    # The measured average rate — the one to use for any frame-index-to-time maths.
     fps: float | None = None
+    # The rate the container declares. Equal to fps for constant-rate footage; when
+    # the two differ the source is variable-rate, and a frame index no longer maps to
+    # a wall-clock offset by division alone. Storing both is what makes that
+    # detectable rather than silent, which matters once speeds are derived from it.
+    nominal_fps: float | None = None
     duration_seconds: float | None = None
     resolution: dict | None = None
 

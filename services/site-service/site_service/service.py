@@ -1,3 +1,4 @@
+import json
 import uuid
 
 import duckdb
@@ -11,7 +12,7 @@ from shared.models.file import (
 )
 from shared.models.versioned_document import VersionedDocument
 from shared.models.site import SiteCreate, SiteListResponse, SiteResponse
-from shared.models.source import SourceCreate, SourceResponse
+from shared.models.source import SourceCreate, SourceMetadata, SourceResponse
 from shared.s3.keys import build_key
 
 _COLUMNS = ("id", "name", "created_at", "updated_at")
@@ -23,13 +24,17 @@ def _row_to_site(con: duckdb.DuckDBPyConnection, row: tuple) -> SiteResponse:
     return SiteResponse(**data, source=get_active_source(con, data["id"]))
 
 
-def create_site(con: duckdb.DuckDBPyConnection, data: SiteCreate) -> SiteResponse:
+def create_site(
+    con: duckdb.DuckDBPyConnection,
+    data: SiteCreate,
+    source_metadata: SourceMetadata | None = None,
+) -> SiteResponse:
     site_id = str(uuid.uuid4())
     con.execute("INSERT INTO sites (id, name) VALUES (?, ?)", [site_id, data.name])
     if data.source is not None:
         # Sugar for the caller, not a second code path: the inline source goes through
-        # the same function POST /sites/{id}/sources uses.
-        create_source(con, site_id, data.source)
+        # the same function POST /sites/{id}/sources uses, metadata included.
+        create_source(con, site_id, data.source, source_metadata)
     return get_site(con, site_id)
 
 
@@ -283,24 +288,41 @@ _SOURCE_COLUMNS = (
 
 
 def _row_to_source(row: tuple) -> SourceResponse:
-    return SourceResponse(**dict(zip(_SOURCE_COLUMNS, row)))
+    data = dict(zip(_SOURCE_COLUMNS, row))
+    # DuckDB hands a JSON column back as text, and Pydantic will not coerce a string
+    # into a nested model, so the decode is explicit rather than implied.
+    if isinstance(data.get("metadata"), str):
+        data["metadata"] = json.loads(data["metadata"])
+    return SourceResponse(**data)
 
 
 def create_source(
-    con: duckdb.DuckDBPyConnection, site_id: str, data: SourceCreate
+    con: duckdb.DuckDBPyConnection,
+    site_id: str,
+    data: SourceCreate,
+    metadata: SourceMetadata | None = None,
 ) -> SourceResponse:
-    """Append a new source version. Callers validate a video's file first — see
-    site_service.file_reference."""
+    """Append a new source version.
+
+    Callers validate a video's file and read its metadata first — see
+    site_service.routers.source.validate_source. Both arrive here as plain data so
+    this layer stays pure database work with no network of its own.
+    """
     source_id = str(uuid.uuid4())
     version = _next_version(con, "site_sources", site_id)
     # Exactly one of stream_url / file_id is set: SourceCreate's validator and the
     # table CHECK both guarantee it, so no branching is needed here.
     con.execute(
         """
-        INSERT INTO site_sources (id, site_id, version, kind, stream_url, file_id)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO site_sources (id, site_id, version, kind, stream_url, file_id, metadata)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
-        [source_id, site_id, version, data.kind.value, data.stream_url, data.file_id],
+        [
+            source_id, site_id, version, data.kind.value, data.stream_url, data.file_id,
+            # NULL means "never probed", which is why unset fields are dropped rather
+            # than written as nulls inside the document.
+            json.dumps(metadata.model_dump(exclude_none=True)) if metadata else None,
+        ],
     )
     return get_source(con, site_id, source_id)
 

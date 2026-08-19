@@ -5,7 +5,9 @@ from shared.db.init import init_db
 
 from site_service.main import app, get_db
 from site_service.storage import get_storage
+from site_service.video import get_probe
 from tests.test_file_service import FakeStorage
+from tests.test_source_routes import FakeProbe
 
 # Spelled out rather than imported from shared.config so the tests pin the wire
 # path clients actually call, and a change to the prefix has to be deliberate.
@@ -15,6 +17,7 @@ STREAM = {"kind": "stream", "stream_url": "rtsp://10.0.0.5/s"}
 _test_con = get_connection(":memory:")
 init_db(_test_con)
 _storage = FakeStorage(existing_size=64)
+_probe = FakeProbe()
 
 
 def override_get_db():
@@ -23,6 +26,10 @@ def override_get_db():
 
 def override_get_storage():
     yield _storage
+
+
+def override_get_probe():
+    yield _probe
 
 
 client = TestClient(app)
@@ -35,6 +42,7 @@ def _dependency_overrides():
     # module's connection and storage every test gets.
     app.dependency_overrides[get_db] = override_get_db
     app.dependency_overrides[get_storage] = override_get_storage
+    app.dependency_overrides[get_probe] = override_get_probe
     yield
     app.dependency_overrides.clear()
 
