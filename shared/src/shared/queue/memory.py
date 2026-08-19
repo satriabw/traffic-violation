@@ -16,12 +16,11 @@ class InMemoryQueue:
     def enqueue(self, job: DetectionJob) -> None:
         self._jobs.append(job)
 
-    def consume(self, timeout: int = 0) -> DetectionJob | None:
+    def consume(self) -> DetectionJob | None:
         """The next job, or None once drained.
 
         Nothing can arrive while a single-threaded caller is blocked here, so an empty
-        queue returns immediately rather than honouring `timeout` — that is what stops
-        the worker loop against this queue while the same loop runs forever against
-        Redis.
+        queue returns immediately. That None is what stops the worker loop against this
+        queue, while RedisQueue.consume simply never returns one.
         """
         return self._jobs.popleft() if self._jobs else None

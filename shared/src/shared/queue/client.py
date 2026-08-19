@@ -14,6 +14,16 @@ import redis
 from shared import config
 from shared.models.detection import DetectionJob
 
+# How long one BRPOP waits before we issue another. It must stay *below* the
+# connection's socket timeout: BRPOP with 0 ("wait forever") outlives redis-py's
+# 5-second default and an idle worker dies with "Timeout reading from socket", which
+# looks like a network fault and is really just a quiet queue.
+BLOCK_SECONDS = 5
+
+# Slack over BLOCK_SECONDS so the server always answers first. Finite rather than
+# None so a genuinely dead connection still surfaces instead of hanging forever.
+SOCKET_TIMEOUT_SECONDS = BLOCK_SECONDS * 2
+
 
 class RedisQueue:
     def __init__(self, client, name: str):
@@ -25,18 +35,23 @@ class RedisQueue:
     def enqueue(self, job: DetectionJob) -> None:
         self._client.lpush(self._name, job.model_dump_json())
 
-    def consume(self, timeout: int = 0) -> DetectionJob | None:
-        """The next job, waiting for one to arrive.
+    def consume(self) -> DetectionJob:
+        """The next job, waiting as long as it takes for one to arrive.
 
-        Returns None only when `timeout` elapses first. The default of 0 means BRPOP
-        blocks indefinitely, which is what a worker wants — polling would cost a round
-        trip per interval to learn nothing.
+        Never returns None: an empty queue means "not yet", not "stop". That is what
+        keeps `None` in the worker loop meaning only what InMemoryQueue means by it —
+        drained, nothing more is coming.
+
+        The waiting is a series of bounded BRPOPs rather than one unbounded one. Each
+        window costs a single round trip every BLOCK_SECONDS, so this is still
+        blocking rather than polling, but the connection is never idle long enough for
+        the socket timeout to fire.
         """
-        reply = self._client.brpop(self._name, timeout)
-        if reply is None:
-            return None
-        _, payload = reply
-        return DetectionJob.model_validate_json(payload)
+        while True:
+            reply = self._client.brpop(self._name, BLOCK_SECONDS)
+            if reply is not None:
+                _, payload = reply
+                return DetectionJob.model_validate_json(payload)
 
 
 def from_config() -> RedisQueue:
@@ -44,6 +59,10 @@ def from_config() -> RedisQueue:
     # decode_responses so payloads come back as str: model_validate_json accepts
     # bytes too, but every other reader would have to remember to decode.
     return RedisQueue(
-        redis.Redis.from_url(config.REDIS_URL, decode_responses=True),
+        redis.Redis.from_url(
+            config.REDIS_URL,
+            decode_responses=True,
+            socket_timeout=SOCKET_TIMEOUT_SECONDS,
+        ),
         config.DETECTION_QUEUE_NAME,
     )

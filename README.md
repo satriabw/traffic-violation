@@ -24,11 +24,27 @@ Run tests:
 .venv/bin/pytest
 ```
 
-Run site-service:
+Run everything locally — three processes, one per terminal, all from the repo root:
+
 ```
-set -a; source .env; set +a   # R2 credentials — see .env.example
+# 1. the queue
+redis-server dev/redis.conf
+
+# 2. the API
+set -a; source .env; set +a
 PYTHONPATH=shared/src:services/site-service .venv/bin/uvicorn site_service.main:app --reload --port 8001
+
+# 3. the detection worker
+set -a; source .env; set +a
+PYTHONPATH=shared/src:workers/detection-worker .venv/bin/python -m detection_worker.worker
 ```
+
+Source `.env` in **each** shell that needs it. The worker reads `REDIS_URL` from the
+same environment uvicorn does, so a worker started in an unsourced shell quietly talks
+to the default localhost instead of wherever you pointed it.
+
+Only the API is needed to browse sites, files, and calibrations. Redis is needed to
+accept a detection job, and the worker to consume one — see below.
 
 Config is read from the process environment only (`shared/config.py` is plain
 `os.environ`); `.env` is just a convenient way to populate a local shell, and is
@@ -50,18 +66,21 @@ writer, so site-service owns the file and every resource below lives in it —
 including files, which the LLD gives to a separate file-service. Splitting that
 out later is a gateway config change, since routing is by resource prefix.
 
-Redis is needed only to *run* detection jobs for real, and it runs in a container so
-nothing is installed on the host:
+Redis is needed only to *run* detection jobs for real. `brew install redis` for the
+binary, then start it from the repo root:
 
 ```
-docker compose up -d redis     # from the repo root
-docker compose down            # when you are done
+redis-server dev/redis.conf
 ```
 
-It holds no volume and persists nothing, so `down` takes the queue with it and no
-Redis is left running when you are not working on this. Any Docker-compatible runtime
-serves — Docker Desktop, Colima, OrbStack — or point `REDIS_URL` at one you already
-have and skip compose entirely.
+Everything stays inside the repo: it writes to the gitignored `data/`, persists
+nothing, and stops with Ctrl-C. No `brew services`, no launchd job, nothing running
+when you are not working on this. Point `REDIS_URL` elsewhere to use one you already
+have.
+
+No container runtime is involved. Docker containers are Linux processes, so on macOS
+any Docker setup runs a Linux VM underneath — a lot of machinery for one 40 MB server,
+when everything else here already runs on the host.
 
 The test suite drives the queue through an injected fake and never connects to Redis,
 the same way it never touches R2. Object storage is likewise needed only for the file
@@ -180,8 +199,16 @@ writes violations yet.
 `shared/queue/` holds two implementations of one shape, `enqueue` / `consume`:
 `RedisQueue`, and an `InMemoryQueue` that lets the worker run a job through without
 Redis anywhere. The difference that matters is what `consume()` does when empty —
-`InMemoryQueue` returns `None`, `BRPOP` blocks — so the same loop in `run()` drains an
-in-memory queue once and keeps a deployed worker waiting indefinitely.
+`InMemoryQueue` returns `None`, `RedisQueue` keeps waiting — so the same loop in
+`run()` drains an in-memory queue once and keeps a deployed worker waiting
+indefinitely. `None` therefore means "drained", never "nothing yet".
+
+That waiting is a series of bounded `BRPOP` windows (`BLOCK_SECONDS`), not one
+unbounded one. A `BRPOP` of `0` blocks forever and outlives redis-py's default 5-second
+socket timeout, so an idle worker died with `TimeoutError: Timeout reading from socket`
+— a quiet queue looking exactly like a network fault. The connection's `socket_timeout`
+is set above the window so the server always answers first, and stays finite so a truly
+dead connection still surfaces.
 
 A handler that raises stops the worker rather than dropping the job. Retry and a
 dead-letter queue are marked FUTURE in the LLD; until they exist, failing loudly beats

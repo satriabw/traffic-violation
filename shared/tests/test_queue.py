@@ -1,7 +1,7 @@
 import json
 
 from shared.models.detection import DetectionJob, FrameRange, ViolationType
-from shared.queue.client import RedisQueue
+from shared.queue.client import BLOCK_SECONDS, RedisQueue, from_config
 from shared.queue.memory import InMemoryQueue
 
 QUEUE_NAME = "detection:jobs"
@@ -26,12 +26,16 @@ class FakeRedis:
     def __init__(self):
         self.lists: dict[str, list[str]] = {}
         self.brpop_calls: list[tuple] = []
+        # Called at the start of each brpop, so a test can let a job land part way
+        # through a wait rather than only before it.
+        self.on_brpop = lambda: None
 
     def lpush(self, name: str, value: str) -> int:
         self.lists.setdefault(name, []).insert(0, value)
         return len(self.lists[name])
 
     def brpop(self, name: str, timeout: int = 0):
+        self.on_brpop()
         self.brpop_calls.append((name, timeout))
         values = self.lists.get(name, [])
         if not values:
@@ -103,15 +107,36 @@ def test_redis_queue_is_fifo():
     assert [queue.consume().id for _ in range(3)] == ["job-0", "job-1", "job-2"]
 
 
-def test_redis_consume_returns_none_on_timeout():
-    assert RedisQueue(FakeRedis(), QUEUE_NAME).consume() is None
-
-
-def test_redis_consume_blocks_indefinitely_by_default():
+def test_redis_consume_waits_through_empty_windows():
+    # An idle worker must survive a quiet queue. consume() keeps waiting rather than
+    # returning None, so run()'s "None means drained" only ever fires in memory.
     redis = FakeRedis()
+    queue = RedisQueue(redis, QUEUE_NAME)
+    job = _job()
+    redis.on_brpop = lambda: queue.enqueue(job) if len(redis.brpop_calls) == 2 else None
 
-    RedisQueue(redis, QUEUE_NAME).consume()
+    assert queue.consume() == job
+    assert len(redis.brpop_calls) == 3
 
-    # timeout=0 is BRPOP for "wait forever". A worker that polled instead would burn
-    # a round trip per second doing nothing.
-    assert redis.brpop_calls == [(QUEUE_NAME, 0)]
+
+def test_redis_blocks_in_bounded_windows():
+    # The regression this file exists for. BRPOP with timeout=0 blocks forever, which
+    # outlives redis-py's 5s socket timeout and kills an idle worker with
+    # "Timeout reading from socket". Every window has to be finite and shorter than
+    # the socket timeout — see from_config.
+    redis = FakeRedis()
+    queue = RedisQueue(redis, QUEUE_NAME)
+    redis.on_brpop = lambda: queue.enqueue(_job()) if not redis.brpop_calls else None
+
+    queue.consume()
+
+    assert redis.brpop_calls == [(QUEUE_NAME, BLOCK_SECONDS)]
+    assert 0 < BLOCK_SECONDS
+
+
+def test_configured_socket_timeout_outlives_a_block_window():
+    # If the socket gives up first, a perfectly healthy idle BRPOP looks like a
+    # network failure. from_url does not connect, so this needs no server.
+    kwargs = from_config()._client.connection_pool.connection_kwargs
+
+    assert kwargs["socket_timeout"] > BLOCK_SECONDS
