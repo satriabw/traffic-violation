@@ -3,13 +3,13 @@ from datetime import datetime
 from pydantic import BaseModel
 
 
-class CalibrationCreate(BaseModel):
-    # The id of an already-uploaded calibration file. site_id comes from the request
+class ConfigurationCreate(BaseModel):
+    # The id of an already-uploaded configuration file. site_id comes from the request
     # path and version is assigned server-side, so neither belongs here.
     file_id: str
 
 
-class CalibrationResponse(BaseModel):
+class ConfigurationResponse(BaseModel):
     id: str
     site_id: str
     file_id: str

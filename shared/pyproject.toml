@@ -5,6 +5,8 @@ requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2",
     "duckdb>=1.0",
+    # >=1.36 for the checksum-calculation knob R2 needs (see shared/s3/client.py).
+    "boto3>=1.36",
 ]
 
 [build-system]

@@ -7,3 +7,4 @@ data/
 .DS_Store
 *.egg-info/
 traffic-violation-lld-reference.md
+.env

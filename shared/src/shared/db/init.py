@@ -1,26 +1,81 @@
 import duckdb
 
+# Identity only. A site is a durable camera location: it outlives any one video, so
+# nothing per-run (source, status, metadata) belongs here — see site_sources.
 SITES_TABLE = """
 CREATE TABLE IF NOT EXISTS sites (
     id VARCHAR PRIMARY KEY,
     name VARCHAR NOT NULL,
-    url VARCHAR NOT NULL,
-    mode VARCHAR NOT NULL CHECK (mode IN ('video', 'stream')),
-    status VARCHAR NOT NULL DEFAULT 'created' CHECK (
-        status IN ('created', 'active', 'processing', 'completed', 'failed', 'degraded')
-    ),
-    metadata JSON,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 """
 
-# References sites(id), so it must be created after SITES_TABLE.
-CAMERA_CALIBRATIONS_TABLE = """
-CREATE TABLE IF NOT EXISTS camera_calibrations (
+
+# What a site is currently pointed at, versioned like calibrations: each POST appends,
+# the highest version is active, superseded ones stay readable so a past violation can
+# still be traced to the stream or file that produced it.
+# References both sites(id) and files(id).
+SITE_SOURCES_TABLE = """
+CREATE TABLE IF NOT EXISTS site_sources (
     id VARCHAR PRIMARY KEY,
     site_id VARCHAR NOT NULL REFERENCES sites(id),
+    version INTEGER NOT NULL DEFAULT 1,
+    kind VARCHAR NOT NULL CHECK (kind IN ('video', 'stream')),
+    -- A discriminated union keyed on kind. A stream is a user-typed address this
+    -- service never resolves; a video is a file whose upload was confirmed. One
+    -- generic column for both is what let a video claim a key nobody had uploaded.
+    stream_url VARCHAR,
+    file_id VARCHAR REFERENCES files(id),
+    -- Per-source, not per-site: 'processing' describes one video, and 'active' /
+    -- 'degraded' only ever described a stream.
+    status VARCHAR NOT NULL DEFAULT 'created' CHECK (
+        status IN ('created', 'active', 'processing', 'completed', 'failed', 'degraded')
+    ),
+    metadata JSON,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (site_id, version),
+    CHECK (
+        (kind = 'video'  AND file_id IS NOT NULL AND stream_url IS NULL) OR
+        (kind = 'stream' AND stream_url IS NOT NULL AND file_id IS NULL)
+    )
+);
+"""
+
+
+# No foreign keys of its own, and created first: sites, camera_calibrations, and
+# configurations all reference it.
+FILES_TABLE = """
+CREATE TABLE IF NOT EXISTS files (
+    id VARCHAR PRIMARY KEY,
+    name VARCHAR NOT NULL,
+    -- The object key, not a URL, despite the column name inherited from the LLD
+    -- (which sites.url and camera_calibrations.url share). Presigned URLs expire,
+    -- so they are computed per request and never stored.
     url VARCHAR NOT NULL,
+    type VARCHAR NOT NULL CHECK (
+        type IN ('calibration', 'configuration', 'video', 'evidence_frame')
+    ),
+    -- Bytes go client-direct to S3, so a row only becomes a fact once HeadObject
+    -- confirms the object landed. Until then it is a claim.
+    status VARCHAR NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'uploaded')),
+    content_type VARCHAR,
+    size_bytes BIGINT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+
+# camera_calibrations and configurations are the same shape — a versioned pointer from
+# a site to a file. They stay separate tables because the LLD models them as distinct
+# resources; the service layer is written once and parameterised by table name.
+_VERSIONED_DOC_TABLE = """
+CREATE TABLE IF NOT EXISTS {table} (
+    id VARCHAR PRIMARY KEY,
+    site_id VARCHAR NOT NULL REFERENCES sites(id),
+    file_id VARCHAR NOT NULL REFERENCES files(id),
     version INTEGER NOT NULL DEFAULT 1,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -28,7 +83,15 @@ CREATE TABLE IF NOT EXISTS camera_calibrations (
 );
 """
 
+# References both sites(id) and files(id), so both must be created first.
+CAMERA_CALIBRATIONS_TABLE = _VERSIONED_DOC_TABLE.format(table="camera_calibrations")
+CONFIGURATIONS_TABLE = _VERSIONED_DOC_TABLE.format(table="configurations")
+
 
 def init_db(con: duckdb.DuckDBPyConnection) -> None:
+    # files first — every other table references it.
+    con.execute(FILES_TABLE)
     con.execute(SITES_TABLE)
+    con.execute(SITE_SOURCES_TABLE)
     con.execute(CAMERA_CALIBRATIONS_TABLE)
+    con.execute(CONFIGURATIONS_TABLE)
