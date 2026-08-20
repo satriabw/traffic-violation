@@ -70,8 +70,13 @@ Redis is needed only to *run* detection jobs for real. `brew install redis` for 
 binary, then start it from the repo root:
 
 ```
+mkdir -p data          # once per checkout
 redis-server dev/redis.conf
 ```
+
+The `mkdir` is only needed the first time. `data/` is gitignored so a fresh clone does
+not have it, and unlike DuckDB — whose `get_connection` creates its parent directory —
+Redis refuses to start when its `dir` is missing.
 
 Everything stays inside the repo: it writes to the gitignored `data/`, persists
 nothing, and stops with Ctrl-C. No `brew services`, no launchd job, nothing running
@@ -147,6 +152,13 @@ POST /api/v1/sites/{site_id}/detect   {"types": ["red_light_running"]}
 {
   "id": "9f0c...",
   "site_id": "3a1b...",
+  "source": {
+    "source_id": "7d2e...",
+    "version": 3,
+    "key": "video/4c8a.../clip.mp4",
+    "fps": 29.97,
+    "total_frames": 27000
+  },
   "frame_range": {"start": 0, "end": 27000},
   "types": ["red_light_running", "pedestrian_right_of_way"]
 }
@@ -162,6 +174,20 @@ probed `total_frames`, in frame indices rather than seconds — variable-rate fo
 makes a time offset ambiguous, which is why the source keeps `fps` and `nominal_fps`
 apart. `types` defaults to every type the system knows, so the list can grow without
 updating callers.
+
+`source` is the video itself, carried in the message rather than looked up by the
+worker. Not to save a round trip — that is microseconds against a multi-minute decode —
+but because **sources are versioned**: asking site-service for a site's source answers
+"what is active now", so a job enqueued against v3 and consumed after v4 was attached
+would silently read a different video than the one it was created for. Carrying it pins
+the job to the decision that produced it, and lets a backlog drain while site-service is
+down.
+
+It carries the object **key**, not a download url. A presigned url expires, and one that
+died in a queue — or partway through a long read — fails *after* the worker has started.
+A key is immutable (a new upload is a new file id), so the worker signs its own url each
+time it opens the video. That is why the worker needs the R2 settings in its
+environment; it needs them regardless, since evidence frames will be written there.
 
 Everything that can go wrong is about the site's *state*, so it is 409 rather than 422 —
 the request is well formed, and the identical one succeeds once a video is attached:
@@ -191,10 +217,28 @@ worker's entrypoint ordinary Python rather than a framework's. `LPUSH` at the he
 PYTHONPATH=shared/src:workers/detection-worker .venv/bin/python -m detection_worker.worker
 ```
 
-The worker logs each job and moves on. That is the whole stub — the pipeline the LLD
-describes (source → detect → track → evaluate → store) hangs off `handle` in
-`workers/detection-worker/detection_worker/worker.py` when it exists, and nothing
-writes violations yet.
+The worker signs a url from the job's `source.key`, reads the frames the job asks for,
+logs how many it got, and moves on. Reading is all it does — the rest of the pipeline
+the LLD describes (detect → track → evaluate → store) hangs off the frames
+`make_handler` iterates in `workers/detection-worker/detection_worker/worker.py`, and
+nothing writes violations yet.
+
+Frames come from `detection_worker/reader.py`. OpenCV opens the presigned url through
+its ffmpeg backend, which range-requests the object — the same mechanism the probe
+relies on — so nothing is downloaded to disk. `read_frames` yields `(index, frame)` over
+the half-open range with **absolute** indices: a job covering frames 900-1800 reports
+900 for its first frame, because that is the number a violation has to be recorded
+against for anyone to find it in the footage later. A video that ends before
+`frame_range.end` stops the read rather than failing it — `total_frames` is the
+container's claim, and truncated or stream-copied files over-report it.
+
+Because the worker signs its own urls, it needs the same R2 settings site-service does.
+Source `.env` in the worker's shell too, not just uvicorn's.
+
+Nothing is cached between jobs. Today one job covers a whole video read once, so a cache
+would have a zero hit rate by construction; it earns its place when the LLD's 30-second
+chunks make one video the target of many jobs. The object key is immutable, so when that
+day comes the cache key is the key and there is no invalidation problem.
 
 `shared/queue/` holds two implementations of one shape, `enqueue` / `consume`:
 `RedisQueue`, and an `InMemoryQueue` that lets the worker run a job through without

@@ -5,8 +5,22 @@ from shared.models.detection import (
     DetectionJob,
     DetectionRequest,
     FrameRange,
+    JobSource,
     ViolationType,
 )
+
+
+def _source(**overrides) -> JobSource:
+    return JobSource(
+        **{
+            "source_id": "source-1",
+            "version": 3,
+            "key": "video/file-1/clip.mp4",
+            "fps": 29.97,
+            "total_frames": 27000,
+            **overrides,
+        }
+    )
 
 
 def _job(**overrides) -> DetectionJob:
@@ -14,6 +28,7 @@ def _job(**overrides) -> DetectionJob:
         **{
             "id": "job-1",
             "site_id": "site-1",
+            "source": _source(),
             "frame_range": FrameRange(start=0, end=27000),
             "types": [ViolationType.RED_LIGHT_RUNNING],
             **overrides,
@@ -23,10 +38,34 @@ def _job(**overrides) -> DetectionJob:
 
 def test_job_survives_a_json_round_trip():
     # The queue carries json, so this is the only property that actually matters:
-    # what the worker parses must equal what the service pushed.
+    # what the worker parses must equal what the service pushed — the nested source
+    # included, since the worker reads the video from it and nothing else.
     job = _job(types=list(ViolationType))
 
-    assert DetectionJob.model_validate_json(job.model_dump_json()) == job
+    parsed = DetectionJob.model_validate_json(job.model_dump_json())
+
+    assert parsed == job
+    assert parsed.source.key == "video/file-1/clip.mp4"
+
+
+def test_job_requires_a_source():
+    # Without one the worker has no video to open, and no way to find out which one
+    # it should have been — it never queries site-service.
+    with pytest.raises(ValidationError):
+        DetectionJob(
+            id="job-1",
+            site_id="site-1",
+            frame_range=FrameRange(start=0, end=10),
+            types=[ViolationType.RED_LIGHT_RUNNING],
+        )
+
+
+def test_source_metadata_is_optional_but_the_key_is_not():
+    # fps and total_frames are conveniences copied from the probe. The key is the
+    # only way to reach the video at all.
+    assert _source(fps=None, total_frames=None).key == "video/file-1/clip.mp4"
+    with pytest.raises(ValidationError):
+        _source(key=None)
 
 
 def test_frame_range_rejects_an_empty_or_backwards_range():

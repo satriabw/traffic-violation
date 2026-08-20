@@ -1,6 +1,6 @@
 import json
 
-from shared.models.detection import DetectionJob, FrameRange, ViolationType
+from shared.models.detection import DetectionJob, FrameRange, JobSource, ViolationType
 from shared.queue.client import BLOCK_SECONDS, RedisQueue, from_config
 from shared.queue.memory import InMemoryQueue
 
@@ -11,6 +11,9 @@ def _job(job_id: str = "job-1", start: int = 0, end: int = 100) -> DetectionJob:
     return DetectionJob(
         id=job_id,
         site_id="site-1",
+        source=JobSource(
+            source_id="source-1", version=3, key="video/file-1/clip.mp4", total_frames=end
+        ),
         frame_range=FrameRange(start=start, end=end),
         types=[ViolationType.RED_LIGHT_RUNNING],
     )
@@ -83,6 +86,15 @@ def test_redis_enqueue_pushes_json_onto_the_named_list():
     assert json.loads(redis.lists[QUEUE_NAME][0]) == {
         "id": "job-1",
         "site_id": "site-1",
+        # The video travels with the job. The worker reads it from here and asks
+        # site-service nothing — see JobSource.
+        "source": {
+            "source_id": "source-1",
+            "version": 3,
+            "key": "video/file-1/clip.mp4",
+            "fps": None,
+            "total_frames": 100,
+        },
         "frame_range": {"start": 0, "end": 100},
         "types": ["red_light_running"],
     }
