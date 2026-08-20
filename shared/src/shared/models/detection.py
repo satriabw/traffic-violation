@@ -35,9 +35,40 @@ class FrameRange(BaseModel):
         return self
 
 
+class JobSource(BaseModel):
+    """The video to read, as it was when the job was created.
+
+    Carried in the message rather than looked up by the worker, for two reasons that
+    have nothing to do with saving a round trip — that would be microseconds against a
+    multi-minute decode.
+
+    Sources are versioned. Asking site-service for a site's source answers "what is
+    active now", so a job enqueued against v3 and consumed after someone attached v4
+    would silently read a different video than the one it was created for. A source in
+    the message pins the job to the decision that produced it. It also lets a backlog
+    drain while site-service is down, which is the point of a queue.
+
+    `key` rather than a download url: a presigned url expires, and one that dies in a
+    backlog or midway through a long read fails *after* the worker has started, which
+    is the worst place for it. An object key is immutable — a new upload is a new file
+    id — so the worker signs its own url whenever it opens the video.
+    """
+
+    source_id: str
+    # Carried so a job that read the wrong thing is diagnosable rather than merely
+    # wrong: the pair identifies exactly which version of the site's source this was.
+    version: int
+    key: str
+    # Copied from the source's probed metadata. The worker needs fps to turn frame
+    # indices into times, and neither value is worth a second lookup to obtain.
+    fps: float | None = None
+    total_frames: int | None = None
+
+
 class DetectionJob(BaseModel):
     id: str
     site_id: str
+    source: JobSource
     frame_range: FrameRange
     # At least one: a job asking for no violation types is a no-op nobody wants queued.
     types: list[ViolationType] = Field(min_length=1)

@@ -161,3 +161,44 @@ def test_a_rejected_request_queues_nothing():
     client.post(_detect(_site_with_stream()), json={})
 
     assert _queue.consume() is None
+
+
+def test_the_job_carries_the_source_it_was_created_against():
+    # Not just the site id: the worker never looks the source up, so a job consumed
+    # after a newer source is attached must still read the video it was made for.
+    site_id = _site_with_video()
+    source = client.get(f"{SITES}/{site_id}/sources").json()
+
+    queued = client.post(_detect(site_id), json={}).json()["source"]
+
+    assert queued["source_id"] == source["id"]
+    assert queued["version"] == source["version"]
+
+
+def test_the_job_carries_the_object_key_rather_than_a_signed_url():
+    # A presigned url expires; a key does not. The worker signs its own at read time.
+    site_id = _site_with_video()
+    file_id = client.get(f"{SITES}/{site_id}/sources").json()["file_id"]
+    key = client.get(f"/api/v1/files/{file_id}").json()["url"]
+
+    queued = client.post(_detect(site_id), json={}).json()["source"]
+
+    assert queued["key"] == key
+    assert "http" not in queued["key"]
+
+
+def test_the_source_metadata_comes_from_the_probe():
+    queued = client.post(_detect(_site_with_video()), json={}).json()["source"]
+
+    assert queued["fps"] == 29.97
+    assert queued["total_frames"] == 27000
+
+
+def test_the_queued_message_carries_the_source_too():
+    # The response body and the message are the same object; this is the half that
+    # actually reaches the worker.
+    site_id = _site_with_video()
+
+    client.post(_detect(site_id), json={})
+
+    assert _queue.consume().source.key.startswith("video/")

@@ -3,6 +3,13 @@ name = "detection-worker"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
+    # Headless: the worker never opens a window, and the GUI build pulls in GTK for
+    # nothing. The wheel still carries the ffmpeg backend, which is what lets
+    # VideoCapture open an http url.
+    "opencv-python-headless>=4.9",
+    "numpy",
+    # boto3 (to sign its own download urls) and the job model both come with shared.
+    # No http client: the worker never calls site-service — see JobSource.
     "shared",
 ]
 
