@@ -8,6 +8,16 @@ dependencies = [
     # VideoCapture open an http url.
     "opencv-python-headless>=4.9",
     "numpy",
+    # Inference only. Notably NOT torch: the research pipeline imports torch,
+    # torchvision and transformers to reach the same ONNX session, and none of it is
+    # needed once preprocessing is cv2 and numpy. See detection_worker.model.
+    "onnxruntime>=1.17",
+    # For sv.Detections (the type detector and tracker pass between them) and
+    # sv.ByteTrack. Capped below 0.31, which removes ByteTrack — the successor lives
+    # in the `trackers` package and depends on opencv-python, which would collide
+    # with the headless build above. detection_worker.tracker is the only place that
+    # has to change when we migrate.
+    "supervision>=0.26,<0.31",
     # boto3 (to sign its own download urls) and the job model both come with shared.
     # No http client: the worker never calls site-service — see JobSource.
     "shared",
