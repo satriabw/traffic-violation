@@ -1,7 +1,7 @@
 import numpy as np
 import supervision as sv
 
-from detection_worker.tracker import DEFAULT_FPS, DEFAULT_PARAMS, TrackerParams, make_tracker
+from detection_worker.detection.tracker import DEFAULT_FPS, DEFAULT_PARAMS, TrackerParams, make_tracker
 
 
 class RecordingBackend:

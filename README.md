@@ -240,10 +240,20 @@ PYTHONPATH=shared/src:workers/detection-worker .venv/bin/python -m detection_wor
 ```
 
 The worker signs a url from the job's `source.key`, reads the frames the job asks for,
-logs how many it got, and moves on. Reading is all it does — the rest of the pipeline
-the LLD describes (detect → track → evaluate → store) hangs off the frames
-`make_handler` iterates in `workers/detection-worker/detection_worker/worker.py`, and
-nothing writes violations yet.
+detects and tracks what is in them, and logs a summary. The rest of the pipeline the
+LLD describes (evaluate → store) is still missing, and nothing writes violations yet.
+
+The work splits by how often it runs. `make_handler` in `detection_worker/worker.py`
+holds what happens **once per job** — resolve the job's context, sign the url, iterate
+the reader, aggregate, log — and a `FrameAnalyzer` from `detection_worker/analysis/`
+holds what happens **once per frame**: predict, then track, returning a `FrameResult`. Trajectory collection and the rule engine land inside
+`analyze`, which is why they are separate at all: neither has any business widening a
+function that also knows about presigned urls.
+
+An analyzer belongs to exactly one job, because its tracker does. That lifetime is the
+one thing in this design worth being careful about — a tracker holds live state, so
+sharing one across jobs would let a track from one site's chunk be re-matched against
+another's, and the corruption would arrive silently.
 
 Frames come from `detection_worker/reader.py`. OpenCV opens the presigned url through
 its ffmpeg backend, which range-requests the object — the same mechanism the probe
