@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 def make_handler(
     load_context: Callable[[DetectionJob], context.JobContext],
-    new_analyzer: Callable[[DetectionJob], FrameAnalyzer],
+    new_analyzer: Callable[[DetectionJob, context.JobContext], FrameAnalyzer],
     sign: Callable[[str], str] = presigned_get,
     read: Callable[[str, FrameRange], Iterable[tuple[int, Any]]] = read_frames,
 ) -> Callable[[DetectionJob], None]:
@@ -60,12 +60,15 @@ def make_handler(
 
         # Once per job, before the loop. Inside it, every frame would land in an
         # analyzer whose tracker had never seen the previous one, and nothing would
-        # ever hold an id for longer than a single frame.
-        analyzer = new_analyzer(job)
+        # ever hold an id for longer than a single frame. Built after the context
+        # because it is built *from* it — a job's calibration is what the trajectory
+        # collector projects with.
+        analyzer = new_analyzer(job, job_context)
 
         read_count = 0
         detection_count = 0
         seen_tracks: set[int] = set()
+        located_tracks: set[int] = set()
 
         for index, frame in read(url, job.frame_range):
             result = analyzer.analyze(frame, index)
@@ -74,6 +77,7 @@ def make_handler(
             read_count += 1
             detection_count += len(result.detections)
             seen_tracks.update(ids)
+            located_tracks.update(result.trajectories)
 
             # Per-frame detail is DEBUG because a 30-second chunk is ~900 of these,
             # and the summary below is what anyone watching a normal run wants.
@@ -87,7 +91,7 @@ def make_handler(
 
         logger.info(
             "detection job %s site=%s source=%s v%d calib=%s config=%s frames=%d-%d "
-            "read=%d detections=%d tracks=%d types=%s",
+            "read=%d detections=%d tracks=%d located=%d types=%s",
             job.id,
             job.site_id,
             job.source.source_id,
@@ -105,6 +109,11 @@ def make_handler(
             # detection_count's "how many boxes". Ids restart at 1 for every job, so
             # this number is only ever meaningful within one chunk.
             len(seen_tracks),
+            # How many of those were put on the ground. Zero where the site has no
+            # calibration, and short of `tracks` where some object never had a box
+            # whose bottom edge met the ground — which is the difference between "we
+            # saw it" and "we know where it was".
+            len(located_tracks),
             [t.value for t in job.types],
         )
 
@@ -154,7 +163,9 @@ def main() -> None:
         from_config(),
         make_handler(
             lambda job: context.load(con, job),
-            lambda job: make_analyzer(model, job.source.fps),
+            lambda job, job_context: make_analyzer(
+                model, job.source.fps, job_context.calibration
+            ),
         ),
     )
 

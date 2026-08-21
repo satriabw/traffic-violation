@@ -65,14 +65,13 @@ class TrajectoryCollector(ABC):
         Which collector comes back is this function's decision, taken from what the
         document contains. That is the point: callers name one class.
 
-        Not implemented yet — the projection and the filter land next. Raising here
-        rather than omitting the method keeps the entry point visible and stops anyone
-        reaching for a concrete collector directly in the meantime.
+        Imported here rather than at module scope because the collector it builds
+        subclasses this one, and a base class that imports its own subclasses at import
+        time cannot be imported at all.
         """
-        raise NotImplementedError(
-            "from_calibration arrives with the pinhole collector; until then, "
-            "construct a collector directly"
-        )
+        from trajectory_collector.pinhole import collector_from_calibration
+
+        return collector_from_calibration(source, fps)
 
     @abstractmethod
     def collect(
