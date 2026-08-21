@@ -169,7 +169,8 @@ def test_get_by_id_returns_a_superseded_version(site_id, resource, file_type):
 
 @pytest.mark.parametrize("resource,file_type", RESOURCES)
 def test_delete_site_succeeds_when_it_has_documents(site_id, resource, file_type):
-    # DuckDB has no ON DELETE CASCADE, so delete_site clears children in app code.
+    # The child rows go with the site via ON DELETE CASCADE. This asserts the
+    # endpoint's contract; the cascade itself is covered in shared/tests/test_db_init.
     client.post(_path(site_id, resource), json={"file_id": _file(file_type)})
 
     assert client.delete(f"/api/v1/sites/{site_id}").status_code == 204

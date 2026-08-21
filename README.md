@@ -60,11 +60,21 @@ Services mount that prefix themselves and the gateway does not rewrite it, so th
 path is identical whether a request arrives through the gateway or goes directly to
 the service. `/health` is served at the root, outside the prefix.
 
-All data is stored in one local DuckDB file at `./data/site_service.duckdb`
-(override with `SITE_SERVICE_DB_PATH`). DuckDB permits a single cross-process
-writer, so site-service owns the file and every resource below lives in it —
-including files, which the LLD gives to a separate file-service. Splitting that
-out later is a gateway config change, since routing is by resource prefix.
+All data is stored in one local SQLite file at `./data/traffic_violations.sqlite`
+(override with `TRAFFIC_DB_PATH`). Every resource below lives in it — including
+files, which the LLD gives to a separate file-service. Splitting that out later is a
+gateway config change, since routing is by resource prefix.
+
+SQLite rather than DuckDB because more than one process needs the file. DuckDB allows
+a single read-write process *or* several read-only ones, never both, so
+detection-worker could not open the database at all while site-service held it. SQLite
+in WAL mode gives concurrent readers alongside one writer, which is the shape of this
+system: an API taking human-rate writes and a worker appending violations.
+
+That holds only while the file is on a local filesystem shared by every process.
+Moving detection-worker to its own host, or running worker replicas across machines,
+is where SQLite stops working and Postgres starts. The trigger is the filesystem, not
+the row count.
 
 Redis is needed only to *run* detection jobs for real. `brew install redis` for the
 binary, then start it from the repo root:
@@ -75,8 +85,8 @@ redis-server dev/redis.conf
 ```
 
 The `mkdir` is only needed the first time. `data/` is gitignored so a fresh clone does
-not have it, and unlike DuckDB — whose `get_connection` creates its parent directory —
-Redis refuses to start when its `dir` is missing.
+not have it, and unlike the database — whose `get_connection` creates its parent
+directory — Redis refuses to start when its `dir` is missing.
 
 Everything stays inside the repo: it writes to the gitignored `data/`, persists
 nothing, and stops with Ctrl-C. No `brew services`, no launchd job, nothing running
@@ -306,9 +316,10 @@ than replacing the previous one. The highest version is the one active document 
 `GET .../calibrations` returns; superseded versions stay addressable by id. Reads are
 scoped by both ids, so one site can never read another's documents.
 
-Deleting a site deletes its calibrations and configurations — DuckDB enforces the
-foreign keys but has no `ON DELETE CASCADE`, so `delete_site` does it in application
-code (see the comment there: the deletes must not be wrapped in a transaction).
+Deleting a site deletes its sources, calibrations and configurations — `ON DELETE
+CASCADE` in the schema, not application code. Foreign keys are off by default in
+SQLite and enabled per connection, so `get_connection` sets `PRAGMA foreign_keys = ON`
+on every connection it hands out; without it the cascade silently does nothing.
 
 A `files` row referenced by a site, a calibration, or a configuration cannot be
 deleted while that reference stands. Nothing deletes files today, so this only

@@ -4,12 +4,13 @@ version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2",
-    "duckdb>=1.0",
     # >=1.36 for the checksum-calculation knob R2 needs (see shared/s3/client.py).
     "boto3>=1.36",
     # A Redis list is the detection job queue — see shared/queue/client.py.
     "redis>=5",
 ]
+# No database driver listed on purpose: the store is SQLite, which ships with
+# Python. See shared/db/connection.py for why it is no longer DuckDB.
 
 [build-system]
 requires = ["setuptools>=68"]

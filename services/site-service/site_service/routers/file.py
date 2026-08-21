@@ -1,6 +1,6 @@
+import sqlite3
 from typing import Annotated
 
-import duckdb
 from fastapi import APIRouter, Depends, HTTPException
 from shared import config
 from shared.models.file import FileCreate, FileResponse, FileUploadResponse
@@ -12,7 +12,7 @@ from site_service.storage import Storage
 # Files are a top-level resource: a video belongs to a site, but a calibration or an
 # evidence frame does not, so nesting them under one would be wrong.
 router = APIRouter(prefix="/files", tags=["files"])
-DbConnection = Annotated[duckdb.DuckDBPyConnection, Depends(get_db)]
+DbConnection = Annotated[sqlite3.Connection, Depends(get_db)]
 
 
 @router.post("", response_model=FileUploadResponse, status_code=201)

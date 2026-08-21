@@ -1,6 +1,6 @@
+import sqlite3
 from typing import Annotated
 
-import duckdb
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from shared.models.site import SiteCreate, SiteListResponse, SiteResponse
 from shared.models.source import SourceKind, SourceStatus
@@ -12,7 +12,7 @@ from site_service.storage import Storage
 from site_service.video import Probe
 
 router = APIRouter(prefix="/sites", tags=["sites"])
-DbConnection = Annotated[duckdb.DuckDBPyConnection, Depends(get_db)]
+DbConnection = Annotated[sqlite3.Connection, Depends(get_db)]
 
 
 @router.post("", response_model=SiteResponse, status_code=201)
