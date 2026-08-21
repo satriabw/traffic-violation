@@ -1,2 +1,7 @@
 [tool.pytest.ini_options]
-pythonpath = ["shared/src", "services/site-service", "workers/detection-worker"]
+pythonpath = [
+    "shared/src",
+    "packages/trajectory-collector/src",
+    "services/site-service",
+    "workers/detection-worker",
+]

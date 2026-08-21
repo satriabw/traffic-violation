@@ -1,5 +1,6 @@
 import numpy as np
 import supervision as sv
+from trajectory_collector import NullCollector, Trajectory, TrajectoryCollector
 
 from detection_worker.analysis.frame_analyzer import FrameAnalyzer, make_analyzer
 
@@ -40,6 +41,20 @@ class FakeTracker:
         if len(detections):
             detections.tracker_id = np.arange(1, len(detections) + 1)
         return detections
+
+
+class FakeCollector(TrajectoryCollector):
+    """Records what it was asked to locate, and names one trajectory per track."""
+
+    def __init__(self):
+        self.calls: list[tuple[np.ndarray, np.ndarray, int]] = []
+
+    def collect(self, boxes, track_ids, frame_index):
+        self.calls.append((boxes, track_ids, frame_index))
+        return {
+            int(track_id): Trajectory(position=(float(track_id), 0.0), speed=1.0)
+            for track_id in track_ids
+        }
 
 
 def _trackers():
@@ -143,3 +158,85 @@ def test_each_call_to_make_analyzer_builds_its_own_tracker():
 
     assert len(trackers.made) == 2
     assert trackers.made[0] is not trackers.made[1]
+
+
+# --- trajectories -------------------------------------------------------------
+
+
+def test_the_tracked_boxes_and_ids_reach_the_collector():
+    # Arrays, not sv.Detections: the trajectory package depends on nothing this worker
+    # depends on, and this two-attribute translation is the entire price of that.
+    collector = FakeCollector()
+
+    FrameAnalyzer(FakeModel(detections_per_frame=2), FakeTracker(), collector).analyze(
+        _frame(), index=0
+    )
+
+    boxes, track_ids, _ = collector.calls[0]
+    assert boxes.shape == (2, 4)
+    assert list(track_ids) == [1, 2]
+
+
+def test_the_collector_is_given_the_absolute_frame_index():
+    # Not a count of calls. The collector measures how long a track was missing for,
+    # and a job covering 900-1800 would otherwise measure every gap against zero.
+    collector = FakeCollector()
+    analyzer = FrameAnalyzer(FakeModel(detections_per_frame=1), FakeTracker(), collector)
+
+    analyzer.analyze(_frame(), index=900)
+    analyzer.analyze(_frame(), index=901)
+
+    assert [frame_index for _, _, frame_index in collector.calls] == [900, 901]
+
+
+def test_what_the_collector_returned_reaches_the_result():
+    result = FrameAnalyzer(
+        FakeModel(detections_per_frame=2), FakeTracker(), FakeCollector()
+    ).analyze(_frame(), index=0)
+
+    assert result.trajectories == {
+        1: Trajectory(position=(1.0, 0.0), speed=1.0),
+        2: Trajectory(position=(2.0, 0.0), speed=1.0),
+    }
+
+
+def test_a_frame_with_nothing_tracked_still_reaches_the_collector():
+    # tracker_id is None on such a frame, which becomes empty arrays rather than a
+    # crash — and the collector still hears about the frame, because a frame in which
+    # a track was absent is exactly what it needs to measure a gap.
+    collector = FakeCollector()
+
+    FrameAnalyzer(FakeModel(detections_per_frame=0), FakeTracker(), collector).analyze(
+        _frame(), index=7
+    )
+
+    boxes, track_ids, frame_index = collector.calls[0]
+    assert boxes.shape == (0, 4)
+    assert len(track_ids) == 0
+    assert frame_index == 7
+
+
+def test_an_analyzer_with_no_collector_reports_no_trajectories():
+    # The uncalibrated site: normal, not an error. There is no ground plane to project
+    # onto, so there is no honest position to report.
+    result = FrameAnalyzer(FakeModel(detections_per_frame=2), FakeTracker()).analyze(
+        _frame(), index=0
+    )
+
+    assert result.trajectories == {}
+
+
+def test_make_analyzer_defaults_to_collecting_nothing():
+    analyzer = make_analyzer(FakeModel(), fps=30.0, new_tracker=_trackers())
+
+    assert isinstance(analyzer._trajectory_collector, NullCollector)
+
+
+def test_make_analyzer_passes_a_collector_through():
+    collector = FakeCollector()
+
+    analyzer = make_analyzer(
+        FakeModel(), fps=30.0, new_tracker=_trackers(), trajectory_collector=collector
+    )
+
+    assert analyzer._trajectory_collector is collector

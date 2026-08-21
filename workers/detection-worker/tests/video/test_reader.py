@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 from shared.models.detection import FrameRange
 
-from detection_worker.reader import VideoUnavailable, read_frames
+from detection_worker.video.reader import VideoUnavailable, read_frames
 
 
 class FakeCapture:
