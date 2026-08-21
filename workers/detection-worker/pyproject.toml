@@ -18,6 +18,11 @@ dependencies = [
     # with the headless build above. detection_worker.detection.tracker is the only
     # place that has to change when we migrate.
     "supervision>=0.26,<0.31",
+    # Ground-plane positions and speeds from tracked boxes. A separate distribution
+    # rather than another module in here because the same code has been copied into
+    # several projects: it depends on nothing in this repository, so the day a second
+    # one needs it, it moves out whole. See packages/trajectory-collector.
+    "trajectory-collector",
     # boto3 (to sign its own download urls), the job model, and the shared database
     # connection all come with shared. Still no http client: the worker reads the same
     # SQLite file as site-service but never calls it — see detection_worker.db.

@@ -1,7 +1,7 @@
 """What one frame produced.
 
-A record rather than a tuple because it is about to grow: trajectories hang off the
-same frame, and so do whatever the rule engine decides about it. Every one of those is
+A record rather than a tuple because it is still growing: trajectories are here now,
+and whatever the rule engine decides about the frame lands next. Every one of those is
 a field here rather than another return value the handler has to keep in the right
 order.
 
@@ -14,6 +14,7 @@ long chunk turns into a memory problem.
 from dataclasses import dataclass
 
 import supervision as sv
+from trajectory_collector import Trajectory
 
 
 @dataclass(frozen=True)
@@ -25,6 +26,13 @@ class FrameResult:
     index: int
     # Tracked: these have been through the tracker, so they carry `tracker_id`.
     detections: sv.Detections
+    # Where each tracked object is on the ground and how fast it is going, keyed by the
+    # same tracker id. Empty for a site with no calibration, which is a normal state
+    # rather than a failure: without one there is no ground plane to project onto.
+    # Keyed rather than aligned with `detections` because that is the join a rule
+    # actually makes — "how fast is track 7" — and an index into a per-frame array
+    # would mean something different on every frame.
+    trajectories: dict[int, Trajectory]
 
     @property
     def track_ids(self) -> list[int]:

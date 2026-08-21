@@ -1,3 +1,8 @@
 {
-    "extraPaths": ["shared/src", "services/site-service", "workers/detection-worker"]
+    "extraPaths": [
+        "shared/src",
+        "packages/trajectory-collector/src",
+        "services/site-service",
+        "workers/detection-worker"
+    ]
 }
