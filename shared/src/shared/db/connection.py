@@ -15,10 +15,12 @@ import datetime
 import os
 import sqlite3
 
-# Python 3.12 deprecated the built-in "timestamp" converter, and CI runs 3.13, so the
-# conversion is ours. Without it every TIMESTAMP column comes back as a string and
-# Pydantic parses each one itself — which works, until a DeprecationWarning becomes
-# the removal it was announcing.
+# Python 3.12 deprecated the built-in datetime adapter and timestamp converter, and CI
+# runs 3.13, so both directions are ours. Registered as a pair on purpose: the format
+# written has to be the one read back, and the separator below is a space so a stored
+# datetime is byte-identical to what CURRENT_TIMESTAMP produces for the columns that
+# default to it. fromisoformat accepts both that and the "T" form, offset or not.
+sqlite3.register_adapter(datetime.datetime, lambda value: value.isoformat(sep=" "))
 sqlite3.register_converter(
     "TIMESTAMP", lambda raw: datetime.datetime.fromisoformat(raw.decode())
 )

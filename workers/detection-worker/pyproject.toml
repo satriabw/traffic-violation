@@ -18,8 +18,9 @@ dependencies = [
     # with the headless build above. detection_worker.tracker is the only place that
     # has to change when we migrate.
     "supervision>=0.26,<0.31",
-    # boto3 (to sign its own download urls) and the job model both come with shared.
-    # No http client: the worker never calls site-service — see JobSource.
+    # boto3 (to sign its own download urls), the job model, and the shared database
+    # connection all come with shared. Still no http client: the worker reads the same
+    # SQLite file as site-service but never calls it — see detection_worker.db.
     "shared",
 ]
 

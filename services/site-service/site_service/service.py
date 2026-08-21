@@ -100,8 +100,37 @@ def delete_site(con: sqlite3.Connection, site_id: str) -> bool:
     # in the schema now rather than four statements here — see init.py. The file rows
     # they point at are deliberately not cascaded: a file outlives the site that
     # referenced it, and nothing deletes files yet.
+    #
+    # Violations are the exception and do not cascade, so this raises rather than
+    # quietly destroying them. Checked up front rather than caught, because the
+    # IntegrityError alone cannot say *which* reference stood in the way.
+    if has_violations(con, site_id):
+        raise SiteHasViolations(site_id)
     con.execute("DELETE FROM sites WHERE id = ?", [site_id])
     return True
+
+
+class SiteHasViolations(Exception):
+    """A site cannot be deleted while it has violations recorded against it.
+
+    Configuration is disposable; a record of something that happened is not. Deleting
+    the site would take the violations with it, so the caller has to deal with them
+    first rather than have that happen as a side effect.
+    """
+
+    def __init__(self, site_id: str):
+        super().__init__(f"site {site_id} has recorded violations")
+        self.site_id = site_id
+
+
+def has_violations(con: sqlite3.Connection, site_id: str) -> bool:
+    return (
+        con.execute(
+            "SELECT EXISTS (SELECT 1 FROM traffic_violations WHERE site_id = ?)",
+            [site_id],
+        ).fetchone()[0]
+        == 1
+    )
 
 
 def _next_version(con: sqlite3.Connection, table: str, site_id: str) -> int:

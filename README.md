@@ -321,6 +321,12 @@ CASCADE` in the schema, not application code. Foreign keys are off by default in
 SQLite and enabled per connection, so `get_connection` sets `PRAGMA foreign_keys = ON`
 on every connection it hands out; without it the cascade silently does nothing.
 
+Violations are the exception: a site with any recorded against it cannot be deleted,
+and the attempt is a 409. Sources and calibrations describe how a site is configured
+and are meaningless once it is gone, but a violation is a record of something that
+happened — taking it along as a side effect of tidying up a site is not a decision the
+API should make on the caller's behalf.
+
 A `files` row referenced by a site, a calibration, or a configuration cannot be
 deleted while that reference stands. Nothing deletes files today, so this only
 constrains a future `DELETE /files/{id}`.

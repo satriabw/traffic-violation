@@ -1,7 +1,9 @@
+import pytest
 from shared.models.site import SiteCreate
 
 
 from site_service.service import (
+    SiteHasViolations,
     create_site,
     delete_site,
     get_site,
@@ -61,6 +63,25 @@ def test_delete_site_removes_existing_site(con):
 
 def test_delete_site_returns_false_when_missing(con):
     assert delete_site(con, "does-not-exist") is False
+
+
+def test_delete_site_refuses_a_site_that_has_violations(con):
+    """Configuration is disposable; a record of something that happened is not.
+
+    Everything else hanging off a site cascades away with it. Violations do not, so
+    the delete is refused rather than quietly taking them along.
+    """
+    site = create_site(con, SiteCreate(name="Busy Junction"))
+    con.execute(
+        "INSERT INTO traffic_violations (id, site_id, type, detected_at)"
+        " VALUES ('v1', ?, 'red_light_running', '2026-08-21 10:00:00')",
+        [site.id],
+    )
+
+    with pytest.raises(SiteHasViolations):
+        delete_site(con, site.id)
+
+    assert get_site(con, site.id) is not None
 
 
 def _site(con, name="A"):

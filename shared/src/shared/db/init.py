@@ -91,6 +91,60 @@ CAMERA_CALIBRATIONS_TABLE = _VERSIONED_DOC_TABLE.format(table="camera_calibratio
 CONFIGURATIONS_TABLE = _VERSIONED_DOC_TABLE.format(table="configurations")
 
 
+# The product's actual output. References sites(id), so sites must exist first.
+#
+# Deliberately NOT ON DELETE CASCADE, unlike every other child of sites. Sources,
+# calibrations and configurations are configuration — they describe how a site is set
+# up, and they are meaningless once it is gone. A violation is a record of something
+# that happened. Deleting a site should not silently destroy it, so this FK restricts
+# and site-service turns the resulting IntegrityError into a 409.
+TRAFFIC_VIOLATIONS_TABLE = """
+CREATE TABLE IF NOT EXISTS traffic_violations (
+    id VARCHAR PRIMARY KEY,
+    site_id VARCHAR NOT NULL REFERENCES sites(id),
+    type VARCHAR NOT NULL CHECK (
+        type IN ('red_light_running', 'pedestrian_right_of_way')
+    ),
+    -- 'explained' is the LLM having filled in explanation and severity, which happens
+    -- on demand at read time rather than here. The worker only ever writes 'detected'.
+    status VARCHAR NOT NULL DEFAULT 'detected' CHECK (status IN ('detected', 'explained')),
+    -- When the violation happened in the footage, not when the row was written. The
+    -- two differ by however long the job sat in the queue, and only this one is
+    -- meaningful to anyone looking at the video.
+    detected_at TIMESTAMP NOT NULL,
+    explanation VARCHAR,
+    severity VARCHAR,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+# GET /traffic_violation filters by site and date, which is exactly this pair.
+TRAFFIC_VIOLATIONS_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_traffic_violations_site_detected
+    ON traffic_violations (site_id, detected_at);
+"""
+
+
+# Trajectories, speeds and bounding boxes for one violation, plus the S3 keys of its
+# evidence frames. A separate table rather than a column on traffic_violations because
+# it is large and the list endpoint never wants it: keeping it out of that row means
+# listing violations does not drag every trajectory along with it.
+#
+# TEXT for the same affinity reason as site_sources.metadata. UNIQUE because the
+# relationship is one-to-one — a second blob for the same violation would be a bug
+# rather than an addition.
+VIOLATION_METADATA_TABLE = """
+CREATE TABLE IF NOT EXISTS violation_metadata (
+    id VARCHAR PRIMARY KEY,
+    traffic_violation_id VARCHAR NOT NULL
+        REFERENCES traffic_violations(id) ON DELETE CASCADE,
+    json_blob TEXT NOT NULL,
+    UNIQUE (traffic_violation_id)
+);
+"""
+
+
 def init_db(con: sqlite3.Connection) -> None:
     # files first — every other table references it.
     con.execute(FILES_TABLE)
@@ -98,3 +152,6 @@ def init_db(con: sqlite3.Connection) -> None:
     con.execute(SITE_SOURCES_TABLE)
     con.execute(CAMERA_CALIBRATIONS_TABLE)
     con.execute(CONFIGURATIONS_TABLE)
+    con.execute(TRAFFIC_VIOLATIONS_TABLE)
+    con.execute(TRAFFIC_VIOLATIONS_INDEX)
+    con.execute(VIOLATION_METADATA_TABLE)

@@ -200,5 +200,21 @@ def test_delete_site_returns_404_when_missing():
     assert response.json() == {"detail": "Site not found"}
 
 
+def test_delete_site_returns_409_when_it_has_violations():
+    # 409 rather than 422: the request is well formed, and the same request succeeds
+    # once the violations are dealt with.
+    created = client.post(SITES, json={"name": "Busy", "source": STREAM}).json()
+    _test_con.execute(
+        "INSERT INTO traffic_violations (id, site_id, type, detected_at)"
+        " VALUES ('v-routes-1', ?, 'red_light_running', '2026-08-21 10:00:00')",
+        [created["id"]],
+    )
+
+    response = client.delete(f"{SITES}/{created['id']}")
+
+    assert response.status_code == 409
+    assert client.get(f"{SITES}/{created['id']}").status_code == 200
+
+
 def _create_site(name="CalSite"):
     return client.post(SITES, json={"name": name}).json()

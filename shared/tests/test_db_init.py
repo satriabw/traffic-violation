@@ -288,3 +288,99 @@ def test_deleting_a_site_cascades_to_everything_that_hangs_off_it():
     # The file itself outlives the site that referenced it: nothing cascades to files,
     # which is what keeps a calibration reusable across sites.
     assert con.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 1
+
+
+VIOLATION = (
+    "INSERT INTO traffic_violations (id, site_id, type, detected_at)"
+    " VALUES (?, 's1', ?, '2026-08-21 10:00:00')"
+)
+
+
+def test_init_db_creates_the_violation_tables():
+    con = _fresh()
+
+    assert _columns(con, "traffic_violations") == {
+        "id", "site_id", "type", "status", "detected_at",
+        "explanation", "severity", "created_at", "updated_at",
+    }
+    assert _columns(con, "violation_metadata") == {
+        "id", "traffic_violation_id", "json_blob",
+    }
+
+
+def test_traffic_violations_defaults_to_detected():
+    con = _with_site_and_file()
+    con.execute(VIOLATION, ["v1", "red_light_running"])
+
+    assert con.execute("SELECT status FROM traffic_violations").fetchone()[0] == "detected"
+
+
+def test_traffic_violations_rejects_an_unknown_type():
+    con = _with_site_and_file()
+
+    with pytest.raises(sqlite3.IntegrityError):
+        con.execute(VIOLATION, ["v1", "jaywalking_backwards"])
+
+
+def test_traffic_violations_rejects_an_unknown_status():
+    con = _with_site_and_file()
+
+    with pytest.raises(sqlite3.IntegrityError):
+        con.execute(
+            "INSERT INTO traffic_violations (id, site_id, type, detected_at, status)"
+            " VALUES ('v1', 's1', 'red_light_running', '2026-08-21 10:00:00', 'probably')"
+        )
+
+
+def test_traffic_violations_rejects_an_unknown_site():
+    con = _with_site_and_file()
+
+    with pytest.raises(sqlite3.IntegrityError):
+        con.execute(
+            "INSERT INTO traffic_violations (id, site_id, type, detected_at)"
+            " VALUES ('v1', 'no-such-site', 'red_light_running', '2026-08-21 10:00:00')"
+        )
+
+
+def test_a_site_with_violations_cannot_be_deleted():
+    """The one child of sites that does not cascade.
+
+    Sources and calibrations describe how a site is configured and are meaningless
+    without it. A violation is a record of something that happened, and deleting a
+    site should not take it along silently.
+    """
+    con = _with_site_and_file()
+    con.execute(VIOLATION, ["v1", "red_light_running"])
+
+    with pytest.raises(sqlite3.IntegrityError):
+        con.execute("DELETE FROM sites WHERE id = 's1'")
+
+
+def test_violation_metadata_goes_with_its_violation():
+    con = _with_site_and_file()
+    con.execute(VIOLATION, ["v1", "red_light_running"])
+    con.execute(
+        "INSERT INTO violation_metadata (id, traffic_violation_id, json_blob)"
+        " VALUES ('m1', 'v1', '{}')"
+    )
+
+    con.execute("DELETE FROM traffic_violations WHERE id = 'v1'")
+
+    assert con.execute("SELECT COUNT(*) FROM violation_metadata").fetchone()[0] == 0
+
+
+def test_a_violation_cannot_have_two_metadata_blobs():
+    # One-to-one in the LLD. A second blob would be a bug, not an addition, and
+    # whichever one a reader picked up would be arbitrary.
+    con = _with_site_and_file()
+    con.execute(VIOLATION, ["v1", "red_light_running"])
+    con.execute(
+        "INSERT INTO violation_metadata (id, traffic_violation_id, json_blob)"
+        " VALUES ('m1', 'v1', '{}')"
+    )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        con.execute(
+            "INSERT INTO violation_metadata (id, traffic_violation_id, json_blob)"
+            " VALUES ('m2', 'v1', '{}')"
+        )
