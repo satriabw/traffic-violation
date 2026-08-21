@@ -14,7 +14,7 @@ reason and by the same key — tracker ids restart at 1 for every job, so a coll
 outliving one would merge unrelated objects.
 """
 
-from typing import Any, Callable, Mapping
+from typing import Callable
 
 import numpy as np
 import supervision as sv
@@ -79,7 +79,7 @@ class FrameAnalyzer:
 def make_analyzer(
     model: DetectionModel,
     fps: float | None,
-    calibration: Mapping[str, Any] | None = None,
+    calibration: bytes | None = None,
     new_tracker: Callable[[float | None], Tracker] = make_tracker,
     new_collector: Callable[..., TrajectoryCollector] = TrajectoryCollector.from_calibration,
 ) -> FrameAnalyzer:
@@ -93,10 +93,13 @@ def make_analyzer(
     source had no probed fps cannot end up with a tracker aging tracks at one rate and
     a collector measuring gaps at another.
 
-    `calibration` is the document the job was pinned to, already fetched — resolving it
-    is `detection_worker.context`'s job, and by the time anything gets here the version
-    it belongs to has been settled. None means the site had none, which is a normal
-    state: detection and tracking still run, and the job simply reports no trajectories.
+    `calibration` is the raw document the job was pinned to, as fetched — resolving
+    *which* document is `detection_worker.context`'s job, and by the time anything gets
+    here the version it belongs to has been settled. What is inside it is the trajectory
+    package's business: a calibration is an OpenCV FileStorage document, and nothing on
+    this side of the boundary should have an opinion about that. None means
+    the site had none, which is a normal state: detection and tracking still run, and
+    the job simply reports no trajectories.
 
     A calibration that cannot be projected with raises out of here, before a single
     frame is decoded. That stops the worker, which is the same thing any other failing

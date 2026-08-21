@@ -289,3 +289,45 @@ def test_a_calibration_that_cannot_be_projected_with_stops_the_job():
             new_tracker=_trackers(),
             new_collector=new_collector,
         )
+
+
+# --- the calibration format ---------------------------------------------------
+
+OPENCV_YML = b"""%YAML:1.0
+---
+camera_matrix: !!opencv-matrix
+   rows: 3
+   cols: 3
+   dt: d
+   data: [ 1000., 0., 0., 0., 1000., 0., 0., 0., 1. ]
+rot_matrix: !!opencv-matrix
+   rows: 3
+   cols: 3
+   dt: d
+   data: [ 1., 0., 0., 0., 1., 0., 0., 0., 1. ]
+tvec: !!opencv-matrix
+   rows: 3
+   cols: 1
+   dt: d
+   data: [ 0., 0., 100. ]
+"""
+
+
+def test_a_job_whose_calibration_is_an_opencv_document_locates_its_tracks():
+    # The format calibrations are written in. It reaches the analyzer as the raw bytes
+    # context fetched, and nothing on this side of the boundary parses it — that is the
+    # trajectory package's business.
+    analyzer = make_analyzer(
+        FakeModel(detections_per_frame=1), fps=30.0, calibration=OPENCV_YML
+    )
+
+    result = analyzer.analyze(np.zeros((720, 1280, 3), dtype=np.uint8), index=0)
+
+    # The fake model puts one box at (0, 0, 10, 10), so its anchor is (5, 10) — a
+    # hundredth of the 1000px focal length, seen from 100m up, is 0.5m by 1m.
+    assert result.trajectories[1].position == pytest.approx((0.5, 1.0))
+
+
+def test_a_calibration_document_that_is_neither_format_stops_the_job():
+    with pytest.raises(CalibrationInvalid):
+        make_analyzer(FakeModel(), fps=30.0, calibration=b"not a calibration")

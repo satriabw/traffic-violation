@@ -205,7 +205,7 @@ environment; it needs them regardless, since evidence frames will be written the
 
 `calibration_version` and `configuration_version` are the same idea applied to the
 site's other two documents, resolved to a number at enqueue time. The documents
-themselves are small JSON files in R2, so the message would only ever carry a pointer —
+themselves are small files in R2, so the message would only ever carry a pointer —
 and a version keeps the queue contract fixed as more per-site context arrives, which a
 growing set of keys would not. The worker looks them up by `(site_id, version)` and
 **never** by "the site's active calibration": a v4 uploaded while the job sits in the
@@ -277,13 +277,13 @@ trajectories = collector.collect(boxes, track_ids, frame_index)
 ```
 
 It is separate because the same code has been copied into several projects, and the
-thing that makes it liftable back out of this one is that it depends on nothing in
-here. Not `shared`, not the worker — and notably not supervision or OpenCV either, so
-its whole dependency list is numpy. That constraint is what shapes the interface:
-`collect` takes plain arrays rather than an `sv.Detections`, and the translation
-between them is two attribute reads in `frame_analyzer._tracked`. Nothing in the API
-mentions a site, a job or a frame range, because none of those exist outside this
-system.
+thing that makes it liftable back out of this one is that it imports nothing from
+here — not `shared`, not the worker, and no detection library either. Its whole
+dependency list is numpy and OpenCV, the latter only because calibrations are OpenCV
+FileStorage documents. That constraint is what shapes the interface: `collect` takes
+plain arrays rather than an `sv.Detections`, and the translation between them is two
+attribute reads in `frame_analyzer._tracked`. Nothing in the API mentions a site, a job
+or a frame range, because none of those exist outside this system.
 
 `from_calibration` is the only entry point. Which projection a calibration calls for is
 the package's decision, so the worker never names a camera model, a filter or a
@@ -380,7 +380,7 @@ GET  /api/v1/sites/{site_id}/configurations/{configuration_id}
 The full flow is three steps — reserve, upload, attach:
 
 ```
-POST /api/v1/files                {"name": "homography.json",
+POST /api/v1/files                {"name": "camera_model.yml",
                                    "type": "calibration", "size_bytes": 2048}
 PUT  <upload_url>                 the bytes, straight to R2
 POST /api/v1/files/{id}/complete  confirms the object landed
@@ -401,36 +401,44 @@ upload the service confirmed, so `POST` can reject what it cannot use:
 ### What a calibration file has to contain
 
 The service stores calibrations as opaque files — it checks that the bytes landed and
-that the type is right, not what is inside them. The worker is what reads one, so the
-format is the trajectory collector's:
+that the type is right, not what is inside them. The worker is what reads one, and the
+format is OpenCV `FileStorage`, which is what camera calibration tools write:
 
-```json
-{
-  "camera_matrix": [[fx, 0, cx], [0, fy, cy], [0, 0, 1]],
-  "rot_matrix":    [[...], [...], [...]],
-  "tvec":          [tx, ty, tz]
-}
+```yaml
+%YAML:1.0
+---
+camera_matrix: !!opencv-matrix
+   rows: 3
+   cols: 3
+   dt: d
+   data: [ fx, 0., cx, 0., fy, cy, 0., 0., 1. ]
+rot_matrix: !!opencv-matrix
+   ...
+tvec: !!opencv-matrix
+   ...
 ```
 
-Intrinsics, and the rotation and translation that put the camera in the world. `tvec`
-is accepted flat or as a column, and any of them may be a flat row-major list — the
-form OpenCV's `FileStorage` writes — so a calibration converted from a `.yml` needs no
-reshaping first. Extra keys are ignored, `dist_coeffs` among them: nothing here
-undistorts, because the only projection it performs is the ground-plane homography.
+Intrinsics, and the rotation and translation that put the camera in the world. That is
+the only format read — a calibration is whatever the calibrating tool produced, and
+supporting a second one bought nothing but the code to tell them apart. Extra nodes are
+ignored, `dist_coeffs` among them: nothing here undistorts, because the only projection
+it performs is the ground-plane homography.
 
 **Translations are in metres**, and there is no field to say otherwise. Every position
 and speed downstream inherits the unit the calibration was built in, so a calibration
 in feet is a wrong calibration rather than a differently-configured one.
 
-The `.yml` files OpenCV writes are not read directly: parsing one needs OpenCV, and the
-trajectory package depends on numpy alone. Convert once with `cv2.FileStorage` and
-store the JSON.
+A calibration that cannot be projected with — an unreadable document, a missing node, a
+wrong shape, a camera whose ground plane is degenerate — fails the job on the way in,
+before a frame is decoded, and the worker stops. That is louder than it sounds and
+deliberately so: a run that produced plausible-looking metres from a broken camera
+model is the failure nobody notices.
 
-A calibration that cannot be projected with — a missing field, a wrong shape, a camera
-whose ground plane is degenerate — fails the job on the way in, before a frame is
-decoded, and the worker stops. That is louder than it sounds and deliberately so: a run
-that produced plausible-looking metres from a broken camera model is the failure nobody
-notices.
+Note that the calibration is fetched as raw bytes while the configuration is fetched as
+parsed JSON. The asymmetry is deliberate: a configuration is ours, so `context.py`
+parses it and nobody thinks about it again, whereas a calibration is whatever the
+calibrating tool wrote — so it travels intact and the one component that knows what a
+camera model is decides what it means.
 
 The `pending` check is the reason the two-phase upload exists. Without it a client
 could reserve a slot, skip the PUT, and attach the resulting id to a site — which is

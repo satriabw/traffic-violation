@@ -37,30 +37,30 @@ and is skipped for that frame rather than reported.
 
 ## Calibration documents
 
-```json
-{
-  "camera_matrix": [[fx, 0, cx], [0, fy, cy], [0, 0, 1]],
-  "rot_matrix":    [[...], [...], [...]],
-  "tvec":          [tx, ty, tz]
-}
+OpenCV `FileStorage`, which is what camera calibration tools write:
+
+```yaml
+%YAML:1.0
+---
+camera_matrix: !!opencv-matrix
+   rows: 3
+   cols: 3
+   dt: d
+   data: [ fx, 0., cx, 0., fy, cy, 0., 0., 1. ]
+rot_matrix: !!opencv-matrix
+   ...
+tvec: !!opencv-matrix
+   ...
 ```
 
-Pass the path to a file like that, or the parsed mapping. Any field may also be a flat
-row-major list — the form OpenCV's `FileStorage` writes — and `tvec` is accepted as a
-column. Extra keys are ignored.
+`from_calibration` takes a path to one, or the document's own bytes — for a caller that
+fetched it from object storage and has no file to point at. Extra nodes are ignored,
+`dist_coeffs` among them, since nothing here undistorts.
 
-OpenCV `.yml` calibrations are not read directly, because parsing one needs OpenCV and
-this package depends on numpy alone. Convert once:
-
-```python
-import cv2, json
-fs = cv2.FileStorage("camera_model.yml", cv2.FILE_STORAGE_READ)
-json.dump({
-    "camera_matrix": fs.getNode("camera_matrix").mat().tolist(),
-    "rot_matrix": fs.getNode("rot_matrix").mat().tolist(),
-    "tvec": fs.getNode("tvec").mat().reshape(-1).tolist(),
-}, open("camera_model.json", "w"))
-```
+That is the only format. Supporting a second one bought nothing but the code to tell
+them apart. If you have the numbers rather than a document — building a camera in a
+test, say — `CameraModel.from_matrices(camera_matrix, rot_matrix, tvec)` takes anything
+array-like, flat and row-major included, and `PinholeCollector` takes the model.
 
 An unusable document raises `CalibrationInvalid` from `from_calibration` — at
 construction, never on some frame in the middle of a video.
@@ -71,8 +71,10 @@ construction, never on some frame in the middle of a video.
 pip install -e packages/trajectory-collector   # from a checkout of traffic-violation
 ```
 
-Depends on numpy and nothing else. It lives in this repository for now, but nothing in
-it imports anything from this repository — the day a second project needs it, it moves
+Depends on numpy and OpenCV — the headless build, since nothing here opens a window.
+Exclude it if you already have `opencv-python`, rather than ending up with two OpenCV
+builds in one environment. It lives in this repository for now, but nothing in it
+imports anything *from* this repository — the day a second project needs it, it moves
 out whole.
 
 **The name `trajectory-collector` is taken on PyPI** by an unrelated project, currently

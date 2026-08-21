@@ -19,7 +19,6 @@ the contract; a calibration in anything else is a wrong calibration.
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from os import PathLike
-from typing import Mapping
 
 import numpy as np
 
@@ -53,14 +52,15 @@ class TrajectoryCollector(ABC):
     @classmethod
     def from_calibration(
         cls,
-        source: str | PathLike | Mapping,
+        source: str | PathLike | bytes | bytearray,
         fps: float,
     ) -> "TrajectoryCollector":
         """Build the collector a calibration calls for.
 
-        `source` is either a path to a calibration file or an already-parsed mapping —
-        a caller that read its calibration from object storage has the document in
-        hand and should not have to write it to a temp file to be allowed to use it.
+        `source` is either a path to an OpenCV FileStorage calibration or the
+        document's own bytes — a caller that read its calibration from object storage
+        has the document in hand and should not have to write it to a temp file to be
+        allowed to use it.
 
         Which collector comes back is this function's decision, taken from what the
         document contains. That is the point: callers name one class.

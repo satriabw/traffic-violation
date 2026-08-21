@@ -42,10 +42,19 @@ def _job(**overrides) -> DetectionJob:
 
 
 def _fetcher(by_key: dict):
-    def fetch(key: str) -> dict:
+    def fetch(key: str):
         return by_key[key]
 
     return fetch
+
+
+def _fetchers(by_key: dict) -> dict:
+    """Both fetchers over one map of objects.
+
+    Calibrations come back as raw bytes and configurations as parsed JSON — the
+    asymmetry is the point, so the fake keeps it rather than smoothing it over.
+    """
+    return {"fetch_json": _fetcher(by_key), "fetch_bytes": _fetcher(by_key)}
 
 
 def test_a_job_with_no_versions_resolves_to_no_context(con):
@@ -54,7 +63,7 @@ def test_a_job_with_no_versions_resolves_to_no_context(con):
     def fetch(key):
         raise AssertionError(f"nothing should have been fetched, got {key}")
 
-    assert load(con, _job(), fetch=fetch) == JobContext()
+    assert load(con, _job(), fetch_json=fetch, fetch_bytes=fetch) == JobContext()
 
 
 def test_the_version_in_the_job_is_the_one_resolved_not_the_active_one(con):
@@ -64,24 +73,24 @@ def test_the_version_in_the_job_is_the_one_resolved_not_the_active_one(con):
     evaluated against v1. Resolving "the site's active calibration" instead would use
     v2 here — and the run would look completely normal.
     """
-    _file(con, "f1", "calibration/f1/v1.json")
-    _file(con, "f2", "calibration/f2/v2.json")
+    _file(con, "f1", "calibration/f1/v1.yml")
+    _file(con, "f2", "calibration/f2/v2.yml")
     _doc(con, CALIBRATIONS, "c1", "f1", version=1)
     _doc(con, CALIBRATIONS, "c2", "f2", version=2)  # uploaded after the job was queued
 
     resolved = load(
         con,
         _job(calibration_version=1),
-        fetch=_fetcher(
-            {"calibration/f1/v1.json": {"which": "v1"}, "calibration/f2/v2.json": {"which": "v2"}}
+        **_fetchers(
+            {"calibration/f1/v1.yml": b"which: v1", "calibration/f2/v2.yml": b"which: v2"}
         ),
     )
 
-    assert resolved.calibration == {"which": "v1"}
+    assert resolved.calibration == b"which: v1"
 
 
 def test_calibration_and_configuration_resolve_independently(con):
-    _file(con, "f1", "calibration/f1/a.json", "calibration")
+    _file(con, "f1", "calibration/f1/a.yml", "calibration")
     _file(con, "f2", "configuration/f2/b.json", "configuration")
     _doc(con, CALIBRATIONS, "c1", "f1", version=1)
     _doc(con, "configurations", "g1", "f2", version=3)
@@ -89,12 +98,15 @@ def test_calibration_and_configuration_resolve_independently(con):
     resolved = load(
         con,
         _job(calibration_version=1, configuration_version=3),
-        fetch=_fetcher(
-            {"calibration/f1/a.json": {"homography": [1]}, "configuration/f2/b.json": {"roi": [2]}}
+        **_fetchers(
+            {"calibration/f1/a.yml": b"%YAML:1.0", "configuration/f2/b.json": {"roi": [2]}}
         ),
     )
 
-    assert resolved == JobContext(calibration={"homography": [1]}, configuration={"roi": [2]})
+    # A calibration arrives as the document itself, unparsed — what is inside it is the
+    # trajectory package's business, not this module's. A configuration is ours, so it
+    # arrives parsed.
+    assert resolved == JobContext(calibration=b"%YAML:1.0", configuration={"roi": [2]})
 
 
 def test_only_one_of_the_two_being_present_is_fine(con):
@@ -104,7 +116,7 @@ def test_only_one_of_the_two_being_present_is_fine(con):
     resolved = load(
         con,
         _job(configuration_version=1),
-        fetch=_fetcher({"configuration/f2/b.json": {"roi": []}}),
+        **_fetchers({"configuration/f2/b.json": {"roi": []}}),
     )
 
     assert resolved.calibration is None
@@ -118,19 +130,19 @@ def test_a_version_that_is_not_in_the_database_is_an_error(con):
     whatever is active would reintroduce exactly the drift the version pin prevents,
     and the run would look fine.
     """
-    _file(con, "f1", "calibration/f1/a.json")
+    _file(con, "f1", "calibration/f1/a.yml")
     _doc(con, CALIBRATIONS, "c1", "f1", version=1)
 
     with pytest.raises(ContextMissing, match="camera_calibrations v7"):
-        load(con, _job(calibration_version=7), fetch=_fetcher({}))
+        load(con, _job(calibration_version=7), **_fetchers({}))
 
 
 def test_one_site_cannot_resolve_another_sites_calibration(con):
     con.execute("INSERT INTO sites (id, name) VALUES ('s2', 'Elsewhere')")
-    _file(con, "f1", "calibration/f1/a.json")
+    _file(con, "f1", "calibration/f1/a.yml")
     con.execute(
         f"INSERT INTO {CALIBRATIONS} (id, site_id, file_id, version) VALUES ('c1', 's2', 'f1', 1)"
     )
 
     with pytest.raises(ContextMissing):
-        load(con, _job(calibration_version=1), fetch=_fetcher({}))
+        load(con, _job(calibration_version=1), **_fetchers({}))
