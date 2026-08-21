@@ -5,6 +5,7 @@ from shared.models.detection import DetectionJob, FrameRange, JobSource, Violati
 from shared.queue.memory import InMemoryQueue
 
 from detection_worker.reader import VideoUnavailable
+from detection_worker.context import JobContext
 from detection_worker.worker import make_handler, run
 
 
@@ -87,9 +88,12 @@ def _trackers():
     return factory
 
 
-def _handler(model=None, sign=None, read=None, new_tracker=None):
+def _handler(model=None, sign=None, read=None, new_tracker=None, load_context=None):
     return make_handler(
         model if model is not None else FakeModel(),
+        # A site with neither document is the default here: these tests are about
+        # frames, detections and ids, and context has its own suite.
+        load_context or (lambda job: JobContext()),
         sign=sign or (lambda key: "u"),
         read=read if read is not None else _reader_of(frame_count=0),
         new_tracker=new_tracker or _trackers(),

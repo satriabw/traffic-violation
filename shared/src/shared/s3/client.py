@@ -10,6 +10,7 @@ creation. That is a header read, not a transfer, and it is still no reason to ad
 download() here.
 """
 
+import json
 from functools import lru_cache
 
 import boto3
@@ -92,6 +93,25 @@ def download_url(key: str, expires_in: int | None = None) -> str:
     """Prefer the public URL when one is configured — it is stable and cacheable —
     and fall back to a presigned URL, which always works but expires."""
     return public_url(key) or presigned_get(key, expires_in)
+
+
+def get_json(key: str) -> dict:
+    """Read a small JSON document out of the bucket.
+
+    The second bounded exception to "file bytes never pass through a service", and it
+    is the same kind as ffprobe's: a calibration or a configuration is a few kilobytes
+    of settings the worker has to *evaluate*, not media it is moving on someone's
+    behalf. Handing it a presigned URL and an HTTP client would be the same transfer
+    with more moving parts.
+
+    Deliberately not a general download(). If a future caller wants this for a video,
+    that is the signal to reach for a stream rather than widen this.
+    """
+    body = get_client().get_object(Bucket=config.S3_BUCKET, Key=key)["Body"]
+    try:
+        return json.loads(body.read())
+    finally:
+        body.close()
 
 
 def head(key: str) -> dict | None:
