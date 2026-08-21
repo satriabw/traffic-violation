@@ -1,6 +1,6 @@
+import sqlite3
 from typing import Annotated
 
-import duckdb
 from fastapi import APIRouter, Depends, HTTPException
 from shared.models.file import FileType
 from shared.models.source import (
@@ -20,16 +20,16 @@ from site_service.video import Probe
 # Nested under a site: a source has no meaning without one, and site_id is never taken
 # from the request body.
 router = APIRouter(prefix="/sites/{site_id}/sources", tags=["sources"])
-DbConnection = Annotated[duckdb.DuckDBPyConnection, Depends(get_db)]
+DbConnection = Annotated[sqlite3.Connection, Depends(get_db)]
 
 
-def require_site(con: duckdb.DuckDBPyConnection, site_id: str) -> None:
+def require_site(con: sqlite3.Connection, site_id: str) -> None:
     if service.get_site(con, site_id) is None:
         raise HTTPException(status_code=404, detail="Site not found")
 
 
 def validate_source(
-    con: duckdb.DuckDBPyConnection, storage, probe, data: SourceCreate
+    con: sqlite3.Connection, storage, probe, data: SourceCreate
 ) -> SourceMetadata | None:
     """Check the source is usable and, for a video, read its shape once.
 

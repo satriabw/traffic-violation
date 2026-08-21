@@ -1,6 +1,9 @@
 import os
 
-DB_PATH = os.environ.get("SITE_SERVICE_DB_PATH", "./data/site_service.duckdb")
+# One SQLite file, shared by every process: site-service writes it, detection-worker
+# reads context from it and appends violations. Not named for site-service any more,
+# because site-service no longer owns it.
+DB_PATH = os.environ.get("TRAFFIC_DB_PATH", "./data/traffic_violations.sqlite")
 
 # Every service mounts its resource routers under this prefix, and callers use the
 # same path whether they reach the service through the gateway or directly by its

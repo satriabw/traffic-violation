@@ -1,7 +1,7 @@
+import sqlite3
 import uuid
 from typing import Annotated
 
-import duckdb
 from fastapi import APIRouter, Depends, HTTPException
 from shared.models.detection import (
     DetectionJob,
@@ -21,11 +21,11 @@ from site_service.storage import Storage
 # Nested under a site for the same reason sources are: detection runs against a
 # location's footage, and site_id is never taken from the request body.
 router = APIRouter(prefix="/sites/{site_id}/detect", tags=["detection"])
-DbConnection = Annotated[duckdb.DuckDBPyConnection, Depends(get_db)]
+DbConnection = Annotated[sqlite3.Connection, Depends(get_db)]
 
 
 def video_for(
-    con: duckdb.DuckDBPyConnection, storage, source: SourceResponse | None
+    con: sqlite3.Connection, storage, source: SourceResponse | None
 ) -> tuple[JobSource, FrameRange]:
     """The video to detect over and the frames to cover, or a 409 explaining why
     there is neither.

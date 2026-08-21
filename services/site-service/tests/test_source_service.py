@@ -155,7 +155,7 @@ def test_delete_site_removes_its_sources(con, site):
 
 
 def test_metadata_is_decoded_back_into_a_model(con, site):
-    # DuckDB returns a JSON column as a string, and Pydantic will not coerce a string
+    # The metadata column is TEXT, and Pydantic will not coerce a string
     # into a nested model — without an explicit decode this is a 500 on every read of
     # a source that has metadata.
     source = service.create_source(con, site.id, _stream())

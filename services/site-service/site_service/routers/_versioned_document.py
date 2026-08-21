@@ -5,9 +5,9 @@ routes are built once. Each caller supplies its own response model, so the wire
 contract stays per-resource and the OpenAPI schema names the real thing.
 """
 
+import sqlite3
 from typing import Annotated
 
-import duckdb
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from shared.models.file import FileType
@@ -16,7 +16,7 @@ from site_service import service
 from site_service.db import get_db
 from site_service.file_reference import raise_for_unusable_file
 
-DbConnection = Annotated[duckdb.DuckDBPyConnection, Depends(get_db)]
+DbConnection = Annotated[sqlite3.Connection, Depends(get_db)]
 
 def build_router(
     *,
@@ -31,7 +31,7 @@ def build_router(
     router = APIRouter(prefix=f"/sites/{{site_id}}/{resource}", tags=[resource])
     singular = resource.rstrip("s")
 
-    def _require_site(con: duckdb.DuckDBPyConnection, site_id: str) -> None:
+    def _require_site(con: sqlite3.Connection, site_id: str) -> None:
         if service.get_site(con, site_id) is None:
             raise HTTPException(status_code=404, detail="Site not found")
 

@@ -4,7 +4,8 @@ Shared by every endpoint that accepts a file_id — sites, calibrations, configu
 — so a video attached to a site and a calibration attached to a site fail the same way.
 """
 
-import duckdb
+import sqlite3
+
 from fastapi import HTTPException
 from shared.models.file import FileType
 
@@ -21,7 +22,7 @@ _FILE_ERRORS = {
 
 
 def raise_for_unusable_file(
-    con: duckdb.DuckDBPyConnection, file_id: str, expected_type: FileType
+    con: sqlite3.Connection, file_id: str, expected_type: FileType
 ) -> None:
     reason = service.unusable_file_reason(con, file_id, expected_type)
     if reason is None:

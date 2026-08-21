@@ -1,4 +1,4 @@
-import duckdb
+import sqlite3
 
 # Identity only. A site is a durable camera location: it outlives any one video, so
 # nothing per-run (source, status, metadata) belongs here — see site_sources.
@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS sites (
 SITE_SOURCES_TABLE = """
 CREATE TABLE IF NOT EXISTS site_sources (
     id VARCHAR PRIMARY KEY,
-    site_id VARCHAR NOT NULL REFERENCES sites(id),
+    site_id VARCHAR NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
     version INTEGER NOT NULL DEFAULT 1,
     kind VARCHAR NOT NULL CHECK (kind IN ('video', 'stream')),
     -- A discriminated union keyed on kind. A stream is a user-typed address this
@@ -32,7 +32,10 @@ CREATE TABLE IF NOT EXISTS site_sources (
     status VARCHAR NOT NULL DEFAULT 'created' CHECK (
         status IN ('created', 'active', 'processing', 'completed', 'failed', 'degraded')
     ),
-    metadata JSON,
+    -- TEXT, not JSON: SQLite gives a JSON-declared column NUMERIC affinity, so a
+    -- document like '123' would come back as the integer 123. The value is a JSON
+    -- string either way — only the affinity differs.
+    metadata TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE (site_id, version),
@@ -74,7 +77,7 @@ CREATE TABLE IF NOT EXISTS files (
 _VERSIONED_DOC_TABLE = """
 CREATE TABLE IF NOT EXISTS {table} (
     id VARCHAR PRIMARY KEY,
-    site_id VARCHAR NOT NULL REFERENCES sites(id),
+    site_id VARCHAR NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
     file_id VARCHAR NOT NULL REFERENCES files(id),
     version INTEGER NOT NULL DEFAULT 1,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -88,7 +91,7 @@ CAMERA_CALIBRATIONS_TABLE = _VERSIONED_DOC_TABLE.format(table="camera_calibratio
 CONFIGURATIONS_TABLE = _VERSIONED_DOC_TABLE.format(table="configurations")
 
 
-def init_db(con: duckdb.DuckDBPyConnection) -> None:
+def init_db(con: sqlite3.Connection) -> None:
     # files first — every other table references it.
     con.execute(FILES_TABLE)
     con.execute(SITES_TABLE)

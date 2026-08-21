@@ -1,7 +1,7 @@
 import json
+import sqlite3
 import uuid
 
-import duckdb
 from shared import config
 from shared.models.file import (
     FileCreate,
@@ -18,14 +18,14 @@ from shared.s3.keys import build_key
 _COLUMNS = ("id", "name", "created_at", "updated_at")
 
 
-def _row_to_site(con: duckdb.DuckDBPyConnection, row: tuple) -> SiteResponse:
+def _row_to_site(con: sqlite3.Connection, row: tuple) -> SiteResponse:
     data = dict(zip(_COLUMNS, row))
     # The active source is embedded so the common read is one request.
     return SiteResponse(**data, source=get_active_source(con, data["id"]))
 
 
 def create_site(
-    con: duckdb.DuckDBPyConnection,
+    con: sqlite3.Connection,
     data: SiteCreate,
     source_metadata: SourceMetadata | None = None,
 ) -> SiteResponse:
@@ -38,7 +38,7 @@ def create_site(
     return get_site(con, site_id)
 
 
-def get_site(con: duckdb.DuckDBPyConnection, site_id: str) -> SiteResponse | None:
+def get_site(con: sqlite3.Connection, site_id: str) -> SiteResponse | None:
     row = con.execute(
         f"SELECT {', '.join(_COLUMNS)} FROM sites WHERE id = ?", [site_id]
     ).fetchone()
@@ -46,7 +46,7 @@ def get_site(con: duckdb.DuckDBPyConnection, site_id: str) -> SiteResponse | Non
 
 
 def list_sites(
-    con: duckdb.DuckDBPyConnection,
+    con: sqlite3.Connection,
     limit: int,
     offset: int,
     kind: str | None = None,
@@ -93,27 +93,27 @@ def list_sites(
     )
 
 
-def delete_site(con: duckdb.DuckDBPyConnection, site_id: str) -> bool:
+def delete_site(con: sqlite3.Connection, site_id: str) -> bool:
     if get_site(con, site_id) is None:
         return False
-    # DuckDB enforces the child -> sites foreign keys but has no
-    # ON DELETE CASCADE, so the children have to go first. Do NOT wrap these two
-    # statements in a transaction: DuckDB's FK check does not see uncommitted child
-    # deletes, so the site delete then fails with a ConstraintException. Autocommit
-    # is what makes this work.
-    con.execute("DELETE FROM site_sources WHERE site_id = ?", [site_id])
-    con.execute(f"DELETE FROM {CALIBRATIONS} WHERE site_id = ?", [site_id])
-    con.execute(f"DELETE FROM {CONFIGURATIONS} WHERE site_id = ?", [site_id])
+    # Sources, calibrations and configurations go with it. That is ON DELETE CASCADE
+    # in the schema now rather than four statements here — see init.py. The file rows
+    # they point at are deliberately not cascaded: a file outlives the site that
+    # referenced it, and nothing deletes files yet.
     con.execute("DELETE FROM sites WHERE id = ?", [site_id])
     return True
 
 
-def _next_version(con: duckdb.DuckDBPyConnection, table: str, site_id: str) -> int:
+def _next_version(con: sqlite3.Connection, table: str, site_id: str) -> int:
     """Next version number for a site in a versioned table.
 
     The one piece genuinely shared by sources, calibrations, and configurations —
-    their column sets differ too much to share more. site-service is the only writer
-    of this DuckDB file, so read-then-insert is safe and no sequence is needed.
+    their column sets differ too much to share more.
+
+    Read-then-insert rather than a sequence. What makes that safe is not that there is
+    one writer — there no longer is — but UNIQUE (site_id, version): two racing
+    appends cannot both land, and the loser gets an IntegrityError rather than a
+    duplicate version.
     """
     return con.execute(
         f"SELECT COALESCE(MAX(version), 0) + 1 FROM {table} WHERE site_id = ?", [site_id]
@@ -133,7 +133,7 @@ def _row_to_versioned_doc(row: tuple) -> VersionedDocument:
 
 
 def unusable_file_reason(
-    con: duckdb.DuckDBPyConnection, file_id: str, expected_type: FileType
+    con: sqlite3.Connection, file_id: str, expected_type: FileType
 ) -> str | None:
     """Why this file may not be attached to a site, or None if it may.
 
@@ -154,12 +154,10 @@ def unusable_file_reason(
 
 
 def create_versioned_doc(
-    con: duckdb.DuckDBPyConnection, table: str, site_id: str, file_id: str
+    con: sqlite3.Connection, table: str, site_id: str, file_id: str
 ) -> VersionedDocument:
     """Append a new version. Callers validate the file first — see unusable_file_reason."""
     doc_id = str(uuid.uuid4())
-    # site-service is the only writer of this DuckDB file, so read-then-insert is
-    # safe here and no sequence is needed.
     version = _next_version(con, table, site_id)
     con.execute(
         f"""
@@ -172,7 +170,7 @@ def create_versioned_doc(
 
 
 def get_active_version(
-    con: duckdb.DuckDBPyConnection, table: str, site_id: str
+    con: sqlite3.Connection, table: str, site_id: str
 ) -> VersionedDocument | None:
     """The one valid document for a site — the highest version."""
     row = con.execute(
@@ -188,7 +186,7 @@ def get_active_version(
 
 
 def get_version(
-    con: duckdb.DuckDBPyConnection, table: str, site_id: str, doc_id: str
+    con: sqlite3.Connection, table: str, site_id: str, doc_id: str
 ) -> VersionedDocument | None:
     # Scoped by both ids so one site can never read another site's documents.
     row = con.execute(
@@ -215,7 +213,7 @@ def _row_to_file(row: tuple, storage, download: bool) -> FileResponse:
     return FileResponse(**data, download_url=download_url)
 
 
-def create_file(con: duckdb.DuckDBPyConnection, storage, data: FileCreate) -> FileUploadResponse:
+def create_file(con: sqlite3.Connection, storage, data: FileCreate) -> FileUploadResponse:
     """Reserve a key and hand back a URL the client can PUT to directly.
 
     The row starts `pending`: nothing has been uploaded yet, and only confirm_upload
@@ -245,7 +243,7 @@ def create_file(con: duckdb.DuckDBPyConnection, storage, data: FileCreate) -> Fi
     )
 
 
-def get_file(con: duckdb.DuckDBPyConnection, storage, file_id: str) -> FileResponse | None:
+def get_file(con: sqlite3.Connection, storage, file_id: str) -> FileResponse | None:
     row = con.execute(
         f"SELECT {', '.join(_FILE_COLUMNS)} FROM files WHERE id = ?", [file_id]
     ).fetchone()
@@ -256,7 +254,7 @@ def get_file(con: duckdb.DuckDBPyConnection, storage, file_id: str) -> FileRespo
 
 
 def confirm_upload(
-    con: duckdb.DuckDBPyConnection, storage, file_id: str
+    con: sqlite3.Connection, storage, file_id: str
 ) -> FileResponse | None:
     """Verify the client's upload actually landed, then mark the row uploaded.
 
@@ -289,15 +287,15 @@ _SOURCE_COLUMNS = (
 
 def _row_to_source(row: tuple) -> SourceResponse:
     data = dict(zip(_SOURCE_COLUMNS, row))
-    # DuckDB hands a JSON column back as text, and Pydantic will not coerce a string
-    # into a nested model, so the decode is explicit rather than implied.
+    # The column is TEXT, and Pydantic will not coerce a string into a nested model,
+    # so the decode is explicit rather than implied.
     if isinstance(data.get("metadata"), str):
         data["metadata"] = json.loads(data["metadata"])
     return SourceResponse(**data)
 
 
 def create_source(
-    con: duckdb.DuckDBPyConnection,
+    con: sqlite3.Connection,
     site_id: str,
     data: SourceCreate,
     metadata: SourceMetadata | None = None,
@@ -328,7 +326,7 @@ def create_source(
 
 
 def get_active_source(
-    con: duckdb.DuckDBPyConnection, site_id: str
+    con: sqlite3.Connection, site_id: str
 ) -> SourceResponse | None:
     """What the site is currently pointed at — the highest version."""
     row = con.execute(
@@ -344,7 +342,7 @@ def get_active_source(
 
 
 def get_source(
-    con: duckdb.DuckDBPyConnection, site_id: str, source_id: str
+    con: sqlite3.Connection, site_id: str, source_id: str
 ) -> SourceResponse | None:
     # Scoped by both ids so one site can never read another site's sources.
     row = con.execute(

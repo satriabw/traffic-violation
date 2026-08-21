@@ -1,24 +1,41 @@
-import duckdb
+import sqlite3
+
 import pytest
 
+from shared.db.connection import get_connection
 from shared.db.init import init_db
 
 
-def test_init_db_creates_sites_table():
-    con = duckdb.connect(":memory:")
-    init_db(con)
+def _fresh():
+    """A schema-ready in-memory database.
 
-    columns = {row[0] for row in con.execute("DESCRIBE sites").fetchall()}
+    get_connection rather than sqlite3.connect: foreign keys are off by default in
+    SQLite and enabled per connection, so a raw connect would make every FK
+    assertion below pass vacuously.
+    """
+    con = get_connection(":memory:")
+    init_db(con)
+    return con
+
+
+def _columns(con, table: str) -> set[str]:
+    # PRAGMA table_info puts the column name at index 1; index 0 is its position.
+    return {row[1] for row in con.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def test_init_db_creates_sites_table():
+    con = _fresh()
+
+    columns = _columns(con, "sites")
     # Identity only. Everything per-run lives on site_sources, because a site
     # outlives any one video.
     assert columns == {"id", "name", "created_at", "updated_at"}
 
 
 def test_init_db_creates_site_sources_table():
-    con = duckdb.connect(":memory:")
-    init_db(con)
+    con = _fresh()
 
-    columns = {row[0] for row in con.execute("DESCRIBE site_sources").fetchall()}
+    columns = _columns(con, "site_sources")
     assert columns == {
         "id", "site_id", "version", "kind", "file_id", "stream_url",
         "status", "metadata", "created_at", "updated_at",
@@ -26,8 +43,7 @@ def test_init_db_creates_site_sources_table():
 
 
 def _with_site_and_file():
-    con = duckdb.connect(":memory:")
-    init_db(con)
+    con = _fresh()
     con.execute("INSERT INTO sites (id, name) VALUES ('s1', 'Junction 5')")
     con.execute(
         "INSERT INTO files (id, name, url, type, status)"
@@ -76,21 +92,21 @@ def test_site_sources_rejects_a_source_that_does_not_match_its_kind(
 ):
     con = _with_site_and_file()
 
-    with pytest.raises(duckdb.ConstraintException):
+    with pytest.raises(sqlite3.IntegrityError):
         _insert_source(con, kind, stream_url, file_id)
 
 
 def test_site_sources_rejects_an_unknown_kind():
     con = _with_site_and_file()
 
-    with pytest.raises(duckdb.ConstraintException):
+    with pytest.raises(sqlite3.IntegrityError):
         _insert_source(con, "carrier-pigeon", stream_url="rtsp://cam")
 
 
 def test_site_sources_rejects_an_unknown_site_id():
     con = _with_site_and_file()
 
-    with pytest.raises(duckdb.ConstraintException):
+    with pytest.raises(sqlite3.IntegrityError):
         con.execute(
             "INSERT INTO site_sources (id, site_id, version, kind, stream_url)"
             " VALUES ('src1', 'nope', 1, 'stream', 'rtsp://cam')"
@@ -100,7 +116,7 @@ def test_site_sources_rejects_an_unknown_site_id():
 def test_site_sources_rejects_an_unknown_file_id():
     con = _with_site_and_file()
 
-    with pytest.raises(duckdb.ConstraintException):
+    with pytest.raises(sqlite3.IntegrityError):
         _insert_source(con, "video", file_id="no-such-file")
 
 
@@ -108,7 +124,7 @@ def test_site_sources_rejects_a_duplicate_version_for_a_site():
     con = _with_site_and_file()
     _insert_source(con, "stream", stream_url="rtsp://a", version=1, source_id="src1")
 
-    with pytest.raises(duckdb.ConstraintException):
+    with pytest.raises(sqlite3.IntegrityError):
         _insert_source(con, "stream", stream_url="rtsp://b", version=1, source_id="src2")
 
 
@@ -122,7 +138,7 @@ def test_site_sources_defaults_to_created_status():
 def test_site_sources_rejects_an_unknown_status():
     con = _with_site_and_file()
 
-    with pytest.raises(duckdb.ConstraintException):
+    with pytest.raises(sqlite3.IntegrityError):
         con.execute(
             "INSERT INTO site_sources (id, site_id, version, kind, stream_url, status)"
             " VALUES ('src1', 's1', 1, 'stream', 'rtsp://cam', 'vibing')"
@@ -130,8 +146,7 @@ def test_site_sources_rejects_an_unknown_status():
 
 
 def test_init_db_is_idempotent():
-    con = duckdb.connect(":memory:")
-    init_db(con)
+    con = _fresh()
     init_db(con)  # should not raise
 
 
@@ -141,8 +156,7 @@ VERSIONED_DOC_TABLES = ("camera_calibrations", "configurations")
 
 
 def _seeded(table_and_rows=True):
-    con = duckdb.connect(":memory:")
-    init_db(con)
+    con = _fresh()
     con.execute("INSERT INTO sites (id, name) VALUES ('s1', 'A')")
     con.execute(
         "INSERT INTO files (id, name, url, type, status)"
@@ -153,10 +167,9 @@ def _seeded(table_and_rows=True):
 
 @pytest.mark.parametrize("table", VERSIONED_DOC_TABLES)
 def test_versioned_doc_table_has_the_expected_columns(table):
-    con = duckdb.connect(":memory:")
-    init_db(con)
+    con = _fresh()
 
-    columns = {row[0] for row in con.execute(f"DESCRIBE {table}").fetchall()}
+    columns = _columns(con, table)
     assert columns == {
         "id", "site_id", "file_id", "version", "created_at", "updated_at",
     }
@@ -166,7 +179,7 @@ def test_versioned_doc_table_has_the_expected_columns(table):
 def test_versioned_doc_rejects_unknown_site_id(table):
     con = _seeded()
 
-    with pytest.raises(duckdb.ConstraintException):
+    with pytest.raises(sqlite3.IntegrityError):
         con.execute(
             f"INSERT INTO {table} (id, site_id, file_id, version)"
             " VALUES ('c1', 'no-such-site', 'f1', 1)"
@@ -179,7 +192,7 @@ def test_versioned_doc_rejects_unknown_file_id(table):
     # does not exist.
     con = _seeded()
 
-    with pytest.raises(duckdb.ConstraintException):
+    with pytest.raises(sqlite3.IntegrityError):
         con.execute(
             f"INSERT INTO {table} (id, site_id, file_id, version)"
             " VALUES ('c1', 's1', 'no-such-file', 1)"
@@ -191,17 +204,16 @@ def test_versioned_doc_rejects_duplicate_version_for_a_site(table):
     con = _seeded()
     con.execute(f"INSERT INTO {table} (id, site_id, file_id, version) VALUES ('c1', 's1', 'f1', 1)")
 
-    with pytest.raises(duckdb.ConstraintException):
+    with pytest.raises(sqlite3.IntegrityError):
         con.execute(
             f"INSERT INTO {table} (id, site_id, file_id, version) VALUES ('c2', 's1', 'f1', 1)"
         )
 
 
 def test_init_db_creates_files_table():
-    con = duckdb.connect(":memory:")
-    init_db(con)
+    con = _fresh()
 
-    columns = {row[0] for row in con.execute("DESCRIBE files").fetchall()}
+    columns = _columns(con, "files")
     assert columns == {
         "id", "name", "url", "type", "status",
         "content_type", "size_bytes", "created_at", "updated_at",
@@ -209,8 +221,7 @@ def test_init_db_creates_files_table():
 
 
 def test_files_defaults_to_pending_status():
-    con = duckdb.connect(":memory:")
-    init_db(con)
+    con = _fresh()
     con.execute(
         "INSERT INTO files (id, name, url, type) VALUES ('f1', 'a.mp4', 'video/f1/a.mp4', 'video')"
     )
@@ -219,21 +230,61 @@ def test_files_defaults_to_pending_status():
 
 
 def test_files_rejects_unknown_type():
-    con = duckdb.connect(":memory:")
-    init_db(con)
+    con = _fresh()
 
-    with pytest.raises(duckdb.ConstraintException):
+    with pytest.raises(sqlite3.IntegrityError):
         con.execute(
             "INSERT INTO files (id, name, url, type) VALUES ('f1', 'a', 'k', 'not-a-type')"
         )
 
 
 def test_files_rejects_unknown_status():
-    con = duckdb.connect(":memory:")
-    init_db(con)
+    con = _fresh()
 
-    with pytest.raises(duckdb.ConstraintException):
+    with pytest.raises(sqlite3.IntegrityError):
         con.execute(
             "INSERT INTO files (id, name, url, type, status)"
             " VALUES ('f1', 'a', 'k', 'video', 'halfway')"
         )
+
+
+def test_site_sources_metadata_survives_a_numeric_looking_document():
+    """The reason the column is TEXT and not JSON.
+
+    SQLite gives a JSON-declared column NUMERIC affinity, so a document that happens to
+    look like a number is coerced on the way in and comes back as an int — valid JSON
+    turning into something Pydantic then refuses. Declaring TEXT is the whole fix, and
+    this is what keeps it from being quietly reverted.
+    """
+    con = _with_site_and_file()
+    _insert_source(con, "stream", stream_url="rtsp://cam")
+    con.execute("UPDATE site_sources SET metadata = '123' WHERE id = 'src1'")
+
+    value, kind = con.execute(
+        "SELECT metadata, typeof(metadata) FROM site_sources WHERE id = 'src1'"
+    ).fetchone()
+    assert (value, kind) == ("123", "text")
+
+
+def test_deleting_a_site_cascades_to_everything_that_hangs_off_it():
+    """Schema-level now, not application-level.
+
+    delete_site used to issue four DELETEs in a particular order because DuckDB had no
+    ON DELETE CASCADE. SQLite does, so the rule moved into init.py — and it belongs in
+    a schema test rather than a service test now that the schema is what enforces it.
+    """
+    con = _with_site_and_file()
+    _insert_source(con, "video", file_id="f1")
+    for table in VERSIONED_DOC_TABLES:
+        con.execute(
+            f"INSERT INTO {table} (id, site_id, file_id, version)"
+            f" VALUES ('{table[:3]}1', 's1', 'f1', 1)"
+        )
+
+    con.execute("DELETE FROM sites WHERE id = 's1'")
+
+    for table in ("site_sources", *VERSIONED_DOC_TABLES):
+        assert con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+    # The file itself outlives the site that referenced it: nothing cascades to files,
+    # which is what keeps a calibration reusable across sites.
+    assert con.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 1
