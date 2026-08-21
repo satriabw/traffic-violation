@@ -1,5 +1,3 @@
-import json
-
 import numpy as np
 import pytest
 
@@ -9,8 +7,8 @@ from trajectory_collector import CalibrationInvalid, CameraModel
 def overhead(focal: float = 1000.0, height: float = 100.0) -> dict:
     """A camera looking straight down from `height` metres.
 
-    Deliberately the simplest calibration that is still a real one: with no rotation
-    and the camera on the optical axis, the ground is a plain scaling of the image at
+    Deliberately the simplest camera that is still a real one: with no rotation and the
+    camera on the optical axis, the ground is a plain scaling of the image at
     `height / focal` metres per pixel. Defaults give 0.1 m/px, so every expected value
     in these tests can be worked out by hand.
     """
@@ -22,7 +20,7 @@ def overhead(focal: float = 1000.0, height: float = 100.0) -> dict:
 
 
 def test_a_pixel_becomes_a_point_in_metres():
-    model = CameraModel.from_calibration(overhead())
+    model = CameraModel.from_matrices(**overhead())
 
     ground = model.project_to_ground(np.array([[100.0, 250.0]]))
 
@@ -31,7 +29,7 @@ def test_a_pixel_becomes_a_point_in_metres():
 
 
 def test_the_whole_frame_projects_in_one_call():
-    model = CameraModel.from_calibration(overhead())
+    model = CameraModel.from_matrices(**overhead())
 
     ground = model.project_to_ground(np.array([[0.0, 0.0], [10.0, 20.0], [-30.0, 5.0]]))
 
@@ -41,7 +39,7 @@ def test_the_whole_frame_projects_in_one_call():
 def test_an_empty_frame_projects_to_nothing():
     # Most frames of most footage have something in them, but not all, and an empty
     # array must not become an exception halfway down a video.
-    ground = CameraModel.from_calibration(overhead()).project_to_ground(
+    ground = CameraModel.from_matrices(**overhead()).project_to_ground(
         np.empty((0, 2))
     )
 
@@ -61,7 +59,7 @@ def test_a_ground_point_survives_the_round_trip():
         ],
         "tvec": [-1.62685621, 0.940755188, 91.4862976],
     }
-    model = CameraModel.from_calibration(document)
+    model = CameraModel.from_matrices(**document)
     pixel_from_ground = np.linalg.inv(model.ground_from_pixel)
 
     truth = np.array([[3.0, 12.0], [-7.5, 40.0]])
@@ -74,7 +72,7 @@ def test_a_ground_point_survives_the_round_trip():
 def test_further_away_is_more_metres_per_pixel():
     # The property that makes projecting worth doing at all: two objects the same
     # distance apart on screen are not the same distance apart on the ground.
-    model = CameraModel.from_calibration(_tilted())
+    model = CameraModel.from_matrices(**_tilted())
 
     # A hundred pixels apart in both cases; the far pair is nearer the horizon.
     near = model.project_to_ground(np.array([[0.0, 500.0], [0.0, 400.0]]))
@@ -102,7 +100,7 @@ def test_a_pixel_on_the_horizon_has_no_ground_point():
     # Its ray runs parallel to the ground and never meets it, so there is no answer to
     # return. Non-finite rather than an exception: one stray detection box should cost
     # that box, not the video.
-    ground = CameraModel.from_calibration(_tilted()).project_to_ground(
+    ground = CameraModel.from_matrices(**_tilted()).project_to_ground(
         np.array([[0.0, 0.0]])
     )
 
@@ -112,7 +110,7 @@ def test_a_pixel_on_the_horizon_has_no_ground_point():
 def test_one_pixel_on_the_horizon_does_not_spoil_the_rest_of_the_frame():
     # The whole frame projects in one multiply, so a single unusable box must not take
     # its neighbours with it.
-    ground = CameraModel.from_calibration(_tilted()).project_to_ground(
+    ground = CameraModel.from_matrices(**_tilted()).project_to_ground(
         np.array([[0.0, 500.0], [0.0, 0.0], [0.0, 400.0]])
     )
 
@@ -123,22 +121,12 @@ def test_one_pixel_on_the_horizon_does_not_spoil_the_rest_of_the_frame():
 # --- documents that cannot be used --------------------------------------------
 
 
-def test_a_missing_field_is_rejected_at_construction():
-    # Not on some frame in the middle of a video. A calibration is checked once and
-    # used tens of thousands of times.
-    document = overhead()
-    del document["rot_matrix"]
-
-    with pytest.raises(CalibrationInvalid, match="no rot_matrix"):
-        CameraModel.from_calibration(document)
-
-
 def test_a_field_of_the_wrong_shape_is_rejected():
     document = overhead()
     document["camera_matrix"] = [[1.0, 0.0], [0.0, 1.0]]
 
     with pytest.raises(CalibrationInvalid, match="shape"):
-        CameraModel.from_calibration(document)
+        CameraModel.from_matrices(**document)
 
 
 def test_a_field_that_is_not_numbers_is_rejected():
@@ -146,7 +134,7 @@ def test_a_field_that_is_not_numbers_is_rejected():
     document["tvec"] = ["over", "there", "somewhere"]
 
     with pytest.raises(CalibrationInvalid, match="not numeric"):
-        CameraModel.from_calibration(document)
+        CameraModel.from_matrices(**document)
 
 
 def test_a_camera_with_no_invertible_ground_plane_is_rejected():
@@ -156,7 +144,7 @@ def test_a_camera_with_no_invertible_ground_plane_is_rejected():
     document["tvec"] = [0.0, 0.0, 0.0]
 
     with pytest.raises(CalibrationInvalid, match="ground plane"):
-        CameraModel.from_calibration(document)
+        CameraModel.from_matrices(**document)
 
 
 def test_a_flat_row_major_matrix_is_accepted():
@@ -165,7 +153,7 @@ def test_a_flat_row_major_matrix_is_accepted():
     document = overhead()
     document["camera_matrix"] = [1000.0, 0.0, 0.0, 0.0, 1000.0, 0.0, 0.0, 0.0, 1.0]
 
-    model = CameraModel.from_calibration(document)
+    model = CameraModel.from_matrices(**document)
 
     assert model.project_to_ground(np.array([[100.0, 0.0]])) == pytest.approx(np.array([[10.0, 0.0]]))
 
@@ -174,41 +162,95 @@ def test_a_column_vector_translation_is_accepted():
     document = overhead()
     document["tvec"] = [[0.0], [0.0], [100.0]]
 
-    model = CameraModel.from_calibration(document)
+    model = CameraModel.from_matrices(**document)
 
     assert model.project_to_ground(np.array([[100.0, 0.0]])) == pytest.approx(np.array([[10.0, 0.0]]))
 
 
-# --- reading one from disk ----------------------------------------------------
+# --- reading one from a document ----------------------------------------------
+
+OPENCV_YML = """%YAML:1.0
+---
+camera_matrix: !!opencv-matrix
+   rows: 3
+   cols: 3
+   dt: d
+   data: [ 1000., 0., 0., 0., 1000., 0., 0., 0., 1. ]
+dist_coeffs: !!opencv-matrix
+   rows: 4
+   cols: 1
+   dt: d
+   data: [ 0., 0., 0., 0. ]
+rot_matrix: !!opencv-matrix
+   rows: 3
+   cols: 3
+   dt: d
+   data: [ 1., 0., 0., 0., 1., 0., 0., 0., 1. ]
+tvec: !!opencv-matrix
+   rows: 3
+   cols: 1
+   dt: d
+   data: [ 0., 0., 100. ]
+"""
 
 
-def test_a_calibration_can_be_read_from_a_json_file(tmp_path):
-    path = tmp_path / "camera_model.json"
-    path.write_text(json.dumps(overhead()))
+def test_a_calibration_is_read_from_the_document_a_calibration_tool_wrote():
+    # The same overhead camera as above, in the one format calibrations come in — and
+    # it needs no conversion first. `data` is flat and row-major, `tvec` is a column,
+    # and dist_coeffs is present and ignored.
+    model = CameraModel.from_calibration(OPENCV_YML.encode())
+
+    assert model.project_to_ground(np.array([[100.0, 0.0]])) == pytest.approx(
+        np.array([[10.0, 0.0]])
+    )
+
+
+def test_a_calibration_can_be_read_from_a_file(tmp_path):
+    path = tmp_path / "camera_model.yml"
+    path.write_text(OPENCV_YML)
 
     model = CameraModel.from_calibration(path)
 
-    assert model.project_to_ground(np.array([[100.0, 0.0]])) == pytest.approx(np.array([[10.0, 0.0]]))
+    assert model.project_to_ground(np.array([[100.0, 0.0]])) == pytest.approx(
+        np.array([[10.0, 0.0]])
+    )
 
 
-def test_an_opencv_yml_calibration_says_what_to_do_about_it(tmp_path):
-    # Reading one needs OpenCV, which this package deliberately does not depend on.
-    # The error has to say so, because the file is not wrong — only unsupported here.
-    path = tmp_path / "camera_model.yml"
-    path.write_text("%YAML:1.0\n")
+def test_a_calibration_can_be_read_from_bytes_with_no_file_behind_them():
+    # How the detection worker holds one: fetched from object storage, with no path to
+    # point at. Writing it to a temp file to be allowed to read it would be absurd.
+    model = CameraModel.from_calibration(bytearray(OPENCV_YML.encode()))
 
-    with pytest.raises(CalibrationInvalid, match="convert it to JSON"):
-        CameraModel.from_calibration(path)
+    assert model.project_to_ground(np.array([[100.0, 0.0]])) == pytest.approx(
+        np.array([[10.0, 0.0]])
+    )
+
+
+def test_a_calibration_missing_a_node_is_rejected_by_name():
+    # Absent rather than empty, so the error names the field the same way it would for
+    # a camera built from matrices directly.
+    without_rotation = "\n".join(
+        line for line in OPENCV_YML.splitlines() if "rot_matrix" not in line
+    )
+
+    with pytest.raises(CalibrationInvalid, match="no rot_matrix"):
+        CameraModel.from_calibration(without_rotation.encode())
+
+
+def test_a_document_that_is_not_a_calibration_is_rejected():
+    # OpenCV surfaces a malformed document as a bare SystemError out of its
+    # constructor, which is not an exception type any caller should ever see.
+    with pytest.raises(CalibrationInvalid, match="not a readable OpenCV calibration"):
+        CameraModel.from_calibration(b"not a calibration at all")
+
+
+def test_a_json_document_is_rejected_as_the_wrong_format():
+    # JSON is not read. Calibrations are what calibration tools write, and supporting
+    # a second format bought nothing but the code to tell them apart.
+    with pytest.raises(CalibrationInvalid):
+        CameraModel.from_calibration(b'{"camera_matrix": [[1, 0, 0]]}')
 
 
 def test_a_calibration_file_that_is_not_there_is_rejected(tmp_path):
     with pytest.raises(CalibrationInvalid, match="cannot read"):
-        CameraModel.from_calibration(tmp_path / "absent.json")
-
-
-def test_a_calibration_file_that_is_not_json_is_rejected(tmp_path):
-    path = tmp_path / "camera_model.json"
-    path.write_text("{not json at all")
-
-    with pytest.raises(CalibrationInvalid, match="not valid JSON"):
-        CameraModel.from_calibration(path)
+        CameraModel.from_calibration(tmp_path / "absent.yml")

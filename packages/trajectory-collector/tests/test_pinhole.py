@@ -14,12 +14,10 @@ PIXELS_PER_FRAME = SPEED / FPS / METRES_PER_PIXEL
 
 
 def _camera() -> CameraModel:
-    return CameraModel.from_calibration(
-        {
-            "camera_matrix": [[1000.0, 0.0, 0.0], [0.0, 1000.0, 0.0], [0.0, 0.0, 1.0]],
-            "rot_matrix": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-            "tvec": [0.0, 0.0, 100.0],
-        }
+    return CameraModel.from_matrices(
+        camera_matrix=[[1000.0, 0.0, 0.0], [0.0, 1000.0, 0.0], [0.0, 0.0, 1.0]],
+        rot_matrix=[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        tvec=[0.0, 0.0, 100.0],
     )
 
 
@@ -216,12 +214,10 @@ def test_a_box_that_does_not_meet_the_ground_is_skipped_not_reported():
     # Above the horizon there is no ground point. Letting the resulting nan into a
     # Kalman filter would not cost one frame — it would poison every estimate that
     # track produced afterwards.
-    tilted = CameraModel.from_calibration(
-        {
-            "camera_matrix": [[1000.0, 0.0, 0.0], [0.0, 1000.0, 0.0], [0.0, 0.0, 1.0]],
-            "rot_matrix": [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]],
-            "tvec": [0.0, 5.0, 40.0],
-        }
+    tilted = CameraModel.from_matrices(
+        camera_matrix=[[1000.0, 0.0, 0.0], [0.0, 1000.0, 0.0], [0.0, 0.0, 1.0]],
+        rot_matrix=[[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]],
+        tvec=[0.0, 5.0, 40.0],
     )
     collector = PinholeCollector(tilted, fps=FPS)
 

@@ -3,13 +3,18 @@ name = "trajectory-collector"
 version = "0.1.0"
 description = "Ground-plane trajectories and speeds from tracked bounding boxes"
 requires-python = ">=3.11"
-# numpy and nothing else, on purpose. This package is here because the same code has
-# been copied into several projects; the thing that makes it liftable out of this one
-# is that it depends on nothing in it. Not `shared`, not the detection worker, and
-# notably not opencv or a detection library either — projecting a point to the ground
-# plane is linear algebra, and boxes arrive as arrays rather than as any library's
-# detection type.
-dependencies = ["numpy"]
+# Two, and nothing from this repository. That last part is the point: this package is
+# here because the same code has been copied into several projects by hand, and what
+# makes it liftable back out is that it imports nothing from around it — not `shared`,
+# not the detection worker, and no detection library either. Boxes arrive as arrays
+# rather than as any library's detection type.
+#
+# OpenCV is here for one reason: calibrations are FileStorage documents, and reading
+# one needs it. The headless build, because nothing here opens a window — a consumer
+# that already has `opencv-python` should exclude this to avoid two builds in one
+# environment. Nothing else uses it; projecting a point to the ground plane is linear
+# algebra.
+dependencies = ["numpy", "opencv-python-headless>=4.9"]
 
 [build-system]
 requires = ["setuptools>=68"]

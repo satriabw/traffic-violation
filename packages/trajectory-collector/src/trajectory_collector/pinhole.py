@@ -23,7 +23,6 @@ measurements into a departed object's filter.
 
 from dataclasses import dataclass, field
 from os import PathLike
-from typing import Any, Mapping
 
 import numpy as np
 
@@ -198,7 +197,7 @@ def _trajectory(state: np.ndarray) -> Trajectory:
 
 
 def collector_from_calibration(
-    source: str | PathLike | Mapping[str, Any], fps: float
+    source: str | PathLike | bytes | bytearray, fps: float
 ) -> PinholeCollector:
     """The collector a calibration document calls for.
 

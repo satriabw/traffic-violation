@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from shared.models.detection import DetectionJob
-from shared.s3.client import get_json
+from shared.s3.client import get_bytes, get_json
 
 # Table names, as module constants. Interpolated into SQL below and never derived from
 # a message — the same rule site_service.service follows for the pair.
@@ -39,9 +39,17 @@ class ContextMissing(RuntimeError):
 
 @dataclass(frozen=True)
 class JobContext:
-    """What a rule engine will need, already parsed. Both None until a site has them."""
+    """What a rule engine will need. Both None until a site has them.
 
-    calibration: dict | None = None
+    The two are fetched differently, and the asymmetry is deliberate. A configuration
+    is ours — we define its shape, it is JSON, and parsing it here is the last anyone
+    has to think about it. A calibration is not: it is whatever the tool that produced
+    the camera model wrote, which in practice is an OpenCV FileStorage `.yml`. So it
+    travels as the raw document and `trajectory_collector` decides what it means, which
+    is the only place that knows what a camera model is.
+    """
+
+    calibration: bytes | None = None
     configuration: dict | None = None
 
 
@@ -67,23 +75,26 @@ def _document_key(
 def load(
     con: sqlite3.Connection,
     job: DetectionJob,
-    fetch: Callable[[str], dict] = get_json,
+    fetch_json: Callable[[str], dict] = get_json,
+    fetch_bytes: Callable[[str], bytes] = get_bytes,
 ) -> JobContext:
     """The calibration and configuration this job was created against.
 
-    `fetch` is injectable so tests resolve real keys out of a real database without
-    object storage anywhere in reach.
+    Both fetchers are injectable so tests resolve real keys out of a real database
+    without object storage anywhere in reach.
     """
     return JobContext(
         calibration=(
             None
             if job.calibration_version is None
-            else fetch(_document_key(con, CALIBRATIONS, job.site_id, job.calibration_version))
+            else fetch_bytes(
+                _document_key(con, CALIBRATIONS, job.site_id, job.calibration_version)
+            )
         ),
         configuration=(
             None
             if job.configuration_version is None
-            else fetch(
+            else fetch_json(
                 _document_key(con, CONFIGURATIONS, job.site_id, job.configuration_version)
             )
         ),
