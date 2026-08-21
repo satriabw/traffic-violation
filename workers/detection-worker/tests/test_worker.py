@@ -4,8 +4,9 @@ import supervision as sv
 from shared.models.detection import DetectionJob, FrameRange, JobSource, ViolationType
 from shared.queue.memory import InMemoryQueue
 
-from detection_worker.reader import VideoUnavailable
+from detection_worker.analysis.frame_result import FrameResult
 from detection_worker.context import JobContext
+from detection_worker.reader import VideoUnavailable
 from detection_worker.worker import make_handler, run
 
 
@@ -39,64 +40,60 @@ def _reader_of(frame_count: int):
     return read
 
 
-class FakeModel:
-    """A detector with no model behind it.
+class FakeAnalyzer:
+    """A per-frame pipeline with nothing behind it.
 
-    The point of the DetectionModel protocol being one method: everything downstream
-    of inference can be exercised on a laptop with no GPU and no weights file.
+    The handler's job is orchestration — sign, read, aggregate, log — so everything
+    here can be exercised without a model, a tracker or a weights file. What detection
+    and tracking do with a frame is the analyzer suite's business.
     """
 
-    def __init__(self, detections_per_frame: int = 0):
-        self.frames: list[np.ndarray] = []
+    def __init__(self, job, detections_per_frame: int = 0):
+        self.job = job
+        self.analyzed: list[tuple[np.ndarray, int]] = []
         self._count = detections_per_frame
 
-    def predict(self, frame: np.ndarray) -> sv.Detections:
-        self.frames.append(frame)
+    def analyze(self, frame: np.ndarray, index: int) -> FrameResult:
+        self.analyzed.append((frame, index))
         if self._count == 0:
-            return sv.Detections.empty()
-        return sv.Detections(
-            xyxy=np.array(
-                [[i, i, i + 10, i + 10] for i in range(self._count)], dtype=np.float32
+            return FrameResult(index=index, detections=sv.Detections.empty())
+        return FrameResult(
+            index=index,
+            detections=sv.Detections(
+                xyxy=np.array(
+                    [[i, i, i + 10, i + 10] for i in range(self._count)], dtype=np.float32
+                ),
+                confidence=np.full(self._count, 0.9, dtype=np.float32),
+                class_id=np.full(self._count, 2, dtype=np.int16),
+                # The tracker numbers them 1..n every frame, so a multi-frame job sees
+                # the same handful of ids over and over — which is what makes the
+                # distinct-id count in the summary worth asserting on.
+                tracker_id=np.arange(1, self._count + 1),
             ),
-            confidence=np.full(self._count, 0.9, dtype=np.float32),
-            class_id=np.full(self._count, 2, dtype=np.int16),
         )
 
 
-class FakeTracker:
-    def __init__(self, fps):
-        self.fps = fps
-        self.updates: list[sv.Detections] = []
+def _analyzers(detections_per_frame: int = 0):
+    """An analyzer factory that records every analyzer it was asked to build."""
+    made: list[FakeAnalyzer] = []
 
-    def update(self, detections: sv.Detections) -> sv.Detections:
-        self.updates.append(detections)
-        if len(detections):
-            detections.tracker_id = np.arange(1, len(detections) + 1)
-        return detections
-
-
-def _trackers():
-    """A tracker factory that records every tracker it was asked to build."""
-    made: list[FakeTracker] = []
-
-    def factory(fps):
-        tracker = FakeTracker(fps)
-        made.append(tracker)
-        return tracker
+    def factory(job):
+        analyzer = FakeAnalyzer(job, detections_per_frame)
+        made.append(analyzer)
+        return analyzer
 
     factory.made = made
     return factory
 
 
-def _handler(model=None, sign=None, read=None, new_tracker=None, load_context=None):
+def _handler(sign=None, read=None, new_analyzer=None, load_context=None):
     return make_handler(
-        model if model is not None else FakeModel(),
         # A site with neither document is the default here: these tests are about
         # frames, detections and ids, and context has its own suite.
         load_context or (lambda job: JobContext()),
+        new_analyzer or _analyzers(),
         sign=sign or (lambda key: "u"),
         read=read if read is not None else _reader_of(frame_count=0),
-        new_tracker=new_tracker or _trackers(),
     )
 
 
@@ -178,86 +175,71 @@ def test_a_video_that_cannot_be_opened_stops_the_worker(caplog):
     assert queue.consume().id == "job-1"
 
 
-# --- detection and tracking ---------------------------------------------------
+# --- the analyzer's lifetime --------------------------------------------------
 
 
-def test_every_frame_read_reaches_the_model():
-    model = FakeModel()
-    read = _reader_of(frame_count=5)
+def test_every_frame_read_reaches_the_analyzer_with_its_index():
+    # Absolute indices, straight from the reader: a violation is recorded against the
+    # frame's position in the video, not its position in this run.
+    analyzers = _analyzers()
 
-    _handler(model=model, read=read)(_job("job-0"))
+    _handler(read=_reader_of(frame_count=3), new_analyzer=analyzers)(
+        _job("job-0", start=900, end=1800)
+    )
 
-    assert len(model.frames) == 5
-
-
-def test_the_tracker_is_built_once_per_job_not_once_per_frame():
-    # The lifetime this whole design turns on. A tracker built per frame would have no
-    # memory of the previous one, so nothing would ever hold an id for two frames.
-    trackers = _trackers()
-
-    _handler(read=_reader_of(frame_count=6), new_tracker=trackers)(_job("job-0"))
-
-    assert len(trackers.made) == 1
+    assert [index for _, index in analyzers.made[0].analyzed] == [900, 901, 902]
 
 
-def test_each_job_gets_its_own_tracker():
+def test_the_analyzer_is_built_once_per_job_not_once_per_frame():
+    # The lifetime this whole design turns on. An analyzer built per frame would carry
+    # a tracker with no memory of the previous one, so nothing would ever hold an id
+    # for two frames.
+    analyzers = _analyzers()
+
+    _handler(read=_reader_of(frame_count=6), new_analyzer=analyzers)(_job("job-0"))
+
+    assert len(analyzers.made) == 1
+
+
+def test_each_job_gets_its_own_analyzer():
     # The other half of it: state from one job must not survive into the next, or a
     # track from one site could be re-matched against another's.
-    trackers = _trackers()
-    handle = _handler(read=_reader_of(frame_count=2), new_tracker=trackers)
+    analyzers = _analyzers()
+    handle = _handler(read=_reader_of(frame_count=2), new_analyzer=analyzers)
 
     handle(_job("job-0"))
     handle(_job("job-1"))
 
-    assert len(trackers.made) == 2
-    assert trackers.made[0] is not trackers.made[1]
+    assert len(analyzers.made) == 2
+    assert analyzers.made[0] is not analyzers.made[1]
 
 
-def test_the_tracker_is_built_with_the_sources_frame_rate():
-    trackers = _trackers()
+def test_the_analyzer_is_built_from_the_job():
+    # It is what carries the frame rate the tracker is scaled by, and — once
+    # trajectories land — the calibration the camera model is built from.
+    analyzers = _analyzers()
 
-    _handler(read=_reader_of(frame_count=1), new_tracker=trackers)(_job("job-0"))
+    _handler(read=_reader_of(frame_count=1), new_analyzer=analyzers)(_job("job-0"))
 
-    # _job carries fps=30.0 on its JobSource.
-    assert trackers.made[0].fps == 30.0
-
-
-def test_the_tracker_sees_what_the_model_produced():
-    model = FakeModel(detections_per_frame=3)
-    trackers = _trackers()
-
-    _handler(model=model, read=_reader_of(frame_count=2), new_tracker=trackers)(_job("job-0"))
-
-    updates = trackers.made[0].updates
-    assert len(updates) == 2
-    assert [len(update) for update in updates] == [3, 3]
+    assert analyzers.made[0].job.id == "job-0"
+    assert analyzers.made[0].job.source.fps == 30.0
 
 
-def test_frames_with_nothing_in_them_still_reach_the_tracker():
-    # Most frames of most footage. Skipping the update would let the tracker's frame
-    # counter fall behind the video and age every lost track wrongly.
-    model = FakeModel(detections_per_frame=0)
-    trackers = _trackers()
-
-    _handler(model=model, read=_reader_of(frame_count=4), new_tracker=trackers)(_job("job-0"))
-
-    assert len(trackers.made[0].updates) == 4
+# --- the summary --------------------------------------------------------------
 
 
 def test_the_summary_logs_how_much_was_detected_and_tracked(caplog):
-    model = FakeModel(detections_per_frame=2)
-
     with caplog.at_level("INFO"):
-        _handler(model=model, read=_reader_of(frame_count=3))(_job("job-0"))
+        _handler(read=_reader_of(frame_count=3), new_analyzer=_analyzers(2))(_job("job-0"))
 
-    # 3 frames x 2 detections, and the fake tracker numbers them 1..2 every frame, so
+    # 3 frames x 2 detections, and the fake analyzer numbers them 1..2 every frame, so
     # two distinct ids across the job.
     assert "read=3 detections=6 tracks=2" in caplog.text
 
 
 def test_a_job_that_detects_nothing_still_logs_a_summary(caplog):
     with caplog.at_level("INFO"):
-        _handler(model=FakeModel(0), read=_reader_of(frame_count=3))(_job("job-0"))
+        _handler(read=_reader_of(frame_count=3), new_analyzer=_analyzers(0))(_job("job-0"))
 
     assert "read=3 detections=0 tracks=0" in caplog.text
 
@@ -265,13 +247,11 @@ def test_a_job_that_detects_nothing_still_logs_a_summary(caplog):
 def test_per_frame_detail_is_logged_at_debug_not_info(caplog):
     # A 30-second chunk is ~900 frames. Per-frame lines at INFO would bury the one
     # line anyone watching a normal run actually wants.
-    model = FakeModel(detections_per_frame=1)
-
     with caplog.at_level("INFO"):
-        _handler(model=model, read=_reader_of(frame_count=2))(_job("job-0"))
+        _handler(read=_reader_of(frame_count=2), new_analyzer=_analyzers(1))(_job("job-0"))
     assert "frame 0" not in caplog.text
 
     caplog.clear()
     with caplog.at_level("DEBUG"):
-        _handler(model=model, read=_reader_of(frame_count=2))(_job("job-0"))
+        _handler(read=_reader_of(frame_count=2), new_analyzer=_analyzers(1))(_job("job-0"))
     assert "frame 0 detections=1 ids=[1]" in caplog.text

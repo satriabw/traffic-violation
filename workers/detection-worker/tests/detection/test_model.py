@@ -4,7 +4,12 @@ import numpy as np
 import pytest
 import supervision as sv
 
-from detection_worker.model import COCO_CLASSES, ModelUnavailable, RTDetrOnnx, resolve_model_path
+from detection_worker.detection.model import (
+    COCO_CLASSES,
+    ModelUnavailable,
+    RTDetrOnnx,
+    resolve_model_path,
+)
 
 
 class FakeSession:
