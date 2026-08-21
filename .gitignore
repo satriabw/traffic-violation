@@ -8,6 +8,8 @@ data/
 *.sqlite-shm
 .DS_Store
 *.egg-info/
+# setuptools leaves this behind on a non-editable `pip install ./packages/...`
+build/
 traffic-violation-lld-reference.md
 .env
 *.onnx

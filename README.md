@@ -4,7 +4,8 @@
 
 ```
 python3 -m venv .venv
-.venv/bin/pip install -e ./shared -e ./services/site-service -e ./workers/detection-worker
+.venv/bin/pip install -e ./shared -e ./packages/trajectory-collector \
+  -e ./services/site-service -e ./workers/detection-worker
 ```
 
 Note: on macOS, `pip install -e` can silently no-op — files it creates starting
@@ -36,7 +37,8 @@ PYTHONPATH=shared/src:services/site-service .venv/bin/uvicorn site_service.main:
 
 # 3. the detection worker
 set -a; source .env; set +a
-PYTHONPATH=shared/src:workers/detection-worker .venv/bin/python -m detection_worker.worker
+PYTHONPATH=shared/src:packages/trajectory-collector/src:workers/detection-worker \
+  .venv/bin/python -m detection_worker.worker
 ```
 
 Source `.env` in **each** shell that needs it. The worker reads `REDIS_URL` from the
@@ -236,7 +238,8 @@ worker's entrypoint ordinary Python rather than a framework's. `LPUSH` at the he
 `BRPOP` at the tail — that pairing is what makes it FIFO.
 
 ```
-PYTHONPATH=shared/src:workers/detection-worker .venv/bin/python -m detection_worker.worker
+PYTHONPATH=shared/src:packages/trajectory-collector/src:workers/detection-worker \
+  .venv/bin/python -m detection_worker.worker
 ```
 
 The worker signs a url from the job's `source.key`, reads the frames the job asks for,
@@ -255,8 +258,49 @@ one thing in this design worth being careful about — a tracker holds live stat
 sharing one across jobs would let a track from one site's chunk be re-matched against
 another's, and the corruption would arrive silently.
 
-Frames come from `detection_worker/reader.py`. OpenCV opens the presigned url through
-its ffmpeg backend, which range-requests the object — the same mechanism the probe
+### Trajectories
+
+Where an object is on screen is not where it is. Two cars a hundred pixels apart are
+metres apart at the bottom of a frame and tens of metres apart at the top, so any rule
+about speed or distance has to work on the ground plane rather than in pixels. Turning
+one into the other is what a site's calibration is for.
+
+That work lives in **`packages/trajectory-collector/`**, a separate distribution rather
+than another module in the worker:
+
+```python
+from trajectory_collector import TrajectoryCollector
+
+collector = TrajectoryCollector.from_calibration(document, fps=30.0)
+trajectories = collector.collect(boxes, track_ids, frame_index)
+# {track_id: Trajectory(position=(x, y), speed=…)}   metres, metres per second
+```
+
+It is separate because the same code has been copied into several projects, and the
+thing that makes it liftable back out of this one is that it depends on nothing in
+here. Not `shared`, not the worker — and notably not supervision or OpenCV either, so
+its whole dependency list is numpy. That constraint is what shapes the interface:
+`collect` takes plain arrays rather than an `sv.Detections`, and the translation
+between them is two attribute reads in `frame_analyzer._tracked`. Nothing in the API
+mentions a site, a job or a frame range, because none of those exist outside this
+system.
+
+`from_calibration` is the only entry point. Which projection a calibration calls for is
+the package's decision, so the worker never names a camera model, a filter or a
+projection — the same way it opens a video without naming a decoder.
+
+The collector is per-job for the same reason the tracker is, and by the same key:
+tracker ids restart at 1 for every job, so a collector outliving one would merge
+unrelated objects. A site with no calibration gets a `NullCollector`, which reports
+nothing — an uncalibrated site is a normal state, not a failure, and expressing it as a
+collector rather than as `None` keeps the null check out of the per-frame path.
+
+**Status:** the interface and `NullCollector` are in. `from_calibration` and the
+pinhole collector behind it land next, and until they do every job reports no
+trajectories.
+
+Frames come from `detection_worker/video/reader.py`. OpenCV opens the presigned url
+through its ffmpeg backend, which range-requests the object — the same mechanism the probe
 relies on — so nothing is downloaded to disk. `read_frames` yields `(index, frame)` over
 the half-open range with **absolute** indices: a job covering frames 900-1800 reports
 900 for its first frame, because that is the number a violation has to be recorded
