@@ -21,7 +21,7 @@ from detection_worker import context
 from detection_worker.analysis.frame_analyzer import FrameAnalyzer, make_analyzer
 from detection_worker.db import get_db
 from detection_worker.detection.model import from_config as model_from_config
-from detection_worker.reader import read_frames
+from detection_worker.video.reader import read_frames
 
 logger = logging.getLogger(__name__)
 

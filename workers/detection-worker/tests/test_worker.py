@@ -6,7 +6,7 @@ from shared.queue.memory import InMemoryQueue
 
 from detection_worker.analysis.frame_result import FrameResult
 from detection_worker.context import JobContext
-from detection_worker.reader import VideoUnavailable
+from detection_worker.video.reader import VideoUnavailable
 from detection_worker.worker import make_handler, run
 
 
@@ -56,9 +56,13 @@ class FakeAnalyzer:
     def analyze(self, frame: np.ndarray, index: int) -> FrameResult:
         self.analyzed.append((frame, index))
         if self._count == 0:
-            return FrameResult(index=index, detections=sv.Detections.empty())
+            return FrameResult(index=index, detections=sv.Detections.empty(), trajectories={})
         return FrameResult(
             index=index,
+            # Whether a job has trajectories at all depends on its calibration, which
+            # the analyzer resolves. The handler only ever counts and logs, so an empty
+            # set here is not a case it can get wrong.
+            trajectories={},
             detections=sv.Detections(
                 xyxy=np.array(
                     [[i, i, i + 10, i + 10] for i in range(self._count)], dtype=np.float32
