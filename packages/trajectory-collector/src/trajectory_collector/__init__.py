@@ -14,10 +14,22 @@ are imported by path, but a library's import path is its API. Moving a module sh
 not break anyone.
 """
 
+from trajectory_collector.camera_model import CalibrationInvalid, CameraModel
 from trajectory_collector.collector import (
     NullCollector,
     Trajectory,
     TrajectoryCollector,
 )
+from trajectory_collector.kalman import FilterParams
+from trajectory_collector.pinhole import CollectorParams, PinholeCollector
 
-__all__ = ["NullCollector", "Trajectory", "TrajectoryCollector"]
+__all__ = [
+    "CalibrationInvalid",
+    "CameraModel",
+    "CollectorParams",
+    "FilterParams",
+    "NullCollector",
+    "PinholeCollector",
+    "Trajectory",
+    "TrajectoryCollector",
+]

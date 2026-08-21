@@ -30,10 +30,40 @@ elapsed time.
 A collector holds a filter per track and track ids restart at 1 for every tracking
 session, so build one per video.
 
-## Status
+A track reports a position but no speed for its first few frames — a filter needs a
+velocity to start from, and one sighting gives none, so the warmup is spent measuring
+one. A box whose bottom edge lands on or above the horizon has no ground point at all
+and is skipped for that frame rather than reported.
 
-The interface and `NullCollector` — the "this video has no calibration" case — are in.
-`from_calibration` and the pinhole collector behind it land next.
+## Calibration documents
+
+```json
+{
+  "camera_matrix": [[fx, 0, cx], [0, fy, cy], [0, 0, 1]],
+  "rot_matrix":    [[...], [...], [...]],
+  "tvec":          [tx, ty, tz]
+}
+```
+
+Pass the path to a file like that, or the parsed mapping. Any field may also be a flat
+row-major list — the form OpenCV's `FileStorage` writes — and `tvec` is accepted as a
+column. Extra keys are ignored.
+
+OpenCV `.yml` calibrations are not read directly, because parsing one needs OpenCV and
+this package depends on numpy alone. Convert once:
+
+```python
+import cv2, json
+fs = cv2.FileStorage("camera_model.yml", cv2.FILE_STORAGE_READ)
+json.dump({
+    "camera_matrix": fs.getNode("camera_matrix").mat().tolist(),
+    "rot_matrix": fs.getNode("rot_matrix").mat().tolist(),
+    "tvec": fs.getNode("tvec").mat().reshape(-1).tolist(),
+}, open("camera_model.json", "w"))
+```
+
+An unusable document raises `CalibrationInvalid` from `from_calibration` — at
+construction, never on some frame in the middle of a video.
 
 ## Install
 

@@ -1,10 +1,12 @@
 import numpy as np
 import pytest
 import supervision as sv
+from trajectory_collector import Trajectory
 from shared.models.detection import DetectionJob, FrameRange, JobSource, ViolationType
 from shared.queue.memory import InMemoryQueue
 
 from detection_worker.analysis.frame_result import FrameResult
+from detection_worker import context
 from detection_worker.context import JobContext
 from detection_worker.video.reader import VideoUnavailable
 from detection_worker.worker import make_handler, run
@@ -48,10 +50,12 @@ class FakeAnalyzer:
     and tracking do with a frame is the analyzer suite's business.
     """
 
-    def __init__(self, job, detections_per_frame: int = 0):
+    def __init__(self, job, job_context, detections_per_frame: int = 0, locates: bool = False):
         self.job = job
+        self.job_context = job_context
         self.analyzed: list[tuple[np.ndarray, int]] = []
         self._count = detections_per_frame
+        self._locates = locates
 
     def analyze(self, frame: np.ndarray, index: int) -> FrameResult:
         self.analyzed.append((frame, index))
@@ -60,9 +64,13 @@ class FakeAnalyzer:
         return FrameResult(
             index=index,
             # Whether a job has trajectories at all depends on its calibration, which
-            # the analyzer resolves. The handler only ever counts and logs, so an empty
-            # set here is not a case it can get wrong.
-            trajectories={},
+            # the analyzer resolves — the handler only counts and logs them.
+            trajectories={
+                track_id: Trajectory(position=(0.0, 0.0), speed=1.0)
+                for track_id in range(1, self._count + 1)
+            }
+            if self._locates
+            else {},
             detections=sv.Detections(
                 xyxy=np.array(
                     [[i, i, i + 10, i + 10] for i in range(self._count)], dtype=np.float32
@@ -77,12 +85,12 @@ class FakeAnalyzer:
         )
 
 
-def _analyzers(detections_per_frame: int = 0):
+def _analyzers(detections_per_frame: int = 0, locates: bool = False):
     """An analyzer factory that records every analyzer it was asked to build."""
     made: list[FakeAnalyzer] = []
 
-    def factory(job):
-        analyzer = FakeAnalyzer(job, detections_per_frame)
+    def factory(job, job_context):
+        analyzer = FakeAnalyzer(job, job_context, detections_per_frame, locates)
         made.append(analyzer)
         return analyzer
 
@@ -219,14 +227,49 @@ def test_each_job_gets_its_own_analyzer():
 
 
 def test_the_analyzer_is_built_from_the_job():
-    # It is what carries the frame rate the tracker is scaled by, and — once
-    # trajectories land — the calibration the camera model is built from.
+    # It is what carries the frame rate the tracker and the trajectory collector are
+    # both scaled by.
     analyzers = _analyzers()
 
     _handler(read=_reader_of(frame_count=1), new_analyzer=analyzers)(_job("job-0"))
 
     assert analyzers.made[0].job.id == "job-0"
     assert analyzers.made[0].job.source.fps == 30.0
+
+
+def test_the_analyzer_is_built_from_the_context_the_job_was_pinned_to():
+    # The calibration the trajectory collector projects with. It has to be the one the
+    # job named, not whatever is active now — which is the whole reason the handler
+    # resolves context before it builds the analyzer.
+    analyzers = _analyzers()
+    pinned = JobContext(calibration={"camera_matrix": "v3"})
+
+    _handler(
+        read=_reader_of(frame_count=1),
+        new_analyzer=analyzers,
+        load_context=lambda job: pinned,
+    )(_job("job-0"))
+
+    assert analyzers.made[0].job_context is pinned
+
+
+def test_the_analyzer_is_built_after_the_context_is_resolved():
+    # A job naming a calibration that is not there should fail before anything spends
+    # minutes decoding — and before a collector is built from a document that does not
+    # exist.
+    built: list[str] = []
+
+    def load_context(job):
+        built.append("context")
+        raise context.ContextMissing("calibration v3 is not there")
+
+    def new_analyzer(job, job_context):
+        built.append("analyzer")  # pragma: no cover — must never be reached
+
+    with pytest.raises(context.ContextMissing):
+        _handler(load_context=load_context, new_analyzer=new_analyzer)(_job("job-0"))
+
+    assert built == ["context"]
 
 
 # --- the summary --------------------------------------------------------------
@@ -239,6 +282,26 @@ def test_the_summary_logs_how_much_was_detected_and_tracked(caplog):
     # 3 frames x 2 detections, and the fake analyzer numbers them 1..2 every frame, so
     # two distinct ids across the job.
     assert "read=3 detections=6 tracks=2" in caplog.text
+
+
+def test_the_summary_logs_how_many_tracks_were_put_on_the_ground(caplog):
+    with caplog.at_level("INFO"):
+        _handler(
+            read=_reader_of(frame_count=3), new_analyzer=_analyzers(2, locates=True)
+        )(_job("job-0"))
+
+    assert "tracks=2 located=2" in caplog.text
+
+
+def test_a_job_with_no_calibration_locates_nothing(caplog):
+    # Normal, not a failure: without a calibration there is no ground plane. The count
+    # is what makes the difference visible in a log rather than only in the database.
+    with caplog.at_level("INFO"):
+        _handler(
+            read=_reader_of(frame_count=3), new_analyzer=_analyzers(2, locates=False)
+        )(_job("job-0"))
+
+    assert "tracks=2 located=0" in caplog.text
 
 
 def test_a_job_that_detects_nothing_still_logs_a_summary(caplog):

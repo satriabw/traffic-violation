@@ -31,6 +31,17 @@ import supervision as sv
 DEFAULT_FPS = 30.0
 
 
+def resolve_fps(fps: float | None) -> float:
+    """The frame rate to work in, given whatever the source could tell us.
+
+    One definition, because more than one thing scales by it. The tracker ages lost
+    tracks in frames and the trajectory collector measures gaps in seconds, so a job
+    whose tracker fell back to 30 while its collector fell back to something else would
+    disagree with itself about how much time a frame is worth.
+    """
+    return fps if fps and fps > 0 else DEFAULT_FPS
+
+
 @dataclass(frozen=True)
 class TrackerParams:
     """Tuning, shared by every job. Frozen so one job cannot alter the next one's."""
@@ -76,7 +87,7 @@ def make_tracker(
     there is nothing to gain by reusing one, and correctness to lose."""
     return Tracker(
         backend_factory(
-            frame_rate=fps if fps and fps > 0 else DEFAULT_FPS,
+            frame_rate=resolve_fps(fps),
             **asdict(params),
         )
     )
