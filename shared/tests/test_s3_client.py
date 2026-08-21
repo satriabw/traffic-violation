@@ -111,3 +111,41 @@ def test_presigned_put_omits_content_length_when_not_given():
     query = parse_qs(urlparse(client.presigned_put("k")).query)
 
     assert "content-length" not in query["X-Amz-SignedHeaders"][0]
+
+
+class FakeBody:
+    """A boto3 StreamingBody with the two methods the readers call."""
+
+    def __init__(self, payload: bytes):
+        self._payload = payload
+        self.closed = False
+
+    def read(self) -> bytes:
+        return self._payload
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_get_bytes_returns_the_object_uninterpreted(monkeypatch):
+    # A calibration is whatever the tool that produced it wrote — in practice an
+    # OpenCV FileStorage document, not JSON — so this must not try to parse it.
+    body = FakeBody(b"%YAML:1.0\n---\ncamera_matrix: !!opencv-matrix\n")
+    monkeypatch.setattr(
+        client.get_client(), "get_object", lambda **kwargs: {"Body": body}
+    )
+
+    assert client.get_bytes("calibration/f1/camera_model.yml").startswith(b"%YAML")
+
+
+def test_get_bytes_closes_the_body(monkeypatch):
+    # The stream holds a connection from the pool until it is closed, and a worker
+    # that leaked one per job would run out.
+    body = FakeBody(b"anything")
+    monkeypatch.setattr(
+        client.get_client(), "get_object", lambda **kwargs: {"Body": body}
+    )
+
+    client.get_bytes("calibration/f1/camera_model.yml")
+
+    assert body.closed

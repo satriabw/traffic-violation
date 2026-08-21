@@ -30,10 +30,40 @@ elapsed time.
 A collector holds a filter per track and track ids restart at 1 for every tracking
 session, so build one per video.
 
-## Status
+A track reports a position but no speed for its first few frames — a filter needs a
+velocity to start from, and one sighting gives none, so the warmup is spent measuring
+one. A box whose bottom edge lands on or above the horizon has no ground point at all
+and is skipped for that frame rather than reported.
 
-The interface and `NullCollector` — the "this video has no calibration" case — are in.
-`from_calibration` and the pinhole collector behind it land next.
+## Calibration documents
+
+OpenCV `FileStorage`, which is what camera calibration tools write:
+
+```yaml
+%YAML:1.0
+---
+camera_matrix: !!opencv-matrix
+   rows: 3
+   cols: 3
+   dt: d
+   data: [ fx, 0., cx, 0., fy, cy, 0., 0., 1. ]
+rot_matrix: !!opencv-matrix
+   ...
+tvec: !!opencv-matrix
+   ...
+```
+
+`from_calibration` takes a path to one, or the document's own bytes — for a caller that
+fetched it from object storage and has no file to point at. Extra nodes are ignored,
+`dist_coeffs` among them, since nothing here undistorts.
+
+That is the only format. Supporting a second one bought nothing but the code to tell
+them apart. If you have the numbers rather than a document — building a camera in a
+test, say — `CameraModel.from_matrices(camera_matrix, rot_matrix, tvec)` takes anything
+array-like, flat and row-major included, and `PinholeCollector` takes the model.
+
+An unusable document raises `CalibrationInvalid` from `from_calibration` — at
+construction, never on some frame in the middle of a video.
 
 ## Install
 
@@ -41,8 +71,10 @@ The interface and `NullCollector` — the "this video has no calibration" case �
 pip install -e packages/trajectory-collector   # from a checkout of traffic-violation
 ```
 
-Depends on numpy and nothing else. It lives in this repository for now, but nothing in
-it imports anything from this repository — the day a second project needs it, it moves
+Depends on numpy and OpenCV — the headless build, since nothing here opens a window.
+Exclude it if you already have `opencv-python`, rather than ending up with two OpenCV
+builds in one environment. It lives in this repository for now, but nothing in it
+imports anything *from* this repository — the day a second project needs it, it moves
 out whole.
 
 **The name `trajectory-collector` is taken on PyPI** by an unrelated project, currently

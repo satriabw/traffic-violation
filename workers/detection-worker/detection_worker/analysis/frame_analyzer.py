@@ -22,7 +22,7 @@ from trajectory_collector import NullCollector, TrajectoryCollector
 
 from detection_worker.analysis.frame_result import FrameResult
 from detection_worker.detection.model import DetectionModel
-from detection_worker.detection.tracker import Tracker, make_tracker
+from detection_worker.detection.tracker import Tracker, make_tracker, resolve_fps
 
 
 def _tracked(detections: sv.Detections) -> tuple[np.ndarray, np.ndarray]:
@@ -79,8 +79,9 @@ class FrameAnalyzer:
 def make_analyzer(
     model: DetectionModel,
     fps: float | None,
+    calibration: bytes | None = None,
     new_tracker: Callable[[float | None], Tracker] = make_tracker,
-    trajectory_collector: TrajectoryCollector = NullCollector(),
+    new_collector: Callable[..., TrajectoryCollector] = TrajectoryCollector.from_calibration,
 ) -> FrameAnalyzer:
     """An analyzer for one job.
 
@@ -88,11 +89,27 @@ def make_analyzer(
     state — one session serves the whole process. Everything else here is cheap and
     per-job, which is why this is a factory at all.
 
-    `fps` is passed straight through: what an unknown frame rate falls back to is the
-    tracker's decision, not this one's.
+    The frame rate is resolved once and given to both collaborators, so a job whose
+    source had no probed fps cannot end up with a tracker aging tracks at one rate and
+    a collector measuring gaps at another.
 
-    `trajectory_collector` is passed in rather than built here because building one
-    needs the job's calibration, which is resolved a layer up — see
-    `detection_worker.context`. Nothing supplies a real one yet.
+    `calibration` is the raw document the job was pinned to, as fetched — resolving
+    *which* document is `detection_worker.context`'s job, and by the time anything gets
+    here the version it belongs to has been settled. What is inside it is the trajectory
+    package's business: a calibration is an OpenCV FileStorage document, and nothing on
+    this side of the boundary should have an opinion about that. None means
+    the site had none, which is a normal state: detection and tracking still run, and
+    the job simply reports no trajectories.
+
+    A calibration that cannot be projected with raises out of here, before a single
+    frame is decoded. That stops the worker, which is the same thing any other failing
+    job does today — and much better than a run that produced plausible-looking
+    positions from a broken camera model.
     """
-    return FrameAnalyzer(model, new_tracker(fps), trajectory_collector)
+    resolved = resolve_fps(fps)
+    collector = (
+        NullCollector()
+        if calibration is None
+        else new_collector(calibration, fps=resolved)
+    )
+    return FrameAnalyzer(model, new_tracker(resolved), collector)

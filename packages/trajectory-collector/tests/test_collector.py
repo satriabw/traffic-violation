@@ -3,7 +3,32 @@ import dataclasses
 import numpy as np
 import pytest
 
-from trajectory_collector import NullCollector, Trajectory, TrajectoryCollector
+from trajectory_collector import (
+    CalibrationInvalid,
+    NullCollector,
+    Trajectory,
+    TrajectoryCollector,
+)
+
+
+OVERHEAD_YML = b"""%YAML:1.0
+---
+camera_matrix: !!opencv-matrix
+   rows: 3
+   cols: 3
+   dt: d
+   data: [ 1000., 0., 0., 0., 1000., 0., 0., 0., 1. ]
+rot_matrix: !!opencv-matrix
+   rows: 3
+   cols: 3
+   dt: d
+   data: [ 1., 0., 0., 0., 1., 0., 0., 0., 1. ]
+tvec: !!opencv-matrix
+   rows: 3
+   cols: 1
+   dt: d
+   data: [ 0., 0., 100. ]
+"""
 
 
 def test_a_trajectory_is_a_position_and_a_speed():
@@ -32,11 +57,19 @@ def test_a_collector_must_implement_collect():
         Incomplete()
 
 
-def test_from_calibration_is_not_implemented_yet():
-    # It arrives with the pinhole collector. Present and raising rather than absent,
-    # so the entry point is visible and nobody reaches past it in the meantime.
-    with pytest.raises(NotImplementedError):
-        TrajectoryCollector.from_calibration({"camera_matrix": []}, fps=30.0)
+def test_from_calibration_builds_the_collector_a_calibration_calls_for():
+    # The one entry point. Which collector comes back is the package's decision, taken
+    # from what the document contains — callers name this class and no other.
+    collector = TrajectoryCollector.from_calibration(OVERHEAD_YML, fps=30.0)
+
+    assert isinstance(collector, TrajectoryCollector)
+    assert not isinstance(collector, NullCollector)
+
+
+def test_from_calibration_rejects_a_document_it_cannot_project_with():
+    # At construction, not on some frame in the middle of a video.
+    with pytest.raises(CalibrationInvalid):
+        TrajectoryCollector.from_calibration(b"not a calibration", fps=30.0)
 
 
 # --- the no-calibration case --------------------------------------------------

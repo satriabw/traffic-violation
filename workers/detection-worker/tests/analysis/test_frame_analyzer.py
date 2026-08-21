@@ -1,8 +1,15 @@
 import numpy as np
+import pytest
 import supervision as sv
-from trajectory_collector import NullCollector, Trajectory, TrajectoryCollector
+from trajectory_collector import (
+    CalibrationInvalid,
+    NullCollector,
+    Trajectory,
+    TrajectoryCollector,
+)
 
 from detection_worker.analysis.frame_analyzer import FrameAnalyzer, make_analyzer
+from detection_worker.detection.tracker import DEFAULT_FPS
 
 
 class FakeModel:
@@ -226,17 +233,101 @@ def test_an_analyzer_with_no_collector_reports_no_trajectories():
     assert result.trajectories == {}
 
 
-def test_make_analyzer_defaults_to_collecting_nothing():
+def test_a_job_with_no_calibration_gets_a_collector_that_reports_nothing():
+    # A site with no calibration is a normal state, not a failure. Detection and
+    # tracking still run; there is simply no ground plane to put anything on.
     analyzer = make_analyzer(FakeModel(), fps=30.0, new_tracker=_trackers())
 
     assert isinstance(analyzer._trajectory_collector, NullCollector)
 
 
-def test_make_analyzer_passes_a_collector_through():
+def test_a_job_with_a_calibration_gets_a_collector_built_from_it():
+    built: list[tuple] = []
     collector = FakeCollector()
 
     analyzer = make_analyzer(
-        FakeModel(), fps=30.0, new_tracker=_trackers(), trajectory_collector=collector
+        FakeModel(),
+        fps=30.0,
+        calibration={"camera_matrix": "v3"},
+        new_tracker=_trackers(),
+        new_collector=lambda document, fps: built.append((document, fps)) or collector,
     )
 
+    assert built == [({"camera_matrix": "v3"}, 30.0)]
     assert analyzer._trajectory_collector is collector
+
+
+def test_the_tracker_and_the_collector_are_given_the_same_frame_rate():
+    # A source ffprobe could not read. Both fall back, and they have to fall back to
+    # the same number — one aging lost tracks at 30fps while the other measures gaps at
+    # some other rate would have the two disagree about how much time a frame is worth.
+    trackers = _trackers()
+    built: list[float] = []
+
+    make_analyzer(
+        FakeModel(),
+        fps=None,
+        calibration={"camera_matrix": "v3"},
+        new_tracker=trackers,
+        new_collector=lambda document, fps: built.append(fps) or FakeCollector(),
+    )
+
+    assert trackers.made[0].fps == built[0] == DEFAULT_FPS
+
+
+def test_a_calibration_that_cannot_be_projected_with_stops_the_job():
+    # Before a frame is decoded, and loudly. A run that produced plausible-looking
+    # positions from a broken camera model is far worse than one that refused to start.
+    def new_collector(document, fps):
+        raise CalibrationInvalid("camera_matrix has shape (0,), expected (3, 3)")
+
+    with pytest.raises(CalibrationInvalid):
+        make_analyzer(
+            FakeModel(),
+            fps=30.0,
+            calibration={"camera_matrix": []},
+            new_tracker=_trackers(),
+            new_collector=new_collector,
+        )
+
+
+# --- the calibration format ---------------------------------------------------
+
+OPENCV_YML = b"""%YAML:1.0
+---
+camera_matrix: !!opencv-matrix
+   rows: 3
+   cols: 3
+   dt: d
+   data: [ 1000., 0., 0., 0., 1000., 0., 0., 0., 1. ]
+rot_matrix: !!opencv-matrix
+   rows: 3
+   cols: 3
+   dt: d
+   data: [ 1., 0., 0., 0., 1., 0., 0., 0., 1. ]
+tvec: !!opencv-matrix
+   rows: 3
+   cols: 1
+   dt: d
+   data: [ 0., 0., 100. ]
+"""
+
+
+def test_a_job_whose_calibration_is_an_opencv_document_locates_its_tracks():
+    # The format calibrations are written in. It reaches the analyzer as the raw bytes
+    # context fetched, and nothing on this side of the boundary parses it — that is the
+    # trajectory package's business.
+    analyzer = make_analyzer(
+        FakeModel(detections_per_frame=1), fps=30.0, calibration=OPENCV_YML
+    )
+
+    result = analyzer.analyze(np.zeros((720, 1280, 3), dtype=np.uint8), index=0)
+
+    # The fake model puts one box at (0, 0, 10, 10), so its anchor is (5, 10) — a
+    # hundredth of the 1000px focal length, seen from 100m up, is 0.5m by 1m.
+    assert result.trajectories[1].position == pytest.approx((0.5, 1.0))
+
+
+def test_a_calibration_document_that_is_neither_format_stops_the_job():
+    with pytest.raises(CalibrationInvalid):
+        make_analyzer(FakeModel(), fps=30.0, calibration=b"not a calibration")

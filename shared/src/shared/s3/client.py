@@ -114,6 +114,22 @@ def get_json(key: str) -> dict:
         body.close()
 
 
+def get_bytes(key: str) -> bytes:
+    """Read a small document out of the bucket without interpreting it.
+
+    Same bounded exception as `get_json`, and for the same kind of object — a few
+    kilobytes of settings the worker evaluates. The difference is who decides what the
+    bytes mean. A calibration is whatever the tool that produced it writes, which in
+    practice is an OpenCV `.yml` rather than JSON, so parsing it belongs to the code
+    that understands camera models and not to the code that fetches objects.
+    """
+    body = get_client().get_object(Bucket=config.S3_BUCKET, Key=key)["Body"]
+    try:
+        return body.read()
+    finally:
+        body.close()
+
+
 def head(key: str) -> dict | None:
     """Object metadata, or None if it does not exist.
 
