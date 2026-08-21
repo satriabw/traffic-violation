@@ -1,33 +1,56 @@
 """Queue consumer entrypoint.
 
-It takes jobs off the queue and reads the frames each one asks for. That is the whole
-worker today: the rest of the pipeline the LLD describes — detect, track, evaluate,
-store — hangs off the frames `make_handler` iterates. Reading lands on its own first
-so the hop from a queued job to decoded pixels is proven before a model sits on top
-of it.
+It takes jobs off the queue, reads the frames each one asks for, and runs detection
+and tracking over them. What is still missing is everything after that: the rule
+engine, violations, evidence frames, persistence. Those hang off the tracked
+detections `make_handler` produces, and landing this much first means frames →
+detections → stable ids is proven before any rule sits on top of it.
 """
 
 import logging
 from typing import Any, Callable, Iterable
 
+import supervision as sv
+
 from shared.models.detection import DetectionJob, FrameRange
 from shared.queue.client import from_config
 from shared.s3.client import presigned_get
 
+from detection_worker.model import DetectionModel
+from detection_worker.model import from_config as model_from_config
 from detection_worker.reader import read_frames
+from detection_worker.tracker import Tracker, make_tracker
 
 logger = logging.getLogger(__name__)
 
 
+def _track_ids(detections: sv.Detections) -> list[int]:
+    """The tracker ids on a frame, or none at all.
+
+    `tracker_id` is None rather than an empty array on a frame the tracker had
+    nothing to assign, which is most frames of most footage.
+    """
+    if detections.tracker_id is None:
+        return []
+    return [int(tracker_id) for tracker_id in detections.tracker_id]
+
+
 def make_handler(
+    model: DetectionModel,
     sign: Callable[[str], str] = presigned_get,
     read: Callable[[str, FrameRange], Iterable[tuple[int, Any]]] = read_frames,
+    new_tracker: Callable[[float | None], Tracker] = make_tracker,
 ) -> Callable[[DetectionJob], None]:
-    """Build the job handler, with its two collaborators injectable.
+    """Build the job handler, with its collaborators injectable.
 
     A factory rather than a wider `handle` signature, so `run` keeps taking a plain
-    `Callable[[DetectionJob], None]` and tests substitute a fake signer and reader
-    without S3 or a video anywhere in reach.
+    `Callable[[DetectionJob], None]` and tests substitute a fake signer, reader,
+    model and tracker without S3, a video or a weights file anywhere in reach.
+
+    `model` is passed in rather than built here because building it is expensive and
+    it holds no per-job state — one session serves the whole process. `new_tracker`
+    is a factory for the opposite reason: a tracker is cheap and holds nothing but
+    per-job state, so each job gets its own.
     """
 
     def handle(job: DetectionJob) -> None:
@@ -36,14 +59,35 @@ def make_handler(
         # the message is immutable, so this is always safe to do late. See JobSource.
         url = sign(job.source.key)
 
+        # Once per job, before the loop. Inside it, every frame would land in a
+        # tracker that had never seen the previous one, and nothing would ever hold
+        # an id for longer than a single frame.
+        tracker = new_tracker(job.source.fps)
+
         read_count = 0
-        for _index, _frame in read(url, job.frame_range):
-            # Where detection will go. Counting is deliberately all this does — it is
-            # the smallest thing that proves every requested frame decoded.
+        detection_count = 0
+        seen_tracks: set[int] = set()
+
+        for index, frame in read(url, job.frame_range):
+            detections = model.predict(frame)
+            # Every frame, empty or not: the tracker counts frames by counting
+            # updates, and skipping one ages every lost track wrongly.
+            tracked = tracker.update(detections)
+
+            ids = _track_ids(tracked)
             read_count += 1
+            detection_count += len(tracked)
+            seen_tracks.update(ids)
+
+            # Per-frame detail is DEBUG because a 30-second chunk is ~900 of these,
+            # and the summary below is what anyone watching a normal run wants.
+            logger.debug(
+                "job %s frame %d detections=%d ids=%s", job.id, index, len(tracked), ids
+            )
 
         logger.info(
-            "detection job %s site=%s source=%s v%d frames=%d-%d read=%d types=%s",
+            "detection job %s site=%s source=%s v%d frames=%d-%d "
+            "read=%d detections=%d tracks=%d types=%s",
             job.id,
             job.site_id,
             job.source.source_id,
@@ -51,6 +95,11 @@ def make_handler(
             job.frame_range.start,
             job.frame_range.end,
             read_count,
+            detection_count,
+            # Distinct ids, so this is roughly "how many objects did we see", against
+            # detection_count's "how many boxes". Ids restart at 1 for every job, so
+            # this number is only ever meaningful within one chunk.
+            len(seen_tracks),
             [t.value for t in job.types],
         )
 
@@ -86,8 +135,12 @@ def run(
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    # Before the queue is touched, so a missing or unreadable model file stops the
+    # worker while it still has no claim on any job. Loading it here is also what
+    # makes it once-per-process: every job the loop below handles reuses this session.
+    model = model_from_config()
     logger.info("detection-worker waiting for jobs")
-    run(from_config(), make_handler())
+    run(from_config(), make_handler(model))
 
 
 if __name__ == "__main__":

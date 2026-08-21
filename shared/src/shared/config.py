@@ -38,6 +38,27 @@ REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 DETECTION_QUEUE_NAME = os.environ.get("DETECTION_QUEUE_NAME", "detection:jobs")
 
 
+# --- Detection model ------------------------------------------------------
+# A local filesystem path to an ONNX export. Pulling the weights from R2 instead —
+# the pseudo-registry — resolves through the same setting; see
+# detection_worker.model.resolve_model_path.
+DETECTION_MODEL_PATH = os.environ.get("DETECTION_MODEL_PATH", "")
+
+# Minimum confidence for a detection to leave the model at all. Everything below is
+# dropped before tracking, so this is the coarsest of the pipeline's filters.
+DETECTION_THRESHOLD = float(os.environ.get("DETECTION_THRESHOLD", "0.5"))
+
+# onnxruntime tries these in order and falls back to the next when one is
+# unavailable. CPU is the default because it is the only provider guaranteed to
+# exist, and a worker that silently refuses to start without a GPU is worse than a
+# slow one. Set to "CUDAExecutionProvider,CPUExecutionProvider" where there is a GPU.
+DETECTION_MODEL_PROVIDERS = [
+    provider.strip()
+    for provider in os.environ.get("DETECTION_MODEL_PROVIDERS", "CPUExecutionProvider").split(",")
+    if provider.strip()
+]
+
+
 # --- Video probing --------------------------------------------------------
 # How long ffprobe gets to read a video's header before we give up and call the
 # attempt transient. It runs inside a request, so this is also the worst case a
