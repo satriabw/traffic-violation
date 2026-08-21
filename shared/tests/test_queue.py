@@ -97,6 +97,11 @@ def test_redis_enqueue_pushes_json_onto_the_named_list():
         },
         "frame_range": {"start": 0, "end": 100},
         "types": ["red_light_running"],
+        # Versions, not documents. The worker resolves these against the database by
+        # (site_id, version), which is what pins a job to the calibration that was
+        # active when it was created rather than whatever is active when it runs.
+        "calibration_version": None,
+        "configuration_version": None,
     }
 
 

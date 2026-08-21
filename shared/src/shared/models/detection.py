@@ -73,6 +73,25 @@ class DetectionJob(BaseModel):
     # At least one: a job asking for no violation types is a no-op nobody wants queued.
     types: list[ViolationType] = Field(min_length=1)
 
+    # Version numbers, not the documents. Both are small JSON files in object storage,
+    # so the message would only ever carry a pointer either way — and a version keeps
+    # the queue contract fixed as more per-site context arrives, which a growing set of
+    # keys would not.
+    #
+    # The version is the whole point. Asking site-service for a site's calibration
+    # answers "what is active now", so a job enqueued against v3 and consumed after
+    # someone uploaded v4 would silently be evaluated against a different camera model
+    # than the one it was created for — and the output would stay plausible. The worker
+    # resolves these by (site_id, version) and never by "active". Same reasoning as
+    # JobSource above.
+    #
+    # None means the site had none when the job was created. Detection still runs: there
+    # is no rule engine yet, and a site with a video but no calibration is a normal
+    # state today. Once rules need them, these become required and the endpoint rejects
+    # an uncalibrated site up front instead.
+    calibration_version: int | None = None
+    configuration_version: int | None = None
+
 
 class DetectionRequest(BaseModel):
     """The POST body. Everything else about the job is derived server-side."""

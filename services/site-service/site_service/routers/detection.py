@@ -69,6 +69,17 @@ def video_for(
     )
 
 
+def _active_version(con: sqlite3.Connection, table: str, site_id: str) -> int | None:
+    """The site's current version of a versioned document, or None if it has none.
+
+    None is not an error today: there is no rule engine, so a video source with no
+    calibration is a normal state and the job runs without one. When rules need it,
+    this becomes a 409 in video_for alongside the other three.
+    """
+    doc = service.get_active_version(con, table, site_id)
+    return doc.version if doc else None
+
+
 @router.post("", response_model=DetectionJob, status_code=202)
 def detect(
     site_id: str,
@@ -98,6 +109,11 @@ def detect(
         # Unset means every type we know about, so the list can grow without every
         # caller having to be updated.
         types=(data.types if data and data.types else list(ViolationType)),
+        # Resolved to a number *here*, while "active" still means what the caller
+        # asked for. The worker looks these up by version, so a v4 uploaded while this
+        # job sits in the queue cannot change what it is evaluated against.
+        calibration_version=_active_version(con, service.CALIBRATIONS, site_id),
+        configuration_version=_active_version(con, service.CONFIGURATIONS, site_id),
     )
     # Enqueue before responding: a 202 promising work nobody received is worse than a
     # 500 the caller can retry.

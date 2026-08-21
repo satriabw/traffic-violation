@@ -202,3 +202,54 @@ def test_the_queued_message_carries_the_source_too():
     client.post(_detect(site_id), json={})
 
     assert _queue.consume().source.key.startswith("video/")
+
+
+def _calibration_file(file_type: str = "calibration") -> str:
+    created = client.post(
+        "/api/v1/files", json={"name": "c.json", "type": file_type, "size_bytes": 64}
+    ).json()
+    client.post(f"/api/v1/files/{created['id']}/complete")
+    return created["id"]
+
+
+def test_a_job_carries_no_versions_when_the_site_has_neither_document():
+    # No rule engine yet, so an uncalibrated site is still detectable and the job
+    # simply says there was nothing to pin to.
+    site_id = _site_with_video()
+
+    job = client.post(f"{SITES}/{site_id}/detect").json()
+
+    assert job["calibration_version"] is None
+    assert job["configuration_version"] is None
+
+
+def test_a_job_carries_the_versions_that_were_active_when_it_was_created():
+    site_id = _site_with_video()
+    client.post(f"{SITES}/{site_id}/calibrations", json={"file_id": _calibration_file()})
+    client.post(
+        f"{SITES}/{site_id}/configurations",
+        json={"file_id": _calibration_file("configuration")},
+    )
+
+    job = client.post(f"{SITES}/{site_id}/detect").json()
+
+    assert job["calibration_version"] == 1
+    assert job["configuration_version"] == 1
+
+
+def test_the_version_is_resolved_at_enqueue_time_not_at_consume_time():
+    """The pin, from the producing end.
+
+    A calibration uploaded after the job was queued must not change what that job is
+    evaluated against — which is only true because a number, not "active", went into
+    the message.
+    """
+    site_id = _site_with_video()
+    client.post(f"{SITES}/{site_id}/calibrations", json={"file_id": _calibration_file()})
+    client.post(f"{SITES}/{site_id}/detect")
+
+    # A new calibration lands while the job is still sitting in the queue.
+    client.post(f"{SITES}/{site_id}/calibrations", json={"file_id": _calibration_file()})
+
+    queued = _queue.consume()
+    assert queued.calibration_version == 1

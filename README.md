@@ -170,14 +170,16 @@ POST /api/v1/sites/{site_id}/detect   {"types": ["red_light_running"]}
     "total_frames": 27000
   },
   "frame_range": {"start": 0, "end": 27000},
-  "types": ["red_light_running", "pedestrian_right_of_way"]
+  "types": ["red_light_running", "pedestrian_right_of_way"],
+  "calibration_version": 2,
+  "configuration_version": 1
 }
 ```
 
 202 rather than 201: nothing was created — the work was accepted, and the `id` that
 comes back is what identifies it downstream. The response body *is* the queued message
 (`shared/models/detection.py`), which is the contract between site-service and
-detection-worker; the two share no database.
+detection-worker.
 
 `frame_range` is not something the client sends. It is derived from the active source's
 probed `total_frames`, in frame indices rather than seconds — variable-rate footage
@@ -198,6 +200,16 @@ died in a queue — or partway through a long read — fails *after* the worker 
 A key is immutable (a new upload is a new file id), so the worker signs its own url each
 time it opens the video. That is why the worker needs the R2 settings in its
 environment; it needs them regardless, since evidence frames will be written there.
+
+`calibration_version` and `configuration_version` are the same idea applied to the
+site's other two documents, resolved to a number at enqueue time. The documents
+themselves are small JSON files in R2, so the message would only ever carry a pointer —
+and a version keeps the queue contract fixed as more per-site context arrives, which a
+growing set of keys would not. The worker looks them up by `(site_id, version)` and
+**never** by "the site's active calibration": a v4 uploaded while the job sits in the
+queue must not change what that job is evaluated against, and a run that used the wrong
+camera model would look completely normal. `null` means the site had neither when the
+job was created, which is a normal state until there is a rule engine to need them.
 
 Everything that can go wrong is about the site's *state*, so it is 409 rather than 422 —
 the request is well formed, and the identical one succeeds once a video is attached:
