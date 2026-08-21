@@ -57,7 +57,15 @@ def get_site(site_id: str, con: DbConnection):
 
 @router.delete("/{site_id}", status_code=204)
 def delete_site(site_id: str, con: DbConnection):
-    deleted = service.delete_site(con, site_id)
+    try:
+        deleted = service.delete_site(con, site_id)
+    except service.SiteHasViolations:
+        # 409, not 422: the request is well formed and the same request succeeds once
+        # the violations are dealt with. Nothing here deletes them for the caller —
+        # that has to be a deliberate second act.
+        raise HTTPException(
+            status_code=409, detail="Site has recorded violations and cannot be deleted"
+        )
     if not deleted:
         raise HTTPException(status_code=404, detail="Site not found")
     return Response(status_code=204)
