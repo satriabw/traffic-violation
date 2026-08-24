@@ -1,0 +1,143 @@
+# The whole system, on one machine: the queue, the API, and the worker.
+#
+#   docker compose up --build
+#
+# GPU by default, because that is the point of running this on the workstation. When
+# the GPU is busy, add the CPU override — see docker-compose.cpu.yml.
+#
+# Everything stays inside the repository, the way running the pieces by hand always
+# did: state goes to the gitignored data/, published ports are loopback unless you say
+# otherwise, and `docker compose down` leaves nothing behind.
+
+name: traffic-violation
+
+# What the two Python services share. Both mount the repository and both put its
+# source ahead of the copy pip installed into the image, so an edit on the host is
+# what runs — that is the whole reason to develop against containers rather than
+# rebuild for every change.
+x-repo-mount: &repo-mount
+  # The database lives under here (data/traffic_violations.sqlite), which is what
+  # keeps SQLite viable: one bind mount means api and worker are two processes on one
+  # local filesystem, exactly the arrangement shared/db/connection.py describes. Give
+  # the worker its own host and this stops working — the trigger is the filesystem.
+  - .:/repo
+
+# Both images are built as root but run as you, so the SQLite file, its WAL sidecars
+# and any __pycache__ the containers drop into the working tree stay yours. Without
+# this they land root-owned and the next host-side `pytest` cannot write them.
+x-run-as-host-user: &run-as-host-user
+  user: "${DOCKER_UID:-1000}:${DOCKER_GID:-1000}"
+
+services:
+  # The queue. `docker compose up redis` starts this and nothing else, which is what
+  # lets "just the queue, against host processes" and "the whole stack" be one
+  # definition rather than two — there was a dev/redis-docker.sh holding the same
+  # docker run by hand, and two spellings of one server is how they drift apart.
+  redis:
+    image: redis:8-alpine
+    working_dir: /repo
+    volumes:
+      - ./docker/redis.conf:/repo/docker/redis.conf:ro
+      - ./data:/repo/data
+    # --bind 0.0.0.0 overrides the conf's `bind 127.0.0.1`, which would refuse both
+    # the forwarded connections and the ones from api and worker: all of them arrive
+    # on the container's bridge interface rather than its loopback. What keeps this
+    # off the network is the publish address below, not the bind.
+    command: redis-server docker/redis.conf --bind 0.0.0.0
+    ports:
+      # Loopback by default, and that address is the entire security boundary: the
+      # official images ship `protected-mode no`, and Docker writes its iptables
+      # rules ahead of ufw, so a bare 6379:6379 is an open unauthenticated Redis on
+      # every interface. Publishing at all is only for redis-cli from the host — api
+      # and worker reach it as `redis` over the compose network regardless.
+      - "${REDIS_BIND:-127.0.0.1}:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  api:
+    image: traffic-violation-api
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    <<: *run-as-host-user
+    # Everything the process actually needs comes from here — R2 credentials above
+    # all, without which the service refuses to start and names what is missing.
+    env_file:
+      - .env
+    environment:
+      # These win over .env, because compose `environment` outranks `env_file`, and
+      # they have to: a .env written for running on the host says localhost and
+      # ./data, and neither means anything from inside a container. Overriding
+      # REDIS_URL to point the stack at a Redis you already have is the one case
+      # worth keeping open, hence the interpolation.
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      TRAFFIC_DB_PATH: /repo/data/traffic_violations.sqlite
+      # Ahead of site-packages, so the mounted working tree shadows what pip
+      # installed. The image runs without this; development does not.
+      PYTHONPATH: /repo/shared/src:/repo/services/site-service
+    volumes: *repo-mount
+    ports:
+      # Loopback by default. The API has no authentication of any kind, and anyone
+      # who reaches it can mint presigned R2 upload URLs against your bucket — so
+      # reach it from your laptop over `ssh -L 8001:localhost:8001`, and set
+      # API_BIND=0.0.0.0 in .env only if you have decided the network is trusted.
+      - "${API_BIND:-127.0.0.1}:8001:8001"
+    # --reload only in development, which is what this file is. The image's own CMD
+    # is the plain server. --reload-dir keeps the watcher off data/ and the model
+    # directory; pointed at the repo root it would restart the API every time the
+    # worker touched the SQLite file.
+    command: >
+      uvicorn site_service.main:app
+      --host 0.0.0.0 --port 8001 --reload
+      --reload-dir /repo/services/site-service
+      --reload-dir /repo/shared/src
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 10s
+      timeout: 5s
+      # Generous, because a failing startup here is deliberate: the S3 check in the
+      # lifespan raises before the port is ever bound.
+      start_period: 20s
+      retries: 3
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  worker:
+    image: traffic-violation-worker:gpu
+    build:
+      context: .
+      dockerfile: docker/worker.Dockerfile
+      target: gpu
+    <<: *run-as-host-user
+    # The whole GPU, through the nvidia runtime. Drop this and the worker still runs
+    # — onnxruntime falls back down its provider list to CPU — which is precisely why
+    # the startup log is worth reading rather than assumed.
+    gpus: all
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      TRAFFIC_DB_PATH: /repo/data/traffic_violations.sqlite
+      PYTHONPATH: /repo/shared/src:/repo/packages/trajectory-collector/src:/repo/workers/detection-worker
+      # Weights are not in the image: the export is 80 MB, gitignored, and versioned
+      # by whoever trained it rather than by this repository. It arrives through the
+      # repo mount, so the path is the host path with /repo on the front.
+      DETECTION_MODEL_PATH: ${DETECTION_MODEL_PATH:-/repo/workers/detection-worker/models/rt-detr.onnx}
+      # The container has no passwd entry for the host uid it runs as, so HOME is
+      # unset and two dependencies complain on every start — onnxruntime cannot
+      # persist its telemetry id, matplotlib (which arrives with supervision) cannot
+      # write a config directory. Neither matters; both are noise in front of the log
+      # line that does.
+      HOME: /tmp
+    volumes: *repo-mount
+    # No restart policy on purpose. A handler that raises stops the worker rather
+    # than dropping the job, and restarting it here would turn that deliberate stop
+    # into a crash loop that retries a poisoned job forever. Retry and a dead-letter
+    # queue are FUTURE in the LLD; until they exist, stopping is the behaviour.
+    depends_on:
+      redis:
+        condition: service_healthy

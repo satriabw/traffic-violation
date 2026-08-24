@@ -25,11 +25,62 @@ Run tests:
 .venv/bin/pytest
 ```
 
-Run everything locally — three processes, one per terminal, all from the repo root:
+## Running the stack
+
+Two ways, and which one you want follows from where the GPU is.
+
+### In containers (Linux, and the way to use a GPU)
+
+```
+cp .env.example .env                                   # then fill in the R2 settings
+printf 'DOCKER_UID=%s\nDOCKER_GID=%s\n' "$(id -u)" "$(id -g)" >> .env
+docker compose up --build
+```
+
+Three services — `redis`, `api`, `worker` — and naming one starts just that one, so
+`docker compose up redis` is how you run the queue alone against host processes. The
+API is on `127.0.0.1:8001`; reach it from another machine with
+`ssh -L 8001:localhost:8001` rather than by widening `API_BIND`, because nothing here
+authenticates anything.
+
+The repository is bind-mounted at `/repo` and `PYTHONPATH` puts it ahead of the copy
+pip installed into the image, so an edit on the host is what runs — uvicorn reloads,
+and the worker needs a `docker compose restart worker`. Rebuild only when a dependency
+changes. The `DOCKER_UID` lines are what keep `data/` yours: without them the SQLite
+file, its WAL sidecars and every `__pycache__` come back owned by root, and the next
+host-side `pytest` cannot write them.
+
+`data/` is the shared mount, which is what keeps SQLite viable here — `api` and
+`worker` are still two processes on one local filesystem, exactly the arrangement
+below. It is also why the containers are not the thing that lets the worker move to
+its own host; the filesystem is still the constraint.
+
+**The detection worker runs on the GPU by default**, through the `nvidia` container
+runtime. When the card is busy with something else:
+
+```
+docker compose -f docker-compose.yml -f docker-compose.cpu.yml up --build
+```
+
+That is a different image, not a flag: `onnxruntime` and `onnxruntime-gpu` install the
+same `onnxruntime` package and cannot coexist, so the swap happens at build time in
+`docker/worker.Dockerfile`. Expect about a tenth of the throughput — RT-DETR at 640×640
+measures ~101 fps on a 2080 Ti against ~10 fps on the CPU.
+
+The pinned `onnxruntime-gpu==1.26.0` is worth knowing about before anyone bumps it. It
+is the last release built against CUDA 12; from 1.27.0 the wheel wants CUDA 13 and a
+580-series driver. The failure is quiet — the wheel installs, the provider still lists
+as available, and only session creation logs a library-load error before falling back
+to CPU at a tenth of the speed. Check the worker's first log line, and check it against
+`nvidia-smi`, rather than assuming.
+
+### On the host (macOS, or without Docker)
+
+Three processes, one per terminal, all from the repo root:
 
 ```
 # 1. the queue
-redis-server dev/redis.conf
+redis-server docker/redis.conf   # on Linux: docker compose up redis
 
 # 2. the API
 set -a; source .env; set +a
@@ -43,14 +94,28 @@ PYTHONPATH=shared/src:packages/trajectory-collector/src:workers/detection-worker
 
 Source `.env` in **each** shell that needs it. The worker reads `REDIS_URL` from the
 same environment uvicorn does, so a worker started in an unsourced shell quietly talks
-to the default localhost instead of wherever you pointed it.
+to the default localhost instead of wherever you pointed it. Compose does this for you;
+this is the path where it is yours to remember.
+
+A note if you are on a conda machine: `.venv/bin/...` above is a plain `venv`, and an
+active conda environment does not provide one. Either create the venv anyway — it works
+fine underneath a conda base — or drop the `.venv/bin/` prefix and let the conda
+interpreter serve, having installed the same four distributions into it. The
+`PYTHONPATH` prefix is what matters either way, and it is why the test suite needs no
+install at all.
 
 Only the API is needed to browse sites, files, and calibrations. Redis is needed to
 accept a detection job, and the worker to consume one — see below.
 
 Config is read from the process environment only (`shared/config.py` is plain
 `os.environ`); `.env` is just a convenient way to populate a local shell, and is
-gitignored. In deployment the same variables come from the platform instead.
+gitignored. `.env.example` is the annotated template — copy it and fill in the R2
+settings. In deployment the same variables come from the platform instead.
+
+Compose reads that same file twice, and the second one catches people out: once to
+pass into the containers, and once for `${...}` interpolation in `docker-compose.yml`.
+A literal `$` in a secret has to be written `$$`, or the container gets a truncated
+value.
 
 Source `.env` in the *same* shell you start uvicorn from. The service refuses to
 start when the object-storage settings are empty and names the missing ones — a
@@ -78,26 +143,62 @@ Moving detection-worker to its own host, or running worker replicas across machi
 is where SQLite stops working and Postgres starts. The trigger is the filesystem, not
 the row count.
 
-Redis is needed only to *run* detection jobs for real. `brew install redis` for the
-binary, then start it from the repo root:
+Redis is needed only to *run* detection jobs for real. The two platforms reach the same
+thing — one server, alive only while you are working — by different routes.
+
+On macOS, `brew install redis` for the binary, then start it from the repo root:
 
 ```
 mkdir -p data          # once per checkout
-redis-server dev/redis.conf
+redis-server docker/redis.conf
 ```
 
 The `mkdir` is only needed the first time. `data/` is gitignored so a fresh clone does
 not have it, and unlike the database — whose `get_connection` creates its parent
 directory — Redis refuses to start when its `dir` is missing.
 
-Everything stays inside the repo: it writes to the gitignored `data/`, persists
-nothing, and stops with Ctrl-C. No `brew services`, no launchd job, nothing running
-when you are not working on this. Point `REDIS_URL` elsewhere to use one you already
-have.
+On Linux, a container — and it is the compose file's `redis` service, named on its own:
 
-No container runtime is involved. Docker containers are Linux processes, so on macOS
-any Docker setup runs a Linux VM underneath — a lot of machinery for one 40 MB server,
-when everything else here already runs on the host.
+```
+docker compose up redis    # from the repo root; Ctrl-C stops it
+```
+
+That is the whole story now. There used to be a `dev/redis-docker.sh` holding the same
+`docker run` by hand, and once compose described the service there were two spellings
+of one thing, publishing the same port and so unable to run at the same time. Naming
+the service is what makes "just the queue" and "the whole stack" the same mechanism
+rather than two — `docker compose up` starts all three, `docker compose up redis`
+starts one, and neither can drift from the other.
+
+Either way everything stays inside the repo: it writes to the gitignored `data/`,
+persists nothing, and stops with Ctrl-C. No `brew services`, no launchd job, no systemd
+unit, nothing running when you are not working on this. Point `REDIS_URL` elsewhere to
+use one you already have.
+
+The split is not arbitrary. Docker containers are Linux processes, so on macOS any
+Docker setup runs a Linux VM underneath — a lot of machinery for one 40 MB server, when
+everything else here already runs on the host. On Linux there is no VM, and the trade
+runs the other way: the distribution package is what carries the cost. On Ubuntu 20.04
+`apt install redis-server` is Redis 5.0.7, and it registers a unit that starts at boot
+and holds 6379 — which is both the one thing this setup exists to avoid and a port
+conflict with the server you actually want. A container installs nothing.
+
+Two details in that service definition are easy to get wrong on your own. The
+**published port is `127.0.0.1:6379:6379`, and that address is the entire security
+boundary**: the official images ship `protected-mode no` alongside `bind * -::*`, so a
+bare `-p 6379:6379` is an open unauthenticated Redis on every interface — and Docker
+writes its iptables rules ahead of ufw, so a host firewall does not cover for you. That
+is what `REDIS_BIND` defaults to loopback for, and why widening it is a decision rather
+than a convenience.
+
+The other is that the container overrides the conf's `bind 127.0.0.1` with
+`--bind 0.0.0.0`. Connections arrive on the container's bridge interface rather than
+its loopback — the forwarded ones from the host, and `api` and `worker` reaching
+`redis` over the compose network — so the conf as written refuses all of them. Redis
+then logs a warning about accepting connections from anywhere; that is its view from
+inside the container, which cannot see the publish address. The conf and `data/` are
+mounted under `/repo` with a matching working directory, so `dir ./data` resolves as it
+does on the host and the command stays `redis-server docker/redis.conf`.
 
 The test suite drives the queue through an injected fake and never connects to Redis,
 the same way it never touches R2. Object storage is likewise needed only for the file
