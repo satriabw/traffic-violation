@@ -1,9 +1,8 @@
 """What one frame produced.
 
-A record rather than a tuple because it is still growing: trajectories are here now,
-and whatever the rule engine decides about the frame lands next. Every one of those is
-a field here rather than another return value the handler has to keep in the right
-order.
+A record rather than a tuple because it grew: detections, then trajectories, now what
+the rules decided. Every one of those is a field here rather than another return value
+the handler has to keep in the right order.
 
 The frame itself is deliberately not a field. Nothing downstream of the analyzer needs
 the pixels yet — evidence frames are cropped where a rule fires, inside the analyzer,
@@ -11,10 +10,11 @@ not by whoever reads this — and holding a reference to every decoded frame is 
 long chunk turns into a memory problem.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import supervision as sv
 from trajectory_collector import Trajectory
+from violation_detector import Violation
 
 
 @dataclass(frozen=True)
@@ -33,6 +33,14 @@ class FrameResult:
     # actually makes — "how fast is track 7" — and an index into a per-frame array
     # would mean something different on every frame.
     trajectories: dict[int, Trajectory]
+    # What the rules saw on this frame, which on almost every frame is nothing. A
+    # default, unlike the two above, because a frame with no violations is the normal
+    # case and a caller assembling one by hand should not have to say so.
+    #
+    # A violation's own `frame_index` is not necessarily this frame's `index`: a rule
+    # reports on the frame it was given, but a module working on a clip reports several
+    # frames late. Record the violation's, never the result's.
+    violations: list[Violation] = field(default_factory=list)
 
     @property
     def track_ids(self) -> list[int]:

@@ -1,6 +1,6 @@
 # detection-worker — the queue consumer that decodes video and runs the detector.
-# Build from the repo root: the worker depends on `shared` and on
-# packages/trajectory-collector, both outside its directory.
+# Build from the repo root: the worker depends on `shared` and on the two
+# distributions under packages/, all outside its directory.
 #
 # Two targets, because the same worker has to run in two places. `gpu` is what this
 # workstation uses; `cpu` is the fallback for when the GPU is busy, and the only one
@@ -23,16 +23,18 @@ WORKDIR /repo
 
 COPY shared/ shared/
 COPY packages/trajectory-collector/ packages/trajectory-collector/
+COPY packages/violation-detector/ packages/violation-detector/
 COPY workers/detection-worker/ workers/detection-worker/
 
 # One invocation, so `shared` and `trajectory-collector` resolve from the local
 # directories rather than being looked for on PyPI.
 RUN pip install --no-cache-dir \
-        ./shared ./packages/trajectory-collector ./workers/detection-worker
+        ./shared ./packages/trajectory-collector ./packages/violation-detector \
+        ./workers/detection-worker
 
 # Fail the build rather than the first job. An image whose cv2 cannot load its shared
 # libraries looks perfectly healthy until a worker has already claimed work.
-RUN python -c "import cv2, onnxruntime, supervision, trajectory_collector"
+RUN python -c "import cv2, onnxruntime, supervision, trajectory_collector, violation_detector"
 
 ENV PYTHONUNBUFFERED=1
 CMD ["python", "-m", "detection_worker.worker"]
@@ -73,10 +75,12 @@ WORKDIR /repo
 
 COPY shared/ shared/
 COPY packages/trajectory-collector/ packages/trajectory-collector/
+COPY packages/violation-detector/ packages/violation-detector/
 COPY workers/detection-worker/ workers/detection-worker/
 
 RUN pip install --no-cache-dir \
-        ./shared ./packages/trajectory-collector ./workers/detection-worker
+        ./shared ./packages/trajectory-collector ./packages/violation-detector \
+        ./workers/detection-worker
 
 # onnxruntime-gpu replaces onnxruntime rather than joining it. Both distributions
 # install the same `onnxruntime` package directory, so having the two in one
@@ -111,7 +115,7 @@ ENV LD_LIBRARY_PATH="/opt/venv/lib/python3.11/site-packages/nvidia/cudnn/lib:/op
 # onnxruntime cannot see CUDAExecutionProvider is a build failure, not a runtime
 # surprise. This checks that the provider is *registered*; whether it can actually
 # create a session needs a GPU, which no build has.
-RUN python -c "import cv2, supervision, trajectory_collector; \
+RUN python -c "import cv2, supervision, trajectory_collector, violation_detector; \
 import onnxruntime as ort; \
 providers = ort.get_available_providers(); \
 assert 'CUDAExecutionProvider' in providers, providers; \

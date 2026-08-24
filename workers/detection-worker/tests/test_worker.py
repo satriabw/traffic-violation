@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 import supervision as sv
 from trajectory_collector import Trajectory
+from violation_detector import Violation
 from shared.models.detection import DetectionJob, FrameRange, JobSource, ViolationType
 from shared.queue.memory import InMemoryQueue
 
@@ -50,12 +51,31 @@ class FakeAnalyzer:
     and tracking do with a frame is the analyzer suite's business.
     """
 
-    def __init__(self, job, job_context, detections_per_frame: int = 0, locates: bool = False):
+    def __init__(
+        self,
+        job,
+        job_context,
+        detections_per_frame: int = 0,
+        locates: bool = False,
+        violates: bool = False,
+        held: int = 0,
+    ):
         self.job = job
         self.job_context = job_context
         self.analyzed: list[tuple[np.ndarray, int]] = []
+        self.finished = 0
         self._count = detections_per_frame
         self._locates = locates
+        self._violates = violates
+        self._held = held
+
+    def finish(self) -> list[Violation]:
+        """What the rules were still holding. Empty for every rule that ships today."""
+        self.finished += 1
+        return [
+            Violation(type="red_light_running", track_id=track_id, frame_index=0)
+            for track_id in range(1, self._held + 1)
+        ]
 
     def analyze(self, frame: np.ndarray, index: int) -> FrameResult:
         self.analyzed.append((frame, index))
@@ -63,6 +83,13 @@ class FakeAnalyzer:
             return FrameResult(index=index, detections=sv.Detections.empty(), trajectories={})
         return FrameResult(
             index=index,
+            # Whether a rule fires is the detector's business; the handler only counts
+            # what it is handed.
+            violations=[
+                Violation(type="red_light_running", track_id=1, frame_index=index)
+            ]
+            if self._violates
+            else [],
             # Whether a job has trajectories at all depends on its calibration, which
             # the analyzer resolves — the handler only counts and logs them.
             trajectories={
@@ -85,12 +112,19 @@ class FakeAnalyzer:
         )
 
 
-def _analyzers(detections_per_frame: int = 0, locates: bool = False):
+def _analyzers(
+    detections_per_frame: int = 0,
+    locates: bool = False,
+    violates: bool = False,
+    held: int = 0,
+):
     """An analyzer factory that records every analyzer it was asked to build."""
     made: list[FakeAnalyzer] = []
 
     def factory(job, job_context):
-        analyzer = FakeAnalyzer(job, job_context, detections_per_frame, locates)
+        analyzer = FakeAnalyzer(
+            job, job_context, detections_per_frame, locates, violates, held
+        )
         made.append(analyzer)
         return analyzer
 
@@ -322,3 +356,55 @@ def test_per_frame_detail_is_logged_at_debug_not_info(caplog):
     with caplog.at_level("DEBUG"):
         _handler(read=_reader_of(frame_count=2), new_analyzer=_analyzers(1))(_job("job-0"))
     assert "frame 0 detections=1 ids=[1]" in caplog.text
+
+
+# --- violations ---------------------------------------------------------------
+
+
+def test_the_summary_reports_what_the_rules_found(caplog):
+    with caplog.at_level("INFO"):
+        _handler(
+            read=_reader_of(frame_count=3),
+            new_analyzer=_analyzers(detections_per_frame=2, violates=True),
+        )(_job("job-1"))
+
+    # One per frame, from three frames.
+    assert "violations=3" in caplog.text
+
+
+def test_a_job_whose_rules_never_fire_reports_none(caplog):
+    # Indistinguishable from a site with no configuration by this number alone, which
+    # is why the configuration version is on the same line.
+    with caplog.at_level("INFO"):
+        _handler(
+            read=_reader_of(frame_count=3), new_analyzer=_analyzers(detections_per_frame=2)
+        )(_job("job-1"))
+
+    assert "violations=0" in caplog.text
+
+
+def test_the_rules_are_drained_once_when_the_frames_run_out():
+    # Once, after the loop — not per frame. A module working on a clip is holding a
+    # partial one here, and draining it mid-run would cut every window short.
+    analyzers = _analyzers()
+
+    _handler(read=_reader_of(frame_count=3), new_analyzer=analyzers)(_job("job-1"))
+
+    assert analyzers.made[0].finished == 1
+
+
+def test_violations_held_back_until_the_end_still_reach_the_summary(caplog):
+    # Without the drain these would be dropped in silence, and the last seconds of
+    # every chunk would go unjudged.
+    with caplog.at_level("INFO"):
+        _handler(read=_reader_of(frame_count=2), new_analyzer=_analyzers(held=2))(_job("job-1"))
+
+    assert "violations=2" in caplog.text
+
+
+def test_a_job_with_no_frames_still_drains_the_rules():
+    analyzers = _analyzers()
+
+    _handler(read=_reader_of(frame_count=0), new_analyzer=analyzers)(_job("job-1"))
+
+    assert analyzers.made[0].finished == 1

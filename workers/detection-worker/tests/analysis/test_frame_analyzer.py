@@ -8,7 +8,18 @@ from trajectory_collector import (
     TrajectoryCollector,
 )
 
-from detection_worker.analysis.frame_analyzer import FrameAnalyzer, make_analyzer
+from violation_detector import (
+    ConfigurationInvalid,
+    Detector,
+    TrackedObject,
+    Violation,
+)
+
+from detection_worker.analysis.frame_analyzer import (
+    FrameAnalyzer,
+    _tracked_objects,
+    make_analyzer,
+)
 from detection_worker.detection.tracker import DEFAULT_FPS
 
 
@@ -19,9 +30,12 @@ class FakeModel:
     of inference can be exercised on a laptop with no GPU and no weights file.
     """
 
-    def __init__(self, detections_per_frame: int = 0):
+    def __init__(self, detections_per_frame: int = 0, names: list[str] | None = None):
         self.frames: list[np.ndarray] = []
         self._count = detections_per_frame
+        # None means no `class_name` in `data` at all, which is what a detection built
+        # by hand looks like. The real model always supplies one.
+        self._names = names
 
     def predict(self, frame: np.ndarray) -> sv.Detections:
         self.frames.append(frame)
@@ -33,6 +47,7 @@ class FakeModel:
             ),
             confidence=np.full(self._count, 0.9, dtype=np.float32),
             class_id=np.full(self._count, 2, dtype=np.int16),
+            data={} if self._names is None else {"class_name": np.array(self._names)},
         )
 
 
@@ -331,3 +346,207 @@ def test_a_job_whose_calibration_is_an_opencv_document_locates_its_tracks():
 def test_a_calibration_document_that_is_neither_format_stops_the_job():
     with pytest.raises(CalibrationInvalid):
         make_analyzer(FakeModel(), fps=30.0, calibration=b"not a calibration")
+
+
+# --- violations ---------------------------------------------------------------
+
+# A junction, small but complete. Only `make_analyzer` reads it; the tests that drive
+# the analyzer directly hand it a fake detector instead.
+CONFIGURATION = {
+    "version": 1,
+    "violations": ["rlr_violation"],
+    "regions": {
+        "lanes": [{"id": "lane_1", "points": [[100, 200], [200, 200], [200, 400], [100, 400]]}],
+        "rois": [{"id": "roi_1", "points": [[100, 100], [200, 100], [200, 200], [100, 200]]}],
+        "traffic_lights": [
+            {"id": "tl_1", "points": [[10, 10], [25, 10], [25, 55]], "controls": ["lane_1"]}
+        ],
+    },
+}
+
+
+class FakeDetector(Detector):
+    """Records what it was asked about, and reports one violation per object."""
+
+    def __init__(self, held: list[Violation] | None = None):
+        super().__init__()
+        self.calls: list[tuple[list[TrackedObject], int]] = []
+        self._held = held or []
+
+    def detect(self, frame, tracked_objects, frame_index):
+        self.calls.append((tracked_objects, frame_index))
+        return [
+            Violation(type="red_light_running", track_id=object.track_id, frame_index=frame_index)
+            for object in tracked_objects
+        ]
+
+    def finish(self):
+        return self._held
+
+
+def test_the_adapter_carries_the_name_the_model_gave_each_box():
+    # Names, not ids. This is the one place that has to know the difference, and the
+    # reason the rule package never needs a class map.
+    detections = sv.Detections(
+        xyxy=np.array([[0, 0, 10, 20]], dtype=np.float32),
+        class_id=np.array([3], dtype=np.int16),
+        tracker_id=np.array([7]),
+        data={"class_name": np.array(["motorbike"])},
+    )
+
+    assert _tracked_objects(detections) == [
+        TrackedObject(track_id=7, bbox=(0.0, 0.0, 10.0, 20.0), class_name="motorbike")
+    ]
+
+
+def test_the_adapter_falls_back_to_the_id_when_nothing_named_the_box():
+    # What the model already does for an id outside its own map. A rule has no opinion
+    # about "3", which is the correct amount of opinion to have.
+    detections = sv.Detections(
+        xyxy=np.array([[0, 0, 10, 20]], dtype=np.float32),
+        class_id=np.array([3], dtype=np.int16),
+        tracker_id=np.array([7]),
+    )
+
+    assert _tracked_objects(detections)[0].class_name == "3"
+
+
+def test_the_adapter_reports_nothing_for_an_untracked_frame():
+    # tracker_id is None rather than an empty array on such a frame, which is most
+    # frames of most footage.
+    assert _tracked_objects(sv.Detections.empty()) == []
+
+
+def test_the_tracked_objects_reach_the_detector():
+    # After tracking, never before: every rule is about what an object did over time,
+    # and an untracked box has no history to have done it in.
+    detector = FakeDetector()
+
+    FrameAnalyzer(
+        FakeModel(detections_per_frame=2, names=["car", "person"]),
+        FakeTracker(),
+        NullCollector(),
+        detector,
+    ).analyze(_frame(), index=0)
+
+    tracked_objects, _ = detector.calls[0]
+    assert [(o.track_id, o.class_name) for o in tracked_objects] == [(1, "car"), (2, "person")]
+
+
+def test_the_detector_is_given_the_absolute_frame_index():
+    # The number a violation is recorded against, so a reviewer can find it in the
+    # footage. A running count of calls would point at the wrong second.
+    detector = FakeDetector()
+    analyzer = FrameAnalyzer(
+        FakeModel(detections_per_frame=1), FakeTracker(), NullCollector(), detector
+    )
+
+    analyzer.analyze(_frame(), index=900)
+    analyzer.analyze(_frame(), index=901)
+
+    assert [frame_index for _, frame_index in detector.calls] == [900, 901]
+
+
+def test_what_the_detector_reported_reaches_the_result():
+    result = FrameAnalyzer(
+        FakeModel(detections_per_frame=2), FakeTracker(), NullCollector(), FakeDetector()
+    ).analyze(_frame(), index=5)
+
+    assert [(v.track_id, v.frame_index) for v in result.violations] == [(1, 5), (2, 5)]
+
+
+def test_an_analyzer_with_no_detector_reports_no_violations():
+    # The unconfigured site: normal, not an error. Detection and tracking still run.
+    result = FrameAnalyzer(FakeModel(detections_per_frame=2), FakeTracker()).analyze(
+        _frame(), index=0
+    )
+
+    assert result.violations == []
+
+
+def test_finishing_drains_whatever_the_rules_were_holding():
+    # Empty for a rule, which decides on the frame it is given. A module working on a
+    # clip is still holding a partial one when the frames run out, and the violation it
+    # then reports names an earlier frame than the last one analysed.
+    held = Violation(type="red_light_running", track_id=4, frame_index=880)
+    analyzer = FrameAnalyzer(
+        FakeModel(), FakeTracker(), NullCollector(), FakeDetector(held=[held])
+    )
+
+    analyzer.analyze(_frame(), index=900)
+
+    assert analyzer.finish() == [held]
+
+
+def test_an_analyzer_with_no_detector_holds_nothing_back():
+    assert FrameAnalyzer(FakeModel(), FakeTracker()).finish() == []
+
+
+def test_a_job_with_no_configuration_gets_a_detector_with_no_rules():
+    # A site nobody has annotated yet. Detection and tracking still run; there is
+    # simply nothing to judge them against.
+    analyzer = make_analyzer(FakeModel(), fps=30.0, new_tracker=_trackers())
+
+    assert analyzer._detector.get_modules() == ()
+
+
+def test_a_job_with_a_configuration_gets_a_detector_built_from_it():
+    analyzer = make_analyzer(
+        FakeModel(),
+        fps=30.0,
+        configuration=CONFIGURATION,
+        types=["red_light_running"],
+        new_tracker=_trackers(),
+    )
+
+    assert [module.type for module in analyzer._detector.get_modules()] == [
+        "red_light_running"
+    ]
+
+
+def test_the_detector_is_told_which_violations_the_job_asked_for():
+    # Canonical values, so the worker holds no table mapping its ViolationType to the
+    # names a document uses.
+    built: list[tuple] = []
+
+    make_analyzer(
+        FakeModel(),
+        fps=25.0,
+        configuration=CONFIGURATION,
+        types=["pedestrian_right_of_way"],
+        new_tracker=_trackers(),
+        new_detector=lambda configuration, types, fps: built.append((types, fps))
+        or Detector(),
+    )
+
+    assert built == [(["pedestrian_right_of_way"], 25.0)]
+
+
+def test_the_detector_is_given_the_same_frame_rate_as_the_tracker():
+    # A source ffprobe could not read. A module reasoning about a span of time has to
+    # agree with the tracker about how much time a frame is worth.
+    trackers = _trackers()
+    built: list[float] = []
+
+    make_analyzer(
+        FakeModel(),
+        fps=None,
+        configuration=CONFIGURATION,
+        new_tracker=trackers,
+        new_detector=lambda configuration, types, fps: built.append(fps) or Detector(),
+    )
+
+    assert trackers.made[0].fps == built[0] == DEFAULT_FPS
+
+
+def test_a_configuration_that_cannot_be_parsed_stops_the_job():
+    # Before a frame is decoded, and loudly — the same bargain a bad calibration
+    # strikes. A job that watched an hour of footage through the wrong polygons would
+    # look entirely normal and be entirely wrong.
+    with pytest.raises(ConfigurationInvalid):
+        make_analyzer(
+            FakeModel(),
+            fps=30.0,
+            configuration={"version": 99, "violations": ["rlr_violation"], "regions": {}},
+            new_tracker=_trackers(),
+        )
