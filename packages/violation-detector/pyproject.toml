@@ -1,0 +1,29 @@
+[project]
+name = "violation-detector"
+version = "0.1.0"
+description = "Traffic violation detection from tracked objects and a site's annotated regions"
+requires-python = ">=3.11"
+# Two, and nothing from this repository — the same constraint trajectory-collector
+# holds itself to, and for the same reason: this code has been carried between
+# projects by hand, and what makes it liftable back out is that it imports nothing
+# from around it. Not `shared`, not the detection worker, and no detection library
+# either. Tracked objects arrive as `TrackedObject`s built from plain numbers rather
+# than as any library's detection type.
+#
+# Notably NOT trajectory-collector, and not because the boundary was hard to draw:
+# nothing here needs a camera model at all. Point-in-polygon gives the same answer in
+# pixels as on the ground plane, and geometry.py has the measurements. A rule about
+# speed or following distance would need one, and that is when to revisit this line.
+#
+# OpenCV is here for point-in-polygon tests and for reading traffic light state out
+# of a frame's pixels. The headless build, because nothing here opens a window — a
+# consumer that already has `opencv-python` should exclude this to avoid two builds
+# in one environment.
+dependencies = ["numpy", "opencv-python-headless>=4.9"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
