@@ -424,6 +424,18 @@ detection library. A `TrackedObject` carries a **class name**, not a class id, b
 an id means nothing without knowing which model produced it; translating one into the
 other is `frame_analyzer._tracked_objects`, and it is the whole of the boundary.
 
+Two rules ship today. **`rlr_violation`** is red-light running: crossing into the box
+past the stop line after the light governing your lane turned red. **`pdx_violation`**
+is pedestrian right of way: driving into a crossing somebody is already in. Both are
+reported under the canonical names the queue uses — `red_light_running` and
+`pedestrian_right_of_way`.
+
+Both turn on the same distinction, and it is the one worth understanding: a rule fires
+on the frame a vehicle *enters* a region, not on every frame it spends there. A car
+already inside the box when the light changed was caught by the change rather than
+running it; a car already stopped in a crossing when somebody steps off the kerb has
+not failed to give way to them. Neither is an offence, and neither is reported.
+
 Which rules a job runs is the intersection of two things. The site's configuration says
 what this junction is annotated for; the job's `types` say what was asked for. Either
 side naming something the other does not is a no-op rather than an error — the site is

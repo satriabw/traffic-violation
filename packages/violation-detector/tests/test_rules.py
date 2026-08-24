@@ -1,7 +1,14 @@
 import pytest
 
-from violation_detector.context import NEVER, LightState, VehicleState
-from violation_detector.rules import is_running_red
+from violation_detector.context import (
+    NEVER,
+    CrossingVehicle,
+    LightState,
+    Occupancy,
+    VehicleState,
+)
+from violation_detector.rules import failing_to_yield, is_running_red
+from violation_detector.observations import Occupant
 from violation_detector.traffic_light import GREEN, RED, UNKNOWN, YELLOW
 
 # One light governing one lane, which is the shape every case below varies from.
@@ -92,3 +99,54 @@ def test_only_the_light_governing_the_vehicles_lane_is_consulted():
     }
     assert is_running_red(car(lane="lane_1"), states, controls) is False
     assert is_running_red(car(lane="lane_2"), states, controls) is True
+
+
+# --- pedestrian right of way --------------------------------------------------
+
+
+def occupancy(vehicles=((1, True, False),), pedestrians=(2,)) -> Occupancy:
+    """One crossing. Each test spoils exactly one condition."""
+    return Occupancy(
+        vehicles=tuple(
+            CrossingVehicle(track_id=id, in_roi=in_roi, prev_in_roi=prev)
+            for id, in_roi, prev in vehicles
+        ),
+        pedestrians=tuple(Occupant(track_id=id, roi="roi_1") for id in pedestrians),
+    )
+
+
+def test_a_vehicle_entering_an_occupied_crossing_is_reported():
+    assert failing_to_yield(occupancy()) == (1,)
+
+
+def test_an_empty_crossing_reports_nobody():
+    # No one to give way to. The commonest state of any crossing.
+    assert failing_to_yield(occupancy(pedestrians=())) == ()
+
+
+def test_a_vehicle_already_inside_when_somebody_stepped_out_is_not_reported():
+    # A car queued in the box before anybody left the kerb has not failed to yield to
+    # them. This is the case prev_in_roi exists for.
+    assert failing_to_yield(occupancy(vehicles=((1, True, True),))) == ()
+
+
+def test_a_vehicle_short_of_the_crossing_is_not_reported():
+    assert failing_to_yield(occupancy(vehicles=((1, False, False),))) == ()
+
+
+def test_every_vehicle_that_pushed_in_is_reported():
+    # Three cars into an occupied crossing on one frame is three drivers who failed to
+    # yield, not one incident.
+    reported = failing_to_yield(
+        occupancy(vehicles=((1, True, False), (2, True, False), (3, True, False)))
+    )
+
+    assert reported == (1, 2, 3)
+
+
+def test_only_the_vehicles_that_just_entered_are_reported():
+    reported = failing_to_yield(
+        occupancy(vehicles=((1, True, False), (2, True, True), (3, False, False)))
+    )
+
+    assert reported == (1,)

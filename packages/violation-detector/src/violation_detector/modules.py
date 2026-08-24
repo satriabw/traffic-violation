@@ -13,15 +13,22 @@ from typing import ClassVar, Sequence
 
 import numpy as np
 
-from violation_detector.context import RedLightRunningContext
+from violation_detector.context import (
+    PedestrianRightOfWayContext,
+    RedLightRunningContext,
+)
 from violation_detector.objects import TrackedObject, Violation
-from violation_detector.observations import RedLightRunningObserver
+from violation_detector.observations import (
+    PedestrianRightOfWayObserver,
+    RedLightRunningObserver,
+)
 from violation_detector.regions import Regions
-from violation_detector.rules import is_running_red
+from violation_detector.rules import failing_to_yield, is_running_red
 
 # The canonical name, as everything outside this package knows it — deliberately the
 # value the queue's ViolationType uses, not the "rlr_violation" a document says.
 RED_LIGHT_RUNNING = "red_light_running"
+PEDESTRIAN_RIGHT_OF_WAY = "pedestrian_right_of_way"
 
 
 class ViolationModule(ABC):
@@ -91,4 +98,34 @@ class RedLightRunningModule(ViolationModule):
             Violation(type=self.type, track_id=vehicle.track_id, frame_index=frame_index)
             for vehicle in context.vehicles
             if is_running_red(vehicle, context.lights, self._controlled_lanes)
+        ]
+
+
+class PedestrianRightOfWayModule(ViolationModule):
+    """Driving into a crossing somebody is already in.
+
+    Per job, on the same terms as every other module here: its context caches what it
+    has seen keyed by tracker id.
+    """
+
+    type: ClassVar[str] = PEDESTRIAN_RIGHT_OF_WAY
+
+    def __init__(self, regions: Regions):
+        self._observer = PedestrianRightOfWayObserver(regions)
+        self._context = PedestrianRightOfWayContext()
+
+    def detect(
+        self,
+        frame: np.ndarray,
+        tracked_objects: Sequence[TrackedObject],
+        frame_index: int,
+    ) -> list[Violation]:
+        observation = self._observer.observe(frame, tracked_objects)
+        context = self._context.update(observation, frame_index)
+        return [
+            Violation(type=self.type, track_id=track_id, frame_index=frame_index)
+            # Sorted, so two crossings reported on one frame come out in a stable order
+            # rather than in whatever order a dict happened to iterate.
+            for roi in sorted(context.rois)
+            for track_id in failing_to_yield(context.rois[roi])
         ]

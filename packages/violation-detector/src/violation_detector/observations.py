@@ -51,11 +51,31 @@ class VehicleObservation:
 
 
 @dataclass(frozen=True)
+class Occupant:
+    """One object on one frame, placed against the regions of interest alone.
+
+    What a rule about a crossing needs and all it needs: which region something is in,
+    if any. No lane, because a crossing does not care where a vehicle came from.
+    """
+
+    track_id: int
+    roi: str | None
+
+
+@dataclass(frozen=True)
 class Observation:
-    """Everything one frame has to say."""
+    """Everything one frame has to say about red-light running."""
 
     lights: tuple[LightObservation, ...]
     vehicles: tuple[VehicleObservation, ...]
+
+
+@dataclass(frozen=True)
+class CrossingObservation:
+    """Everything one frame has to say about who is in a crossing."""
+
+    vehicles: tuple[Occupant, ...]
+    pedestrians: tuple[Occupant, ...]
 
 
 class RedLightRunningObserver:
@@ -99,3 +119,39 @@ class RedLightRunningObserver:
             if object.is_vehicle
         )
         return Observation(lights=lights, vehicles=vehicles)
+
+
+class PedestrianRightOfWayObserver:
+    """Reads a frame for who is standing in a crossing and who is driving into it.
+
+    Simpler than the red-light observer in one way that matters: there is nothing in
+    the pixels it needs. A crossing has no light to read, so the frame is accepted and
+    ignored, and every question is answered by geometry against the regions of
+    interest.
+
+    A cyclist counts as a pedestrian and a motorbike does not. What these rules care
+    about is whether a thing is vulnerable and has right of way, not what it is
+    riding — see `objects`.
+    """
+
+    def __init__(self, regions: Regions):
+        self._rois = RegionIndex(regions.rois)
+
+    def observe(
+        self, frame: np.ndarray, tracked_objects: Sequence[TrackedObject]
+    ) -> CrossingObservation:
+        vehicles, pedestrians = [], []
+        for object in tracked_objects:
+            # Anything that is neither is simply not this rule's business — a traffic
+            # light, or a class the model had no name for. The pipeline this is ported
+            # from could not express that: its parser admitted only vehicles and
+            # people, and its context builder filed everything that was not a vehicle
+            # under pedestrians, so a third kind of thing would have been counted as
+            # somebody waiting to cross.
+            if object.is_vehicle:
+                vehicles.append(Occupant(object.track_id, self._rois.locate(object.bbox)))
+            elif object.is_pedestrian:
+                pedestrians.append(Occupant(object.track_id, self._rois.locate(object.bbox)))
+        return CrossingObservation(
+            vehicles=tuple(vehicles), pedestrians=tuple(pedestrians)
+        )

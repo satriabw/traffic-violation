@@ -18,14 +18,16 @@ The re-exports are deliberate, and the same departure `trajectory_collector` mak
 application's `__init__.py` stays empty because its modules are imported by path, but
 a library's import path is its API, and moving a module should not break anyone.
 
-WHAT IS NOT HERE. Pedestrian right of way, which lands next and needs no change on
-this side of the boundary — it registers itself under its own name and any document
-already asking for it starts getting it.
+Both rules the pipeline this is ported from carried are here: red-light running and
+pedestrian right of way. A third registers itself under its own name, and needs
+nothing on this side of the boundary changed — see `register`.
 """
 
 from violation_detector.detector import Detector, get_detector
 from violation_detector.modules import (
+    PEDESTRIAN_RIGHT_OF_WAY,
     RED_LIGHT_RUNNING,
+    PedestrianRightOfWayModule,
     RedLightRunningModule,
     ViolationModule,
 )
@@ -41,12 +43,14 @@ from violation_detector.registry import ModuleContext, register, registered
 
 __all__ = [
     "PEDESTRIANS",
+    "PEDESTRIAN_RIGHT_OF_WAY",
     "RED_LIGHT_RUNNING",
     "VEHICLES",
     "Configuration",
     "ConfigurationInvalid",
     "Detector",
     "ModuleContext",
+    "PedestrianRightOfWayModule",
     "RedLightRunningModule",
     "Region",
     "Regions",

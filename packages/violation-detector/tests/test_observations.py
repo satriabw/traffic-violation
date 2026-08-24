@@ -1,7 +1,11 @@
 import numpy as np
 
 from violation_detector.objects import TrackedObject
-from violation_detector.observations import RedLightRunningObserver
+from violation_detector.observations import (
+    Occupant,
+    PedestrianRightOfWayObserver,
+    RedLightRunningObserver,
+)
 from violation_detector.regions import Region, Regions, TrafficLight
 from violation_detector.traffic_light import RED, UNKNOWN
 
@@ -104,3 +108,69 @@ def test_observing_the_same_frame_twice_says_the_same_thing():
     objects = [TrackedObject(7, (140, 120, 160, 160), "car")]
 
     assert observer.observe(frame, objects) == observer.observe(frame, objects)
+
+
+# --- the crossing observer ----------------------------------------------------
+
+IN_ROI = (140, 120, 160, 160)  # meets the road at (150, 160), inside roi_1
+OUTSIDE = (300, 300, 320, 340)
+
+
+def crossing():
+    return PedestrianRightOfWayObserver(REGIONS)
+
+
+def test_vehicles_and_people_are_told_apart():
+    observation = crossing().observe(
+        np.zeros((400, 400, 3), dtype=np.uint8),
+        [
+            TrackedObject(1, IN_ROI, "car"),
+            TrackedObject(2, IN_ROI, "person"),
+        ],
+    )
+
+    assert observation.vehicles == (Occupant(track_id=1, roi="roi_1"),)
+    assert observation.pedestrians == (Occupant(track_id=2, roi="roi_1"),)
+
+
+def test_a_cyclist_is_somebody_to_give_way_to():
+    # What these rules care about is that the thing is vulnerable and has right of way,
+    # not what it is riding.
+    observation = crossing().observe(
+        np.zeros((400, 400, 3), dtype=np.uint8), [TrackedObject(3, IN_ROI, "bicycle")]
+    )
+
+    assert [occupant.track_id for occupant in observation.pedestrians] == [3]
+
+
+def test_a_motorbike_is_a_vehicle_not_somebody_to_give_way_to():
+    # The one deliberate behaviour change in the port. In the source a motorbike missed
+    # the VEHICLES set, fell through to the else branch, and was counted as a
+    # pedestrian — so a motorbike alone in a crossing made a violator of every car that
+    # entered it, with no person present at all.
+    observation = crossing().observe(
+        np.zeros((400, 400, 3), dtype=np.uint8), [TrackedObject(4, IN_ROI, "motorbike")]
+    )
+
+    assert [occupant.track_id for occupant in observation.vehicles] == [4]
+    assert observation.pedestrians == ()
+
+
+def test_something_that_is_neither_is_nobodys_business():
+    # A traffic light, or a class the model had no name for. The source pipeline could
+    # not express this: everything that was not a vehicle was filed as a pedestrian.
+    observation = crossing().observe(
+        np.zeros((400, 400, 3), dtype=np.uint8),
+        [TrackedObject(5, IN_ROI, "traffic_light"), TrackedObject(6, IN_ROI, "9")],
+    )
+
+    assert observation.vehicles == ()
+    assert observation.pedestrians == ()
+
+
+def test_an_object_outside_every_crossing_is_placed_nowhere():
+    observation = crossing().observe(
+        np.zeros((400, 400, 3), dtype=np.uint8), [TrackedObject(1, OUTSIDE, "car")]
+    )
+
+    assert observation.vehicles == (Occupant(track_id=1, roi=None),)

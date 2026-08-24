@@ -11,7 +11,12 @@ from violation_detector import (
     ViolationModule,
     get_detector,
 )
-from violation_detector.modules import RED_LIGHT_RUNNING, RedLightRunningModule
+from violation_detector.modules import (
+    PEDESTRIAN_RIGHT_OF_WAY,
+    RED_LIGHT_RUNNING,
+    PedestrianRightOfWayModule,
+    RedLightRunningModule,
+)
 from violation_detector.registry import ModuleContext, factory_for, register, registered
 
 # The document from the README, verbatim — the schema a site actually ships.
@@ -181,5 +186,37 @@ def test_registering_replaces_an_existing_rule(spy_registered):
 
 
 def test_the_registry_reports_what_it_carries():
-    assert "rlr_violation" in registered()
+    assert registered() == ("pdx_violation", "rlr_violation")
     assert factory_for("rlr_violation")[0] == RED_LIGHT_RUNNING
+    assert factory_for("pdx_violation")[0] == PEDESTRIAN_RIGHT_OF_WAY
+
+
+def test_a_site_can_run_both_rules_at_once():
+    detector = get_detector(configuration(violations=["rlr_violation", "pdx_violation"]))
+
+    assert [type(module) for module in detector.get_modules()] == [
+        RedLightRunningModule,
+        PedestrianRightOfWayModule,
+    ]
+
+
+def test_a_job_can_ask_for_one_of_the_two_a_site_runs():
+    # The intersection doing real work: this junction watches for both, this job wants
+    # only the crossing.
+    detector = get_detector(
+        configuration(violations=["rlr_violation", "pdx_violation"]),
+        types=[PEDESTRIAN_RIGHT_OF_WAY],
+    )
+
+    assert [module.type for module in detector.get_modules()] == [
+        PEDESTRIAN_RIGHT_OF_WAY
+    ]
+
+
+def test_both_rules_report_into_one_list():
+    # Nothing deduplicates across them: a vehicle that ran a red light into an occupied
+    # crossing broke two rules, and which to keep is the caller's judgement.
+    detector = get_detector(configuration(violations=["rlr_violation", "pdx_violation"]))
+
+    assert detector.detect(FRAME, [], 0) == []
+    assert detector.finish() == []
