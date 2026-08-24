@@ -1,0 +1,24 @@
+# What never belongs in a build context. The images install from the pyprojects and
+# get their source back as a bind mount in development, so most of the repo is here
+# only to make the context small and the layer cache stable.
+
+.git/
+.github/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+
+# Runtime state, not inputs: the SQLite file, Redis's directory, anything the
+# containers themselves write.
+data/
+
+# Weights are mounted, never baked. The RT-DETR export is 80 MB and gitignored, so
+# copying it in would make every rebuild slower to produce an image that still could
+# not be shared. See DETECTION_MODEL_PATH in docker-compose.yml.
+*.onnx
+
+# Secrets. Compose passes .env in as an env_file at run time; it must not be a layer.
+.env

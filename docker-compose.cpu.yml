@@ -1,0 +1,29 @@
+# The worker without the GPU, for when the card is busy with something else.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.cpu.yml up --build
+#
+# Also the only variant that runs on a machine with no CUDA at all, which is what
+# makes it worth keeping rather than assuming the workstation is the only host.
+#
+# Expect roughly a tenth of the throughput: RT-DETR at 640x640 measured ~101 fps on
+# the 2080 Ti and ~10 fps on this workstation's CPU, so a job that takes a minute on
+# the GPU takes ten here.
+
+services:
+  worker:
+    # A separate tag, not a rebuild of the GPU one. Building both under one name
+    # would mean `docker compose up` silently ran whichever was built last.
+    image: traffic-violation-worker:cpu
+    build:
+      target: cpu
+    # !reset, not absent and not `gpus: []`. Compose merges an override into the base
+    # rather than replacing it, so both of those leave the base file's `gpus: all`
+    # standing — the CPU image would then be handed a GPU it has no provider for.
+    # !reset is compose's way of deleting an inherited key. Check it took with
+    # `docker compose -f docker-compose.yml -f docker-compose.cpu.yml config`.
+    gpus: !reset null
+    environment:
+      # The CPU image has no CUDA provider to fall back from, so naming CPU here is
+      # not a fallback — it is the whole list, and it keeps onnxruntime from logging
+      # a provider it was never built with.
+      DETECTION_MODEL_PROVIDERS: CPUExecutionProvider
