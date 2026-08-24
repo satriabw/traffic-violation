@@ -2,6 +2,7 @@
     "extraPaths": [
         "shared/src",
         "packages/trajectory-collector/src",
+        "packages/violation-detector/src",
         "services/site-service",
         "workers/detection-worker"
     ]
