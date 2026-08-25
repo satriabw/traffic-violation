@@ -1,6 +1,11 @@
 import numpy as np
 
-from violation_detector.modules import RED_LIGHT_RUNNING, RedLightRunningModule
+from violation_detector.modules import (
+    PEDESTRIAN_RIGHT_OF_WAY,
+    RED_LIGHT_RUNNING,
+    PedestrianRightOfWayModule,
+    RedLightRunningModule,
+)
 from violation_detector.objects import TrackedObject
 from violation_detector.regions import Configuration
 from violation_detector.traffic_light import GREEN, RED
@@ -154,3 +159,116 @@ def test_a_scene_that_can_never_fire_builds_anyway():
 
     assert detector.detect(frame(RED), [car(IN_LANE)], 0) == []
     assert detector.detect(frame(RED), [car(IN_BOX)], 1) == []
+
+
+# --- pedestrian right of way --------------------------------------------------
+
+BLANK = np.zeros((400, 400, 3), dtype=np.uint8)
+ON_KERB = (140.0, 180.0, 160.0, 220.0)  # meets the road at (150, 220), outside roi_1
+
+
+def crossing_module() -> PedestrianRightOfWayModule:
+    return PedestrianRightOfWayModule(Configuration.from_document(DOCUMENT).regions)
+
+
+def walker(bbox, track_id: int = 2) -> TrackedObject:
+    return TrackedObject(track_id=track_id, bbox=bbox, class_name="person")
+
+
+def test_driving_into_an_occupied_crossing_is_reported_once():
+    # Scenario A of the audit: without prev_in_roi this is one report per frame, and a
+    # three-second dwell at 30fps inflates the count ninety-fold.
+    detector = crossing_module()
+    reported = []
+
+    for index, car_bbox in enumerate([ON_KERB, IN_BOX, IN_BOX, IN_BOX]):
+        reported.append(
+            detector.detect(BLANK, [car(car_bbox), walker(IN_BOX)], index)
+        )
+
+    assert [len(violations) for violations in reported] == [0, 1, 0, 0]
+
+    violation = reported[1][0]
+    assert violation.type == PEDESTRIAN_RIGHT_OF_WAY == "pedestrian_right_of_way"
+    assert violation.track_id == 7
+    assert violation.frame_index == 1
+
+
+def test_a_vehicle_already_stopped_when_somebody_steps_out_is_not_reported():
+    # Scenario B, and the case the whole prev_in_roi mechanism exists for. A car queued
+    # in the box before anybody left the kerb has not failed to give way to them.
+    detector = crossing_module()
+
+    detector.detect(BLANK, [car(ON_KERB)], 0)
+    detector.detect(BLANK, [car(IN_BOX)], 1)
+
+    assert detector.detect(BLANK, [car(IN_BOX), walker(IN_BOX)], 2) == []
+    assert detector.detect(BLANK, [car(IN_BOX), walker(IN_BOX)], 3) == []
+
+
+def test_a_vehicle_first_seen_already_inside_is_not_reported():
+    # Scenario C. We never watched it enter, so we cannot say it entered while somebody
+    # was crossing. At a chunk boundary this is what the LLD's overlap covers.
+    detector = crossing_module()
+
+    assert detector.detect(BLANK, [car(IN_BOX), walker(IN_BOX)], 0) == []
+
+
+def test_an_empty_crossing_reports_nobody():
+    detector = crossing_module()
+
+    detector.detect(BLANK, [car(ON_KERB)], 0)
+
+    assert detector.detect(BLANK, [car(IN_BOX)], 1) == []
+
+
+def test_a_motorbike_alone_in_a_crossing_makes_nobody_a_violator():
+    # The deliberate change, end to end. Measured against the source: a car entering a
+    # crossing occupied only by a motorbike, with no person anywhere, was reported.
+    detector = crossing_module()
+    rider = TrackedObject(track_id=4, bbox=IN_BOX, class_name="motorbike")
+
+    detector.detect(BLANK, [car(ON_KERB), rider], 0)
+
+    assert detector.detect(BLANK, [car(IN_BOX), rider], 1) == []
+
+
+def test_a_cyclist_in_a_crossing_has_right_of_way():
+    detector = crossing_module()
+    cyclist = TrackedObject(track_id=3, bbox=IN_BOX, class_name="bicycle")
+
+    detector.detect(BLANK, [car(ON_KERB), cyclist], 0)
+
+    assert len(detector.detect(BLANK, [car(IN_BOX), cyclist], 1)) == 1
+
+
+def test_a_pedestrian_at_another_crossing_makes_nobody_a_violator():
+    # Co-presence in one crossing. The document below has a second ROI well away from
+    # the first, and somebody standing in it is nothing to do with this vehicle.
+    rois = [
+        *DOCUMENT["regions"]["rois"],
+        {"id": "roi_2", "points": [[300, 100], [380, 100], [380, 180], [300, 180]]},
+    ]
+    document = {**DOCUMENT, "regions": {**DOCUMENT["regions"], "rois": rois}}
+    detector = PedestrianRightOfWayModule(Configuration.from_document(document).regions)
+    far_away = walker((330.0, 140.0, 350.0, 170.0))
+
+    detector.detect(BLANK, [car(ON_KERB), far_away], 0)
+
+    assert detector.detect(BLANK, [car(IN_BOX), far_away], 1) == []
+
+
+def test_every_vehicle_that_pushed_in_is_reported():
+    detector = crossing_module()
+    first, second = car(ON_KERB, 7), car(ON_KERB, 8)
+
+    detector.detect(BLANK, [first, second, walker(IN_BOX)], 0)
+    violations = detector.detect(
+        BLANK, [car(IN_BOX, 7), car(IN_BOX, 8), walker(IN_BOX)], 1
+    )
+
+    assert sorted(violation.track_id for violation in violations) == [7, 8]
+
+
+def test_a_rule_module_holds_nothing_back_at_the_end():
+    assert crossing_module().finish() == []

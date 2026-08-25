@@ -16,9 +16,15 @@ of fields, which is nothing next to the frames themselves — and eviction would
 know that a track is finished, which nothing here is told.
 """
 
+from collections import defaultdict
 from dataclasses import dataclass
 
-from violation_detector.observations import Observation, VehicleObservation
+from violation_detector.observations import (
+    CrossingObservation,
+    Observation,
+    Occupant,
+    VehicleObservation,
+)
 from violation_detector.traffic_light import RED
 
 # No entry recorded. -1 rather than None so the comparison in the rule — did this
@@ -154,4 +160,106 @@ class RedLightRunningContext:
             in_roi=in_roi,
             prev_in_roi=memory.prev_in_roi,
             enter_roi_frame=memory.enter_roi_frame,
+        )
+
+
+@dataclass(frozen=True)
+class CrossingVehicle:
+    """A vehicle, and whether this frame is the one it drove in on."""
+
+    track_id: int
+    in_roi: bool
+    # Whether it was already inside on an earlier frame. This is what separates
+    # *entering* an occupied crossing from *being* in one that later becomes occupied —
+    # a car queued in the box before anybody stepped off the kerb has not failed to
+    # yield to them. It is also what keeps one crossing from being reported on every
+    # frame of the crossing.
+    prev_in_roi: bool
+
+
+@dataclass(frozen=True)
+class Occupancy:
+    """Who is in one region of interest, right now."""
+
+    # Only those actually inside it. A vehicle short of the line and a pedestrian on
+    # the far pavement are not in this crossing and are not here.
+    vehicles: tuple[CrossingVehicle, ...]
+    pedestrians: tuple[Occupant, ...]
+
+
+@dataclass(frozen=True)
+class CrossingContext:
+    """Every region of interest that has anything in it, keyed by its id.
+
+    Keyed and grouped because the rule is about co-presence: a vehicle and a pedestrian
+    matter to each other only when they are in the *same* crossing. A junction with two
+    crossings would otherwise have one pedestrian make violators of vehicles entering
+    the other.
+    """
+
+    rois: dict[str, Occupancy]
+
+
+@dataclass
+class _CrossingMemory:
+    enter_roi_frame: int
+    prev_in_roi: bool
+
+
+class PedestrianRightOfWayContext:
+    """Folds each frame's crossing observation into what is known so far.
+
+    Per job, and for the same reason everything else here is: the cache is keyed by
+    tracker id, and those restart at 1 for every video.
+    """
+
+    def __init__(self) -> None:
+        self._vehicles: dict[int, _CrossingMemory] = {}
+
+    def update(self, observation: CrossingObservation, frame_index: int) -> CrossingContext:
+        vehicles: dict[str, list[CrossingVehicle]] = defaultdict(list)
+        pedestrians: dict[str, list[Occupant]] = defaultdict(list)
+
+        for occupant in observation.vehicles:
+            # Every vehicle is folded into the cache, including one outside every
+            # crossing: leaving it out would make its next arrival look like a first
+            # sighting. Only those actually inside one are grouped.
+            vehicle = self._vehicle(occupant, frame_index)
+            if occupant.roi is not None:
+                vehicles[occupant.roi].append(vehicle)
+
+        for occupant in observation.pedestrians:
+            if occupant.roi is not None:
+                pedestrians[occupant.roi].append(occupant)
+
+        return CrossingContext(
+            rois={
+                roi: Occupancy(
+                    vehicles=tuple(vehicles[roi]), pedestrians=tuple(pedestrians[roi])
+                )
+                for roi in vehicles.keys() | pedestrians.keys()
+            }
+        )
+
+    def _vehicle(self, occupant: Occupant, frame_index: int) -> CrossingVehicle:
+        in_roi = occupant.roi is not None
+        memory = self._vehicles.get(occupant.track_id)
+
+        if memory is None:
+            memory = _CrossingMemory(
+                enter_roi_frame=frame_index if in_roi else NEVER, prev_in_roi=False
+            )
+            self._vehicles[occupant.track_id] = memory
+
+        # The same two lines, in the same order, as the red-light context, and they
+        # carry the same three consequences: not a repeat on the frame it enters, a
+        # repeat from the next frame on, and a vehicle first seen already inside marked
+        # immediately and never reportable. See `RedLightRunningContext._vehicle`.
+        if in_roi and memory.enter_roi_frame != NEVER:
+            memory.prev_in_roi = True
+        if in_roi and memory.enter_roi_frame == NEVER:
+            memory.enter_roi_frame = frame_index
+
+        return CrossingVehicle(
+            track_id=occupant.track_id, in_roi=in_roi, prev_in_roi=memory.prev_in_roi
         )

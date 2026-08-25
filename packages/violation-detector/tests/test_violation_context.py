@@ -1,7 +1,13 @@
-from violation_detector.context import NEVER, RedLightRunningContext
+from violation_detector.context import (
+    NEVER,
+    PedestrianRightOfWayContext,
+    RedLightRunningContext,
+)
 from violation_detector.observations import (
+    CrossingObservation,
     LightObservation,
     Observation,
+    Occupant,
     VehicleObservation,
 )
 from violation_detector.traffic_light import GREEN, RED, UNKNOWN, YELLOW
@@ -177,3 +183,88 @@ def test_a_vehicle_never_in_a_lane_or_the_box_carries_nothing():
     assert vehicle(context).last_lane is None
     assert vehicle(context).in_roi is False
     assert vehicle(context).enter_roi_frame == NEVER
+
+
+# --- the crossing context -----------------------------------------------------
+
+
+def crossing(vehicles=(), pedestrians=()) -> CrossingObservation:
+    return CrossingObservation(
+        vehicles=tuple(Occupant(id, roi) for id, roi in vehicles),
+        pedestrians=tuple(Occupant(id, roi) for id, roi in pedestrians),
+    )
+
+
+def test_everyone_in_one_crossing_is_grouped_under_it():
+    builder = PedestrianRightOfWayContext()
+
+    context = builder.update(
+        crossing(vehicles=[(1, "roi_1")], pedestrians=[(2, "roi_1")]), 0
+    )
+
+    assert list(context.rois) == ["roi_1"]
+    assert [v.track_id for v in context.rois["roi_1"].vehicles] == [1]
+    assert [p.track_id for p in context.rois["roi_1"].pedestrians] == [2]
+
+
+def test_two_crossings_are_kept_apart():
+    # The reason this is grouped at all: a pedestrian at one crossing must not make a
+    # violator of a vehicle entering another.
+    builder = PedestrianRightOfWayContext()
+
+    context = builder.update(
+        crossing(vehicles=[(1, "roi_1")], pedestrians=[(2, "roi_2")]), 0
+    )
+
+    assert context.rois["roi_1"].pedestrians == ()
+    assert context.rois["roi_2"].vehicles == ()
+
+
+def test_anyone_outside_every_crossing_is_left_out():
+    builder = PedestrianRightOfWayContext()
+
+    context = builder.update(
+        crossing(vehicles=[(1, None)], pedestrians=[(2, None)]), 0
+    )
+
+    assert context.rois == {}
+
+
+def test_entering_a_crossing_is_not_yet_a_repeat():
+    builder = PedestrianRightOfWayContext()
+
+    builder.update(crossing(vehicles=[(1, None)]), 0)
+    context = builder.update(crossing(vehicles=[(1, "roi_1")]), 1)
+
+    assert context.rois["roi_1"].vehicles[0].prev_in_roi is False
+
+
+def test_staying_in_a_crossing_is_a_repeat_from_the_next_frame_on():
+    builder = PedestrianRightOfWayContext()
+
+    builder.update(crossing(vehicles=[(1, None)]), 0)
+    builder.update(crossing(vehicles=[(1, "roi_1")]), 1)
+    context = builder.update(crossing(vehicles=[(1, "roi_1")]), 2)
+
+    assert context.rois["roi_1"].vehicles[0].prev_in_roi is True
+
+
+def test_a_vehicle_first_seen_already_inside_can_never_be_reported():
+    # Preserved from the source, and the same decision the red-light context makes: we
+    # never watched it enter, so we cannot say it entered while somebody was crossing.
+    builder = PedestrianRightOfWayContext()
+
+    context = builder.update(crossing(vehicles=[(1, "roi_1")]), 0)
+
+    assert context.rois["roi_1"].vehicles[0].prev_in_roi is True
+
+
+def test_a_vehicle_outside_a_crossing_is_still_remembered():
+    # Left out of the grouping but not out of the cache. Dropping it would make its
+    # arrival at the next frame look like a first sighting, which can never be reported.
+    builder = PedestrianRightOfWayContext()
+
+    builder.update(crossing(vehicles=[(1, None)]), 0)
+    context = builder.update(crossing(vehicles=[(1, "roi_1")]), 1)
+
+    assert context.rois["roi_1"].vehicles[0].prev_in_roi is False

@@ -12,7 +12,7 @@ lets the conditions that do not depend on the light be checked once instead of o
 per light.
 """
 
-from violation_detector.context import LightState, VehicleState
+from violation_detector.context import LightState, Occupancy, VehicleState
 from violation_detector.traffic_light import RED
 
 
@@ -51,3 +51,34 @@ def is_running_red(
             return True
 
     return False
+
+
+def failing_to_yield(occupancy: Occupancy) -> tuple[int, ...]:
+    """Which vehicles drove into this crossing while somebody was in it.
+
+    Two conditions, and the whole rule:
+
+      1. somebody vulnerable is in this crossing — a pedestrian, a cyclist, anyone the
+         traffic is supposed to give way to;
+      2. a vehicle entered it on this frame, and was not already inside on the last
+         one.
+
+    The second is what makes this about *yielding* rather than about proximity. A car
+    already stopped in the box when a pedestrian steps off the kerb has not failed to
+    give way to them; a car that drives in while they are crossing has. Without it the
+    rule would also report the same car on every frame the two are in the box together,
+    and the count would grow with how long the pedestrian took.
+
+    Every entering vehicle is reported, not just one. If three cars push into an
+    occupied crossing on the same frame, three drivers failed to yield.
+
+    Co-presence in ONE crossing: this is asked per region of interest, so a pedestrian
+    at one crossing cannot make violators of vehicles entering another.
+    """
+    if not occupancy.pedestrians:
+        return ()
+    return tuple(
+        vehicle.track_id
+        for vehicle in occupancy.vehicles
+        if vehicle.in_roi and not vehicle.prev_in_roi
+    )

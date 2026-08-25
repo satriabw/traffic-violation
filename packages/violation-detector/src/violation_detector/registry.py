@@ -23,7 +23,9 @@ from dataclasses import dataclass
 from typing import Callable
 
 from violation_detector.modules import (
+    PEDESTRIAN_RIGHT_OF_WAY,
     RED_LIGHT_RUNNING,
+    PedestrianRightOfWayModule,
     RedLightRunningModule,
     ViolationModule,
 )
@@ -83,4 +85,10 @@ register(
     "rlr_violation",
     RED_LIGHT_RUNNING,
     lambda context: RedLightRunningModule(context.regions),
+)
+
+register(
+    "pdx_violation",
+    PEDESTRIAN_RIGHT_OF_WAY,
+    lambda context: PedestrianRightOfWayModule(context.regions),
 )
