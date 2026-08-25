@@ -12,9 +12,10 @@ The re-exports are deliberate, and the same departure `trajectory_collector` mak
 application's `__init__.py` stays empty because its modules are imported by path, but
 a library's import path is its API, and moving a module should not break anyone.
 
-WHAT IS NOT HERE. The rules themselves, and the factory that builds them from a
-configuration. This package currently parses and validates a site's document and
-answers where an object is; detecting anything is the next thing to land.
+WHAT IS NOT HERE. The factory that turns a configuration's `violations` list into a
+set of modules, and the registry it resolves those names through. Red-light running
+is implemented — `violation_detector.modules.RedLightRunningModule` — but a caller
+still has to build it by hand; the one-call entry point is the next thing to land.
 """
 
 from violation_detector.objects import PEDESTRIANS, VEHICLES, TrackedObject, Violation
