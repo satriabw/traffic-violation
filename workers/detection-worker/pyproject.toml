@@ -23,6 +23,11 @@ dependencies = [
     # several projects: it depends on nothing in this repository, so the day a second
     # one needs it, it moves out whole. See packages/trajectory-collector.
     "trajectory-collector",
+    # The rules themselves, and for the same reason: this code came from another
+    # project and is meant to be liftable back out, so it depends on nothing in this
+    # repository — not shared, not this worker, and no detection library. The two
+    # adapters in analysis.frame_analyzer are the whole of the boundary.
+    "violation-detector",
     # boto3 (to sign its own download urls), the job model, and the shared database
     # connection all come with shared. Still no http client: the worker reads the same
     # SQLite file as site-service but never calls it — see detection_worker.db.

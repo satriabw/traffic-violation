@@ -122,7 +122,7 @@ services:
     environment:
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       TRAFFIC_DB_PATH: /repo/data/traffic_violations.sqlite
-      PYTHONPATH: /repo/shared/src:/repo/packages/trajectory-collector/src:/repo/workers/detection-worker
+      PYTHONPATH: /repo/shared/src:/repo/packages/trajectory-collector/src:/repo/packages/violation-detector/src:/repo/workers/detection-worker
       # Weights are not in the image: the export is 80 MB, gitignored, and versioned
       # by whoever trained it rather than by this repository. It arrives through the
       # repo mount, so the path is the host path with /repo on the front.

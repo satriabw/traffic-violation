@@ -89,7 +89,7 @@ PYTHONPATH=shared/src:services/site-service .venv/bin/uvicorn site_service.main:
 
 # 3. the detection worker
 set -a; source .env; set +a
-PYTHONPATH=shared/src:packages/trajectory-collector/src:workers/detection-worker \
+PYTHONPATH=shared/src:packages/trajectory-collector/src:packages/violation-detector/src:workers/detection-worker \
   .venv/bin/python -m detection_worker.worker
 ```
 
@@ -313,7 +313,8 @@ growing set of keys would not. The worker looks them up by `(site_id, version)` 
 **never** by "the site's active calibration": a v4 uploaded while the job sits in the
 queue must not change what that job is evaluated against, and a run that used the wrong
 camera model would look completely normal. `null` means the site had neither when the
-job was created, which is a normal state until there is a rule engine to need them.
+job was created, which stays a normal state: without a calibration a job reports no
+trajectories, and without a configuration it runs no rules.
 
 Everything that can go wrong is about the site's *state*, so it is 409 rather than 422 —
 the request is well formed, and the identical one succeeds once a video is attached:
@@ -340,20 +341,29 @@ worker's entrypoint ordinary Python rather than a framework's. `LPUSH` at the he
 `BRPOP` at the tail — that pairing is what makes it FIFO.
 
 ```
-PYTHONPATH=shared/src:packages/trajectory-collector/src:workers/detection-worker \
+PYTHONPATH=shared/src:packages/trajectory-collector/src:packages/violation-detector/src:workers/detection-worker \
   .venv/bin/python -m detection_worker.worker
 ```
 
 The worker signs a url from the job's `source.key`, reads the frames the job asks for,
-detects and tracks what is in them, and logs a summary. The rest of the pipeline the
-LLD describes (evaluate → store) is still missing, and nothing writes violations yet.
+detects and tracks what is in them, puts them on the ground, runs the rules the site's
+configuration asks for, and logs a summary. What a firing rule produces is counted and
+logged and goes no further: turning a `Violation` into a row means cropping evidence
+frames, uploading them and calling `detection_worker.violations.record`, and that is
+the next piece of work. The seam is `FrameResult.violations`.
 
 The work splits by how often it runs. `make_handler` in `detection_worker/worker.py`
 holds what happens **once per job** — resolve the job's context, sign the url, iterate
 the reader, aggregate, log — and a `FrameAnalyzer` from `detection_worker/analysis/`
-holds what happens **once per frame**: predict, then track, returning a `FrameResult`. Trajectory collection and the rule engine land inside
-`analyze`, which is why they are separate at all: neither has any business widening a
-function that also knows about presigned urls.
+holds what happens **once per frame**: predict, track, locate, judge, returning a
+`FrameResult`. Trajectory collection and the rules live inside `analyze`, which is why
+the split exists at all: neither has any business widening a function that also knows
+about presigned urls.
+
+`analyzer.finish()` is called once after the loop. Every rule shipped today returns
+nothing from it, because a rule decides on the frame it is given — but a module working
+on a *clip* is always holding a partial window when the frames run out, and without the
+drain the last seconds of every chunk would go unjudged in silence.
 
 An analyzer belongs to exactly one job, because its tracker does. That lifetime is the
 one thing in this design worth being careful about — a tracker holds live state, so
@@ -390,6 +400,40 @@ or a frame range, because none of those exist outside this system.
 `from_calibration` is the only entry point. Which projection a calibration calls for is
 the package's decision, so the worker never names a camera model, a filter or a
 projection — the same way it opens a video without naming a decoder.
+
+### Violations
+
+A rule is a statement about what an object did over time — crossed the stop line after
+the light governing its lane turned red — so it runs after tracking, never before. An
+untracked box has no history to have done anything in.
+
+That work lives in **`packages/violation-detector/`**, separate from the worker on
+exactly the terms trajectory-collector is:
+
+```python
+from violation_detector import Configuration, get_detector
+
+detector = get_detector(Configuration.from_document(document), types=[...], fps=30.0)
+violations = detector.detect(frame, tracked_objects, frame_index)
+# [Violation(type="red_light_running", track_id=7, frame_index=912)]
+violations = detector.finish()
+```
+
+Its whole dependency list is numpy and OpenCV — not `shared`, not the worker, and no
+detection library. A `TrackedObject` carries a **class name**, not a class id, because
+an id means nothing without knowing which model produced it; translating one into the
+other is `frame_analyzer._tracked_objects`, and it is the whole of the boundary.
+
+Which rules a job runs is the intersection of two things. The site's configuration says
+what this junction is annotated for; the job's `types` say what was asked for. Either
+side naming something the other does not is a no-op rather than an error — the site is
+the authority on what can be watched for, the job on what was wanted. `types` are
+canonical values (`red_light_running`), so the worker holds no table mapping its own
+`ViolationType` to the `rlr_violation` a document says; the registry inside the package
+is the only thing that knows both vocabularies.
+
+A detector is per-job, for the third time and the same reason: its rules cache what
+they have seen keyed by tracker id, and those restart at 1 for every video.
 
 The collector is per-job for the same reason the tracker is, and by the same key:
 tracker ids restart at 1 for every job, so a collector outliving one would merge

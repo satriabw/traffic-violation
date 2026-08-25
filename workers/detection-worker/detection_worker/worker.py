@@ -2,10 +2,13 @@
 
 It takes jobs off the queue, resolves the calibration and configuration each one was
 created against, reads the frames it asks for, and hands each frame to an analyzer.
-What is still missing is the middle of the pipeline: trajectories, the rule engine, and
-the evidence frames a firing rule uploads. Both ends of it exist — tracked detections
-come out of `FrameAnalyzer.analyze`, and `detection_worker.violations.record` writes
-what a rule decides — so what lands next is the part that connects them.
+The pipeline now runs end to end: detection, tracking, ground positions, and the rules
+a site's configuration asks for.
+
+What a firing rule produces is counted and logged, and goes no further. Turning a
+`Violation` into a row means cropping evidence frames, uploading them, assembling a
+`ViolationCreate` and calling `detection_worker.violations.record` — which is the next
+piece of work, and deliberately not this one. The seam is `FrameResult.violations`.
 
 Everything here is per-job. Per-frame work lives in `detection_worker.analysis`.
 """
@@ -67,6 +70,7 @@ def make_handler(
 
         read_count = 0
         detection_count = 0
+        violation_count = 0
         seen_tracks: set[int] = set()
         located_tracks: set[int] = set()
 
@@ -78,6 +82,7 @@ def make_handler(
             detection_count += len(result.detections)
             seen_tracks.update(ids)
             located_tracks.update(result.trajectories)
+            violation_count += len(result.violations)
 
             # Per-frame detail is DEBUG because a 30-second chunk is ~900 of these,
             # and the summary below is what anyone watching a normal run wants.
@@ -89,9 +94,15 @@ def make_handler(
                 ids,
             )
 
+        # Once, after the loop. A rule reports on the frame it was given and holds
+        # nothing, but a module working on a clip is still holding a partial one here,
+        # and without this drain the last seconds of every chunk would be dropped in
+        # silence.
+        violation_count += len(analyzer.finish())
+
         logger.info(
             "detection job %s site=%s source=%s v%d calib=%s config=%s frames=%d-%d "
-            "read=%d detections=%d tracks=%d located=%d types=%s",
+            "read=%d detections=%d tracks=%d located=%d violations=%d types=%s",
             job.id,
             job.site_id,
             job.source.source_id,
@@ -114,6 +125,11 @@ def make_handler(
             # whose bottom edge met the ground — which is the difference between "we
             # saw it" and "we know where it was".
             len(located_tracks),
+            # What the rules reported, including anything drained above. Zero for a
+            # site with no configuration, and zero for a job that asked for no types —
+            # both normal, and neither distinguishable from a clean stretch of footage
+            # by this number alone.
+            violation_count,
             [t.value for t in job.types],
         )
 
@@ -164,7 +180,14 @@ def main() -> None:
         make_handler(
             lambda job: context.load(con, job),
             lambda job, job_context: make_analyzer(
-                model, job.source.fps, job_context.calibration
+                model,
+                job.source.fps,
+                job_context.calibration,
+                job_context.configuration,
+                # Canonical values, so the worker holds no table mapping its own
+                # ViolationType to the names a configuration document uses. The
+                # registry is the only place that knows both.
+                [t.value for t in job.types],
             ),
         ),
     )
