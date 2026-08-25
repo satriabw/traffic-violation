@@ -5,6 +5,7 @@
 ```
 python3 -m venv .venv
 .venv/bin/pip install -e ./shared -e ./packages/trajectory-collector \
+  -e ./packages/violation-detector \
   -e ./services/site-service -e ./workers/detection-worker
 ```
 
@@ -566,6 +567,59 @@ API should make on the caller's behalf.
 A `files` row referenced by a site, a calibration, or a configuration cannot be
 deleted while that reference stands. Nothing deletes files today, so this only
 constrains a future `DELETE /files/{id}`.
+
+### What a configuration file has to contain
+
+The service stores configurations the same opaque way it stores calibrations, so the
+schema below is enforced by whoever reads one — `packages/violation-detector/` — and
+`Configuration.from_document` is where it is written down.
+
+A configuration says two things: which rules a site runs, and the places they run
+against.
+
+```json
+{
+  "version": 1,
+  "violations": ["rlr_violation"],
+  "regions": {
+    "lanes":          [{"id": "lane_1", "points": [[115, 640], [232, 1069], [807, 1067], [354, 639]]}],
+    "traffic_lights": [{"id": "tl_1", "points": [[33, 470], [31, 516], [50, 519], [53, 458]],
+                        "controls": ["lane_1"]}],
+    "rois":           [{"id": "roi_1", "points": [[58, 564], [62, 636], [113, 636], [351, 634]]}]
+  }
+}
+```
+
+`points` are pixels in the source video's coordinate space, at least three per region,
+in the order they should be joined. A lane is where a vehicle comes *from*; an ROI is
+the area a rule cares about it entering — the junction box, a crossing.
+
+`controls` is the junction's wiring, and the document is the only thing that knows it.
+Without it there is no way to say which vehicles a given light is responsible for, and
+red-light running is not expressible at all. Every lane it names must be declared in
+`lanes`, and that is checked when the document is parsed: a rule handed the mapping
+cannot tell a lane that does not exist from one it has not seen a vehicle in yet, so a
+typo would simply never fire and never explain itself.
+
+Parsing is strict about anything that could swallow content silently. An unknown
+section (`"roi"` for `"rois"`) is refused rather than ignored, because ignoring it
+drops every region in it and the only symptom is a rule that never fires. Two regions
+in one section may not share an `id`; a lane and an ROI may. Unknown keys *beside* the
+content — a name, a note — are left alone. A `version` other than 1 is refused
+outright: a configuration is read once and used for a whole run, so a document whose
+meaning changed under us would produce a run that looks entirely normal and is
+entirely wrong.
+
+Region membership is decided in **pixels**, and deliberately not on the ground plane
+despite a site usually having a camera model to hand. Projecting first is what the
+pipeline this is ported from did, and it cannot change the answer: the projection is a
+homography, a homography maps lines to lines, so a polygon stays a polygon and its
+interior stays its interior. Measured before the code was deleted — 20,000 random
+points against a lane polygon under a 65-degree pitch, zero disagreements between the
+two paths, and still zero for a polygon annotated so generously that its far edge
+crossed the horizon and its ground projection turned inside out. What it cost was a
+matrix multiply per region per object per frame. A rule about speed or following
+distance is a different question and does need the camera model; membership does not.
 
 ### Files
 
