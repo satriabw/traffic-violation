@@ -43,14 +43,23 @@ class FrameResult:
     # reports on the frame it was given, but a module working on a clip reports several
     # frames late. Record the violation's, never the result's.
     violations: list[Violation] = field(default_factory=list)
-    # The few seconds leading up to each violation on this frame, keyed by the track it
-    # was reported against. Empty on every frame where nothing fired, which is almost
-    # all of them.
+    # The few seconds leading up to this moment, for EVERY track the buffer holds —
+    # keyed by track id, and not only the ones convicted. Empty on every frame where
+    # nothing fired, which is almost all of them.
+    #
+    # The whole scene rather than the violator alone, because who else was there is
+    # what a violation is reviewed against, and a pedestrian's window is the one thing
+    # that cannot be recovered later from a record of the vehicle. Narrowing it to the
+    # ones that mattered is a question about regions, answered by whoever holds the
+    # polygons at read time — see ViolationMetadata.violator_track_id for how the
+    # convicted track stays identifiable once this is a crowd.
     #
     # A window is not the same length as the ring that produced it. A track seen for
     # half a second has half a second of history, and a violation early in a chunk has
     # only as much lead-up as the chunk has frames — which is why the handler counts
-    # the short ones rather than assuming they are all full.
+    # the short ones rather than assuming they are all full. It counts the violator's
+    # alone: with the scene in here, every object that just walked into view is short
+    # too, and they say nothing about whether the window outgrew the chunk overlap.
     evidence: dict[int, TrackWindow] = field(default_factory=dict)
 
     @property

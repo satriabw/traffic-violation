@@ -51,8 +51,24 @@ class TrackSummary(BaseModel):
 class ViolationMetadata(BaseModel):
     """The json_blob, typed. Shape is the LLD's."""
 
+    # WHO WAS ON THE SCENE, not who was to blame. Every track the evidence buffer held
+    # when the rule fired, split by what the detector called each one — the vehicle
+    # convicted, the pedestrian it drove at, and the car queued behind that had nothing
+    # to do with either. Deciding which of them mattered means testing their boxes
+    # against the regions in force, and the row pins `configuration_id` so a reader can
+    # do exactly that; the worker records what was there and interprets none of it.
     vehicles: list[TrackSummary] = Field(default_factory=list)
     pedestrians: list[TrackSummary] = Field(default_factory=list)
+    # WHICH TRACK WAS CONVICTED. Load-bearing, and only since the lists above became
+    # the whole scene: a reader used to be able to take `vehicles[0]`, because there was
+    # never more than one. Now nothing else in here distinguishes the driver who failed
+    # to yield from the driver waiting behind them.
+    #
+    # The tracker's id, so it means something only alongside the run that assigned it —
+    # which is the same scope as the windows it indexes into, and why it lives in the
+    # blob beside them rather than on the row. None on a violation whose rule reported
+    # no track, and on everything written before this existed.
+    violator_track_id: int | None = None
     # S3 object keys, not URLs — presigned links expire, so they are minted per read
     # the same way file downloads are.
     #

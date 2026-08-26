@@ -628,12 +628,16 @@ def test_nothing_after_the_violation_is_in_the_record():
     assert fired.frame_indices == (900, 901)
 
 
-def test_only_the_track_that_fired_is_recorded():
+def test_the_whole_scene_is_recorded_not_only_the_track_that_fired():
+    # Who else was there is what a violation gets reviewed against, and a bystander's
+    # window is the one thing that cannot be recovered later from a record of the
+    # convicted vehicle alone. Which of them mattered is a question about regions, and
+    # nothing here answers it — see ViolationMetadata.
     analyzer = _analyzer(QuietDetector(on={900: [2]}))
 
     result = analyzer.analyze(_frame(), index=900)
 
-    assert list(result.evidence) == [2]
+    assert sorted(result.evidence) == [1, 2]
 
 
 def test_two_rules_convicting_one_vehicle_share_the_one_history():
@@ -652,7 +656,9 @@ def test_two_rules_convicting_one_vehicle_share_the_one_history():
     result = _analyzer(TwoRules()).analyze(_frame(), index=900)
 
     assert len(result.violations) == 2
-    assert list(result.evidence) == [1]
+    # One entry per track, not per violation — two rules convicting track 1 do not put
+    # two copies of its history in here.
+    assert sorted(result.evidence) == [1, 2]
 
 
 def test_the_record_keeps_boxes_and_positions_but_never_the_frame():

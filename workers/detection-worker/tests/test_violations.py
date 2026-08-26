@@ -222,6 +222,11 @@ def _job(fps: float | None = 30.0) -> DetectionJob:
     )
 
 
+def _scene(*windows: TrackWindow) -> dict[int, TrackWindow]:
+    """What the analyzer hands over: every track the buffer held, keyed by id."""
+    return {window.track_id: window for window in windows}
+
+
 def _window(track_id: int = 7) -> TrackWindow:
     return TrackWindow(
         track_id=track_id,
@@ -261,7 +266,7 @@ def test_a_violation_becomes_a_row_that_can_find_its_own_footage():
     created = to_create(
         _job(),
         Violation(type="red_light_running", track_id=7, frame_index=900),
-        _window(),
+        _scene(_window()),
         _context(),
     )
 
@@ -278,7 +283,7 @@ def test_the_row_pins_what_the_violation_was_judged_against():
     created = to_create(
         _job(),
         Violation(type="red_light_running", track_id=7, frame_index=900),
-        _window(),
+        _scene(_window()),
         _context(calibration_id="cal-1", configuration_id="cfg-1"),
     )
 
@@ -291,7 +296,7 @@ def test_a_job_with_no_documents_pins_nothing_rather_than_guessing():
     created = to_create(
         _job(),
         Violation(type="red_light_running", track_id=7, frame_index=900),
-        _window(),
+        _scene(_window()),
         _context(),
     )
 
@@ -305,7 +310,7 @@ def test_the_row_carries_the_violation_s_own_frame_not_the_loop_s():
     created = to_create(
         _job(),
         Violation(type="red_light_running", track_id=7, frame_index=870),
-        _window(),
+        _scene(_window()),
         _context(),
     )
 
@@ -314,7 +319,7 @@ def test_the_row_carries_the_violation_s_own_frame_not_the_loop_s():
 
 def test_the_violator_is_summarised_as_a_vehicle():
     created = to_create(
-        _job(), Violation(type="red_light_running", track_id=7, frame_index=900), _window(), _context()
+        _job(), Violation(type="red_light_running", track_id=7, frame_index=900), _scene(_window()), _context()
     )
 
     assert [v.track_id for v in created.metadata.vehicles] == [7]
@@ -324,29 +329,106 @@ def test_a_violation_with_no_window_still_becomes_a_row():
     # What the rules were holding at the end of a job. A violation with no history is
     # still a violation.
     created = to_create(
-        _job(), Violation(type="red_light_running", track_id=7, frame_index=900), None, _context()
+        _job(), Violation(type="red_light_running", track_id=7, frame_index=900), {}, _context()
     )
 
     assert created.metadata.vehicles == []
 
 
-def test_the_counterparty_is_not_recorded_yet():
-    """The pedestrian rule's whole subject is somebody the module does not name in what
-    it returns, so `pedestrians` stays empty. Filling it in is the next change."""
+def _pedestrian(track_id: int = 12) -> TrackWindow:
+    return TrackWindow(
+        track_id=track_id,
+        frame_indices=(898, 899, 900),
+        positions=(None, None, None),
+        speeds=(None, None, None),
+        bboxes=((5, 5, 9, 15), (6, 5, 10, 15), (7, 5, 11, 15)),
+        class_names=("person", "person", "person"),
+        timestamps=(None, None, None),
+    )
+
+
+def test_the_counterparty_is_recorded_beside_the_vehicle():
+    """The pedestrian rule's whole subject is somebody the module never names in what
+    it returns. Their window is also the one thing that could not be recovered from the
+    footage later without knowing which track to look for."""
     created = to_create(
         _job(),
         Violation(type="pedestrian_right_of_way", track_id=7, frame_index=900),
-        _window(),
+        _scene(_window(), _pedestrian()),
+        _context(),
+    )
+
+    assert [p.track_id for p in created.metadata.pedestrians] == [12]
+    assert [v.track_id for v in created.metadata.vehicles] == [7]
+
+
+def test_the_convicted_track_stays_identifiable_in_a_crowd():
+    # The whole reason violator_track_id exists: `vehicles[0]` used to be the answer
+    # because there was never more than one, and now there is.
+    created = to_create(
+        _job(),
+        Violation(type="red_light_running", track_id=7, frame_index=900),
+        _scene(_window(track_id=3), _window(), _window(track_id=9)),
+        _context(),
+    )
+
+    assert created.metadata.violator_track_id == 7
+    assert [v.track_id for v in created.metadata.vehicles] == [3, 7, 9]
+
+
+def test_a_bystander_is_recorded_without_being_accused():
+    """Who else was there is what a violation gets reviewed against. Which of them was
+    in the crossing is a question about polygons, answered by whoever holds them."""
+    created = to_create(
+        _job(),
+        Violation(type="red_light_running", track_id=7, frame_index=900),
+        _scene(_window(), _window(track_id=9)),
+        _context(),
+    )
+
+    assert [v.track_id for v in created.metadata.vehicles] == [7, 9]
+    assert created.metadata.violator_track_id == 7
+
+
+def test_an_empty_crossing_records_no_pedestrians():
+    # Empty stays the ordinary answer; it just is not the only one any more.
+    created = to_create(
+        _job(),
+        Violation(type="red_light_running", track_id=7, frame_index=900),
+        _scene(_window()),
         _context(),
     )
 
     assert created.metadata.pedestrians == []
 
 
+def test_a_class_no_rule_has_a_word_for_is_kept_rather_than_dropped():
+    # Wrong bucket, kept record. Dropping it would contradict recording the scene.
+    created = to_create(
+        _job(),
+        Violation(type="red_light_running", track_id=7, frame_index=900),
+        _scene(
+            _window(),
+            TrackWindow(
+                track_id=21,
+                frame_indices=(900,),
+                positions=(None,),
+                speeds=(None,),
+                bboxes=((0, 0, 4, 8),),
+                class_names=("traffic light",),
+                timestamps=(None,),
+            ),
+        ),
+        _context(),
+    )
+
+    assert [v.track_id for v in created.metadata.vehicles] == [7, 21]
+
+
 def test_a_row_assembled_this_way_is_writable(con):
     """The two halves meet: what to_create builds is what record takes."""
     created = to_create(
-        _job(), Violation(type="red_light_running", track_id=7, frame_index=900), _window(), _context()
+        _job(), Violation(type="red_light_running", track_id=7, frame_index=900), _scene(_window()), _context()
     )
 
     violation_id = record(con, created)
@@ -382,14 +464,16 @@ def test_a_row_for_an_uncalibrated_job_survives_the_round_trip(con):
     created = to_create(
         _job(),
         Violation(type="red_light_running", track_id=7, frame_index=900),
-        TrackWindow(
-            track_id=7,
-            frame_indices=(900,),
-            positions=(None,),
-            speeds=(None,),
-            bboxes=((0, 0, 10, 10),),
-            class_names=("car",),
-            timestamps=(None,),
+        _scene(
+            TrackWindow(
+                track_id=7,
+                frame_indices=(900,),
+                positions=(None,),
+                speeds=(None,),
+                bboxes=((0, 0, 10, 10),),
+                class_names=("car",),
+                timestamps=(None,),
+            )
         ),
         _context(),
     )

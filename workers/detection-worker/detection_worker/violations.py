@@ -16,7 +16,7 @@ from shared.models.violation import (
     ViolationCreate,
     ViolationMetadata,
 )
-from violation_detector import Violation
+from violation_detector import PEDESTRIANS, Violation
 
 from detection_worker import context
 
@@ -55,10 +55,38 @@ def detected_at(anchor: datetime, frame_index: int, fps: float | None) -> dateti
     return anchor + timedelta(seconds=frame_index / fps)
 
 
+def scene(
+    windows: dict[int, TrackWindow], violator_track_id: int | None = None
+) -> ViolationMetadata:
+    """Every track the buffer held, split by what the detector called each one.
+
+    THE SPLIT IS BY CLASS, NOT BY INVOLVEMENT. `class_names` is already on the window,
+    recorded per frame and resolved by the evidence package's own most-common rule, so
+    this reads a label rather than deciding anything. Which of these was in the crossing
+    is a question about polygons; the row pins `configuration_id` so a reader can answer
+    it, and nothing here computes geometry to guess.
+
+    Anything the rules have no vocabulary for — a tracked traffic light, a class the
+    model had no name for — lands in `vehicles`. Wrong bucket, kept record: dropping it
+    would contradict recording the scene, and no rule that ships can produce one.
+
+    Ordered by track id, because `window_for` already answers that way and a blob that
+    came out differently on two identical runs would be a difference nobody meant.
+    """
+    vehicles, pedestrians = [], []
+    for track_id in sorted(windows):
+        window = windows[track_id]
+        bucket = pedestrians if window.class_name in PEDESTRIANS else vehicles
+        bucket.append(summary(window))
+    return ViolationMetadata(
+        vehicles=vehicles, pedestrians=pedestrians, violator_track_id=violator_track_id
+    )
+
+
 def to_create(
     job: DetectionJob,
     violation: Violation,
-    window: TrackWindow | None,
+    windows: dict[int, TrackWindow],
     job_context: context.JobContext,
 ) -> ViolationCreate:
     """A firing rule and its record, as the row that gets written.
@@ -74,10 +102,11 @@ def to_create(
     to `detected_at` (footage time rather than upload time) lands inside `context` with
     no signature to change out here.
 
-    ONLY THE VIOLATOR IS SUMMARISED. Both rules that ship report against a vehicle, so
-    `vehicles` holds its window and `pedestrians` stays empty — even for the pedestrian
-    rule, whose whole subject is somebody the module does not name in what it returns.
-    Filling that in is the next change, and does not belong in this one.
+    THE WHOLE SCENE IS SUMMARISED, and `violator_track_id` is what keeps the accusation
+    legible inside it. `pedestrians` is filled for the first time here — for the
+    pedestrian rule, whose whole subject the module never names in what it returns, and
+    for the red-light rule too whenever somebody happened to be there. Empty stays the
+    ordinary answer on an empty crossing.
 
     `frames` stays empty by design: the pixels come back from the source on demand.
     """
@@ -91,7 +120,7 @@ def to_create(
         detected_at=detected_at(
             job_context.source_created_at, violation.frame_index, job.source.fps
         ),
-        metadata=ViolationMetadata(vehicles=[summary(window)] if window else []),
+        metadata=scene(windows, violator_track_id=violation.track_id),
     )
 
 
