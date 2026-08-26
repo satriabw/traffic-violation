@@ -14,10 +14,12 @@ from shared.models.violation import ViolationCreate
 def record(con: sqlite3.Connection, violation: ViolationCreate) -> str:
     """Write the violation and its metadata, and return the new id.
 
-    Evidence frames must already be in S3 before this is called. That ordering is the
-    LLD's and it is the right way round: an orphaned frame in object storage is
-    harmless, while a violation row pointing at frames that were never uploaded is
-    broken and stays broken.
+    No evidence frames are uploaded, here or anywhere. The row pins the source and the
+    frame index, and the source is an immutable object in storage that can be seeked
+    back into, so the pixels are re-derived when somebody opens the detail view — by
+    whatever knows how to draw them then, rather than by this process guessing now.
+    `ViolationMetadata.frames` stays empty, and the ordering problem the LLD worried
+    about (a row pointing at frames nobody uploaded) cannot arise.
 
     The two inserts share one transaction. Connections here are autocommit, so the
     BEGIN is explicit — without it a crash between the statements leaves a violation
@@ -30,10 +32,18 @@ def record(con: sqlite3.Connection, violation: ViolationCreate) -> str:
     try:
         con.execute(
             """
-            INSERT INTO traffic_violations (id, site_id, type, detected_at)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO traffic_violations
+                (id, site_id, source_id, frame_index, type, detected_at)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            [violation_id, violation.site_id, violation.type.value, violation.detected_at],
+            [
+                violation_id,
+                violation.site_id,
+                violation.source_id,
+                violation.frame_index,
+                violation.type.value,
+                violation.detected_at,
+            ],
         )
         con.execute(
             """
