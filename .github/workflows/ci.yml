@@ -27,7 +27,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ./shared -e ./packages/trajectory-collector \
-            -e ./packages/violation-detector \
+            -e ./packages/violation-detector -e ./packages/evidence-collector \
             -e ./services/site-service -e ./workers/detection-worker \
             -r requirements-dev.txt
 
