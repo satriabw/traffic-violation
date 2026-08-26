@@ -316,6 +316,15 @@ camera model would look completely normal. `null` means the site had neither whe
 job was created, which stays a normal state: without a calibration a job reports no
 trajectories, and without a configuration it runs no rules.
 
+Each violation records the **row** those versions resolved to, in `calibration_id` and
+`configuration_id`. Two things need it. A reader asking which of a site's violations
+still hold under the setup it runs now has nothing else to compare against; and evidence
+drawn with the *current* polygons over a violation found under older ones shows a
+vehicle sitting outside the box it was convicted in — evidence that looks falsified
+rather than merely stale. The id rather than the version, for the reason `source_id`
+gives: it is the primary key of one version's row, so it pins that version by itself,
+and a second column holding the version would be free to disagree with it.
+
 Everything that can go wrong is about the site's *state*, so it is 409 rather than 422 —
 the request is well formed, and the identical one succeeds once a video is attached:
 
