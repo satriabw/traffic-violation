@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 import supervision as sv
 from trajectory_collector import Trajectory
+from evidence_collector import TrackWindow
 from violation_detector import Violation
 from shared.models.detection import DetectionJob, FrameRange, JobSource, ViolationType
 from shared.queue.memory import InMemoryQueue
@@ -59,6 +60,8 @@ class FakeAnalyzer:
         locates: bool = False,
         violates: bool = False,
         held: int = 0,
+        window: int = 3,
+        capacity: int = 3,
     ):
         self.job = job
         self.job_context = job_context
@@ -68,6 +71,15 @@ class FakeAnalyzer:
         self._locates = locates
         self._violates = violates
         self._held = held
+        # How long a window this analyzer hands back, against how long a one it could.
+        # The handler's whole interest in evidence is telling those two apart.
+        self._window = window
+        self._capacity = capacity
+
+    @property
+    def evidence_capacity(self) -> int:
+        """How long a window this job could hold. A property, as the real one is."""
+        return self._capacity
 
     def finish(self) -> list[Violation]:
         """What the rules were still holding. Empty for every rule that ships today."""
@@ -90,6 +102,19 @@ class FakeAnalyzer:
             ]
             if self._violates
             else [],
+            evidence={
+                1: TrackWindow(
+                    track_id=1,
+                    frame_indices=tuple(range(index - self._window + 1, index + 1)),
+                    positions=((0.0, 0.0),) * self._window,
+                    speeds=(1.0,) * self._window,
+                    bboxes=((0.0, 0.0, 1.0, 1.0),) * self._window,
+                    class_names=("car",) * self._window,
+                    timestamps=(None,) * self._window,
+                )
+            }
+            if self._violates
+            else {},
             # Whether a job has trajectories at all depends on its calibration, which
             # the analyzer resolves — the handler only counts and logs them.
             trajectories={
@@ -117,13 +142,15 @@ def _analyzers(
     locates: bool = False,
     violates: bool = False,
     held: int = 0,
+    window: int = 3,
+    capacity: int = 3,
 ):
     """An analyzer factory that records every analyzer it was asked to build."""
     made: list[FakeAnalyzer] = []
 
     def factory(job, job_context):
         analyzer = FakeAnalyzer(
-            job, job_context, detections_per_frame, locates, violates, held
+            job, job_context, detections_per_frame, locates, violates, held, window, capacity
         )
         made.append(analyzer)
         return analyzer
@@ -408,3 +435,81 @@ def test_a_job_with_no_frames_still_drains_the_rules():
     _handler(read=_reader_of(frame_count=0), new_analyzer=analyzers)(_job("job-1"))
 
     assert analyzers.made[0].finished == 1
+
+
+# --- the record that comes with a violation ----------------------------------
+
+
+def test_every_violation_that_carried_a_window_is_counted(caplog):
+    with caplog.at_level("INFO"):
+        _handler(
+            read=_reader_of(frame_count=3),
+            new_analyzer=_analyzers(detections_per_frame=2, violates=True),
+        )(_job("job-1"))
+
+    assert "evidence=3" in caplog.text
+
+
+def test_a_job_where_nothing_fired_carried_no_records(caplog):
+    with caplog.at_level("INFO"):
+        _handler(
+            read=_reader_of(frame_count=3), new_analyzer=_analyzers(detections_per_frame=2)
+        )(_job("job-1"))
+
+    assert "evidence=0" in caplog.text
+    assert "short=0" in caplog.text
+
+
+def test_a_full_window_is_not_counted_as_a_short_one(caplog):
+    with caplog.at_level("INFO"):
+        _handler(
+            read=_reader_of(frame_count=2),
+            new_analyzer=_analyzers(detections_per_frame=1, violates=True, window=3, capacity=3),
+        )(_job("job-1"))
+
+    assert "evidence=2" in caplog.text
+    assert "short=0" in caplog.text
+
+
+def test_a_window_cut_short_is_counted_separately(caplog):
+    # The one that matters. A handful is ordinary — objects that had only just
+    # appeared. Most of them, on a job that is not the first chunk of its video, means
+    # the window is longer than the overlap between chunks and every record is missing
+    # its approach.
+    with caplog.at_level("INFO"):
+        _handler(
+            read=_reader_of(frame_count=2),
+            new_analyzer=_analyzers(detections_per_frame=1, violates=True, window=2, capacity=151),
+        )(_job("job-1"))
+
+    assert "evidence=2" in caplog.text
+    assert "short=2" in caplog.text
+
+
+def test_the_capacity_is_read_once_per_job_not_once_per_frame():
+    # It is a property of the job. Asking per frame would be the same answer every
+    # time, on every frame of a multi-minute chunk.
+    class CountingAnalyzer(FakeAnalyzer):
+        reads = 0
+
+        @property
+        def evidence_capacity(self):
+            type(self).reads += 1
+            return self._capacity
+
+    def factory(job, job_context):
+        return CountingAnalyzer(job, job_context, detections_per_frame=1, violates=True)
+
+    _handler(read=_reader_of(frame_count=5), new_analyzer=factory)(_job("job-1"))
+
+    assert CountingAnalyzer.reads == 1
+
+
+def test_violations_held_back_until_the_end_do_not_invent_a_record(caplog):
+    # They report on a frame the ring has already rolled past, so any window handed to
+    # them would describe the end of the job rather than the moment convicted.
+    with caplog.at_level("INFO"):
+        _handler(read=_reader_of(frame_count=2), new_analyzer=_analyzers(held=2))(_job("job-1"))
+
+    assert "violations=2" in caplog.text
+    assert "evidence=0" in caplog.text

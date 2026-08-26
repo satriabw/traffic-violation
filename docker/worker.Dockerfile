@@ -24,12 +24,14 @@ WORKDIR /repo
 COPY shared/ shared/
 COPY packages/trajectory-collector/ packages/trajectory-collector/
 COPY packages/violation-detector/ packages/violation-detector/
+COPY packages/evidence-collector/ packages/evidence-collector/
 COPY workers/detection-worker/ workers/detection-worker/
 
 # One invocation, so `shared` and `trajectory-collector` resolve from the local
 # directories rather than being looked for on PyPI.
 RUN pip install --no-cache-dir \
         ./shared ./packages/trajectory-collector ./packages/violation-detector \
+        ./packages/evidence-collector \
         ./workers/detection-worker
 
 # Fail the build rather than the first job. An image whose cv2 cannot load its shared
@@ -76,10 +78,12 @@ WORKDIR /repo
 COPY shared/ shared/
 COPY packages/trajectory-collector/ packages/trajectory-collector/
 COPY packages/violation-detector/ packages/violation-detector/
+COPY packages/evidence-collector/ packages/evidence-collector/
 COPY workers/detection-worker/ workers/detection-worker/
 
 RUN pip install --no-cache-dir \
         ./shared ./packages/trajectory-collector ./packages/violation-detector \
+        ./packages/evidence-collector \
         ./workers/detection-worker
 
 # onnxruntime-gpu replaces onnxruntime rather than joining it. Both distributions

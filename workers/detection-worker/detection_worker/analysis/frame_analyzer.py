@@ -18,7 +18,8 @@ from typing import Callable, Iterable
 
 import numpy as np
 import supervision as sv
-from trajectory_collector import NullCollector, TrajectoryCollector
+from evidence_collector import EvidenceCollector, ObjectState, TrackWindow
+from trajectory_collector import NullCollector, Trajectory, TrajectoryCollector
 from violation_detector import (
     Configuration,
     Detector,
@@ -27,6 +28,11 @@ from violation_detector import (
     get_detector,
 )
 
+# How much lead-up an analyzer built by hand keeps. A caller that resolved a site's
+# context has a number from it and passes that instead; this is only what a bare
+# constructor falls back to. Imported rather than restated, so there is one default,
+# in the module that reads the document it comes from.
+from detection_worker.context import DEFAULT_EVIDENCE_SECONDS
 from detection_worker.analysis.frame_result import FrameResult
 from detection_worker.detection.model import DetectionModel
 from detection_worker.detection.tracker import Tracker, make_tracker, resolve_fps
@@ -34,6 +40,7 @@ from detection_worker.detection.tracker import Tracker, make_tracker, resolve_fp
 # Where the detector puts the name it gave each box. See detection.model — an id
 # outside its class map still yields a detection, named by its number.
 CLASS_NAME = "class_name"
+
 
 
 def _tracked(detections: sv.Detections) -> tuple[np.ndarray, np.ndarray]:
@@ -94,6 +101,37 @@ def _tracked_objects(detections: sv.Detections) -> list[TrackedObject]:
     ]
 
 
+def _object_states(
+    tracked_objects: Iterable[TrackedObject],
+    trajectories: dict[int, Trajectory],
+) -> list[ObjectState]:
+    """A frame's tracked objects and their trajectories, joined for the record.
+
+    The third adapter, and the last of the boundary. Where `_tracked` and
+    `_tracked_objects` take one library's type apart for one package, this one puts two
+    packages' answers back together — the box a rule reasoned about and the ground
+    position a collector measured, which are separate exactly because neither package
+    knows about the other.
+
+    A track with no trajectory keeps None for both position and speed rather than being
+    dropped. Its box is still evidence: an object above the horizon, or one in its
+    filter's first frames, was visibly there and the record should say so. Deciding
+    what to do with a missing position is the evidence package's job, and it decides it
+    per window rather than per frame.
+    """
+    return [
+        ObjectState(
+            track_id=tracked.track_id,
+            bbox=tracked.bbox,
+            class_name=tracked.class_name,
+            position=trajectory.position if trajectory else None,
+            speed=trajectory.speed if trajectory else None,
+        )
+        for tracked in tracked_objects
+        for trajectory in [trajectories.get(tracked.track_id)]
+    ]
+
+
 class FrameAnalyzer:
     """Detect, track, locate. The rule engine belongs after the last of those."""
 
@@ -103,6 +141,7 @@ class FrameAnalyzer:
         tracker: Tracker,
         trajectory_collector: TrajectoryCollector = NullCollector(),
         detector: Detector = Detector(),
+        evidence: EvidenceCollector | None = None,
     ):
         self._model = model
         self._tracker = tracker
@@ -120,6 +159,24 @@ class FrameAnalyzer:
         # no rules and therefore no state; a detector built from a document is not
         # shareable, and `make_analyzer` builds one per job.
         self._detector = detector
+        # None, and built here — the one collaborator that does not follow the
+        # "always, never None" rule above it. That rule works for the other two because
+        # their defaults hold no state and can therefore be shared by every analyzer
+        # that takes one; an evidence collector is a ring of the last few seconds, so a
+        # shared default would splice one job's footage into the next one's records.
+        # Defaulted at all rather than required so a test building an analyzer by hand
+        # does not have to know how long the window is.
+        #
+        # `is None`, NOT `or`. An evidence collector defines `__len__`, so one that has
+        # not recorded anything yet — which is every one of them at this point — is
+        # falsy, and `or` would throw away the collector it was handed and build a
+        # default in its place. Silently: the job would run, record everything, and
+        # report windows of the wrong length in the wrong coordinates.
+        self._evidence = (
+            EvidenceCollector.over(seconds=DEFAULT_EVIDENCE_SECONDS, fps=resolve_fps(None))
+            if evidence is None
+            else evidence
+        )
 
     def analyze(self, frame: np.ndarray, index: int) -> FrameResult:
         detections = self._model.predict(frame)
@@ -127,22 +184,63 @@ class FrameAnalyzer:
         # skipping one ages every lost track wrongly.
         tracked = self._tracker.update(detections)
 
+        # Built once and used twice: the rules reason about these, and the record keeps
+        # them. Building them a second time for the record would be the same work done
+        # again to produce the same answer.
+        tracked_objects = _tracked_objects(tracked)
+
         boxes, track_ids = _tracked(tracked)
         # The absolute index, not a running count of calls. The collector measures how
         # long a track was missing for, and a job covering frames 900-1800 would
         # otherwise have every gap measured against a counter starting at zero.
         trajectories = self._trajectory_collector.collect(boxes, track_ids, index)
 
+        # EVERY FRAME, and before the rules run. A window is a duration, so a frame
+        # with nothing on it is as much a part of the record as one with a car in it —
+        # four seconds of an empty crossing is why the fifth matters. Before, because
+        # the frame a rule fires on has to be in the window it reads: the violation is
+        # the end of the story, not something that happened after it.
+        self._evidence.observe(index, _object_states(tracked_objects, trajectories))
+
         # After tracking, never before: every rule in the package is about what an
         # object did over time, and an untracked box has no history to have done it in.
-        violations = self._detector.detect(frame, _tracked_objects(tracked), index)
+        violations = self._detector.detect(frame, tracked_objects, index)
 
         return FrameResult(
             index=index,
             detections=tracked,
             trajectories=trajectories,
             violations=violations,
+            evidence=self._evidence_for(violations),
         )
+
+    def _evidence_for(self, violations: list[Violation]) -> dict[int, TrackWindow]:
+        """The lead-up to whatever just fired, keyed by the track it fired on.
+
+        Nothing at all on the overwhelming majority of frames, where nothing fires —
+        and reading a window costs nothing on those, because there is nothing to ask
+        for.
+
+        Keyed by track id rather than aligned with `violations`, so two rules
+        convicting one vehicle on one frame share the one history they both describe
+        rather than carrying a copy each.
+        """
+        if not violations:
+            return {}
+        return {
+            window.track_id: window
+            for window in self._evidence.window_for({v.track_id for v in violations})
+        }
+
+    @property
+    def evidence_capacity(self) -> int:
+        """How many frames of lead-up this job's record can hold at most.
+
+        Exposed so the handler can tell a window that is short because the track was
+        only just seen from one that is short because the chunk started too late. The
+        difference does not show in the window itself.
+        """
+        return self._evidence.capacity
 
     def finish(self) -> list[Violation]:
         """Whatever the rules were still holding when the frames ran out.
@@ -155,6 +253,14 @@ class FrameAnalyzer:
         The violations it returns carry their own `frame_index`, which for a buffering
         module is earlier than the last frame analysed. Recording the loop's index
         instead would misdate them by the length of the window.
+
+        NO EVIDENCE COMES BACK WITH THESE, and it is the same buffering that is the
+        reason. A module flushing a partial clip reports on a frame the ring has
+        already rolled past, so the window it would be handed describes the end of the
+        job rather than the moment convicted — worse than none, because it would look
+        right. Empty today, since every rule that ships decides on the frame it is
+        given. The fix when a clip module lands is for it to say how far back it
+        reasons, and to size the ring to cover it.
         """
         return self._detector.finish()
 
@@ -168,6 +274,7 @@ def make_analyzer(
     new_tracker: Callable[[float | None], Tracker] = make_tracker,
     new_collector: Callable[..., TrajectoryCollector] = TrajectoryCollector.from_calibration,
     new_detector: Callable[..., Detector] = get_detector,
+    seconds: float = DEFAULT_EVIDENCE_SECONDS,
 ) -> FrameAnalyzer:
     """An analyzer for one job.
 
@@ -193,6 +300,19 @@ def make_analyzer(
     positions from a broken camera model.
     """
     resolved = resolve_fps(fps)
+    # A third thing that scales by the frame rate, and the reason `resolve_fps` is one
+    # definition: a job whose tracker aged lost tracks at 30 while its evidence ring
+    # held five seconds of something else would disagree with itself about how much
+    # time a frame is worth.
+    #
+    # It is told nothing about the calibration, and needs to be told nothing. A job
+    # without one produces no trajectories, so the record simply has no positions in
+    # it — the same absence, arrived at without anyone having to decide anything.
+    #
+    # `seconds` arrives as a number. Which number is the site's decision, taken where
+    # its configuration document was resolved — nothing here is handed the document to
+    # go looking in.
+    evidence = EvidenceCollector.over(seconds=seconds, fps=resolved)
     collector = (
         NullCollector()
         if calibration is None
@@ -205,4 +325,4 @@ def make_analyzer(
             Configuration.from_document(configuration), types=types, fps=resolved
         )
     )
-    return FrameAnalyzer(model, new_tracker(resolved), collector, detector)
+    return FrameAnalyzer(model, new_tracker(resolved), collector, detector, evidence)

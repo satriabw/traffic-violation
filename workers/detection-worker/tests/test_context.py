@@ -3,7 +3,15 @@ from shared.db.connection import get_connection
 from shared.db.init import init_db
 from shared.models.detection import DetectionJob, FrameRange, JobSource, ViolationType
 
-from detection_worker.context import CALIBRATIONS, ContextMissing, JobContext, load
+from violation_detector import ConfigurationInvalid
+
+from detection_worker.context import (
+    CALIBRATIONS,
+    DEFAULT_EVIDENCE_SECONDS,
+    ContextMissing,
+    JobContext,
+    load,
+)
 
 
 @pytest.fixture
@@ -146,3 +154,53 @@ def test_one_site_cannot_resolve_another_sites_calibration(con):
 
     with pytest.raises(ContextMissing):
         load(con, _job(calibration_version=1), **_fetchers({}))
+
+
+# --- how much lead-up the site asks for -------------------------------------
+
+
+def _with_configuration(con, document: dict):
+    """A site whose configuration document is exactly this."""
+    _file(con, "f-cfg", "configuration/f-cfg/c.json", "configuration")
+    _doc(con, "configurations", "cfg-1", "f-cfg", 1)
+    return load(
+        con,
+        _job(configuration_version=1),
+        fetch_json=_fetcher({"configuration/f-cfg/c.json": document}),
+    )
+
+
+def _document(**overrides) -> dict:
+    return {"version": 1, "violations": ["rlr_violation"], "regions": {}, **overrides}
+
+
+def test_a_site_with_no_configuration_gets_the_default_window(con):
+    assert load(con, _job()).evidence_seconds == DEFAULT_EVIDENCE_SECONDS
+
+
+def test_a_site_whose_document_says_nothing_gets_the_default_window(con):
+    assert _with_configuration(con, _document()).evidence_seconds == DEFAULT_EVIDENCE_SECONDS
+
+
+def test_a_site_can_ask_for_a_longer_lead_up(con):
+    # A junction is the thing that knows better. An approach with a long sight line
+    # wants more; a tight one-way needs less.
+    assert _with_configuration(con, _document(evidence_seconds=12)).evidence_seconds == 12.0
+
+
+def test_a_window_written_as_a_string_is_read_as_a_number(con):
+    assert _with_configuration(con, _document(evidence_seconds="7.5")).evidence_seconds == 7.5
+
+
+@pytest.mark.parametrize("declared", [0, -1, "0"])
+def test_a_window_that_is_not_positive_stops_the_job(con, declared):
+    # While the context resolves, before a frame is decoded. A site whose records were
+    # silently empty would look exactly like a junction where nothing ever happened.
+    with pytest.raises(ConfigurationInvalid, match="evidence_seconds must be positive"):
+        _with_configuration(con, _document(evidence_seconds=declared))
+
+
+@pytest.mark.parametrize("declared", ["five", None, [5]])
+def test_a_window_that_is_not_a_number_stops_the_job(con, declared):
+    with pytest.raises(ConfigurationInvalid, match="evidence_seconds must be a number"):
+        _with_configuration(con, _document(evidence_seconds=declared))

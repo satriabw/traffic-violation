@@ -4,15 +4,17 @@ A record rather than a tuple because it grew: detections, then trajectories, now
 the rules decided. Every one of those is a field here rather than another return value
 the handler has to keep in the right order.
 
-The frame itself is deliberately not a field. Nothing downstream of the analyzer needs
-the pixels yet — evidence frames are cropped where a rule fires, inside the analyzer,
-not by whoever reads this — and holding a reference to every decoded frame is how a
-long chunk turns into a memory problem.
+The frame itself is deliberately not a field, and now never will be. Evidence is a
+record — where each object was and how fast it was going, against the index that finds
+the moment in the footage again — so the pixels are re-derived from the source when
+somebody asks rather than carried around by whatever was running at the time. Holding a
+reference to every decoded frame is also how a long chunk turns into a memory problem.
 """
 
 from dataclasses import dataclass, field
 
 import supervision as sv
+from evidence_collector import TrackWindow
 from trajectory_collector import Trajectory
 from violation_detector import Violation
 
@@ -41,6 +43,15 @@ class FrameResult:
     # reports on the frame it was given, but a module working on a clip reports several
     # frames late. Record the violation's, never the result's.
     violations: list[Violation] = field(default_factory=list)
+    # The few seconds leading up to each violation on this frame, keyed by the track it
+    # was reported against. Empty on every frame where nothing fired, which is almost
+    # all of them.
+    #
+    # A window is not the same length as the ring that produced it. A track seen for
+    # half a second has half a second of history, and a violation early in a chunk has
+    # only as much lead-up as the chunk has frames — which is why the handler counts
+    # the short ones rather than assuming they are all full.
+    evidence: dict[int, TrackWindow] = field(default_factory=dict)
 
     @property
     def track_ids(self) -> list[int]:
