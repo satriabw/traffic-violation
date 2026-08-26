@@ -78,6 +78,18 @@ class ViolationCreate(BaseModel):
     # where the guarantee lives instead.
     source_id: str
     frame_index: int
+    # What this was judged against, pinned the same way the source is. The job message
+    # already carries both, resolved while "active" still meant what the caller asked
+    # for, so the worker has them without a lookup of its own.
+    #
+    # OPTIONAL HERE, where source_id and frame_index are required, and the difference is
+    # real rather than an oversight. Every job has a source; not every job has a
+    # calibration, because a site with a video and no camera model is an ordinary site
+    # and detection runs anyway. None says the site had none — it is the same absence
+    # DetectionJob.calibration_version already carries, and there is no guarantee to
+    # make here that would be true.
+    calibration_id: str | None = None
+    configuration_id: str | None = None
     type: ViolationType
     detected_at: datetime
     metadata: ViolationMetadata = Field(default_factory=ViolationMetadata)
@@ -92,6 +104,14 @@ class ViolationResponse(BaseModel):
     # otherwise would send someone looking for a video nothing named.
     source_id: str | None = None
     frame_index: int | None = None
+    # Carried out too, because the reader is the one that needs them: filtering a site's
+    # violations down to the setup it runs under now is a comparison against these, and
+    # drawing the evidence means resolving the polygons this was actually judged with
+    # rather than whatever is current. None either because the site had none, or because
+    # the violation predates the columns — the two are indistinguishable here, which is
+    # why a filter has to say which it means.
+    calibration_id: str | None = None
+    configuration_id: str | None = None
     type: ViolationType
     status: ViolationStatus
     detected_at: datetime

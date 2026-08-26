@@ -126,6 +126,26 @@ CREATE TABLE IF NOT EXISTS traffic_violations (
     -- because variable-rate footage makes a time offset ambiguous — the same reason
     -- FrameRange is in frames and SourceMetadata keeps fps and nominal_fps apart.
     frame_index INTEGER,
+    -- WHICH CAMERA MODEL AND WHICH ANNOTATION THIS WAS JUDGED AGAINST. The job message
+    -- pins both, so the run is reproducible; without them on the row the record is not.
+    -- Two things need them. A reader asking "which violations hold under the setup this
+    -- site has now" cannot tell, because nothing says what any of them was judged under.
+    -- And evidence drawn with the *current* polygons over a violation found under older
+    -- ones shows a vehicle sitting outside the box it was convicted in — evidence that
+    -- looks falsified rather than merely stale.
+    --
+    -- Ids, not version numbers, for the reason source_id gives above: each is the
+    -- primary key of one version's row, so it pins that version on its own, and a
+    -- separate version column would be a second copy of the same fact free to disagree
+    -- with it.
+    --
+    -- NULLABLE, and here that is not the concession source_id makes. A site with a
+    -- video and no calibration is an ordinary site today — DetectionJob already carries
+    -- calibration_version as int | None, and detection runs without one. So NULL means
+    -- "there was none", a live state rather than a row predating the column, and a
+    -- reader filtering on these has to decide what it wants that to mean.
+    calibration_id VARCHAR REFERENCES camera_calibrations(id),
+    configuration_id VARCHAR REFERENCES configurations(id),
     type VARCHAR NOT NULL CHECK (
         type IN ('red_light_running', 'pedestrian_right_of_way')
     ),
@@ -183,6 +203,8 @@ CREATE TABLE IF NOT EXISTS violation_metadata (
 ADDED_COLUMNS = (
     ("traffic_violations", "source_id", "VARCHAR REFERENCES site_sources(id)"),
     ("traffic_violations", "frame_index", "INTEGER"),
+    ("traffic_violations", "calibration_id", "VARCHAR REFERENCES camera_calibrations(id)"),
+    ("traffic_violations", "configuration_id", "VARCHAR REFERENCES configurations(id)"),
 )
 
 
