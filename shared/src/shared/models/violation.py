@@ -65,6 +65,10 @@ class ViolationCreate(BaseModel):
     # are what lets evidence be re-derived on demand instead of uploaded here — see the
     # DDL. The worker has both already: the job message carries the source it was
     # created against, and a Violation carries its own frame index.
+    #
+    # REQUIRED HERE, though the columns are nullable. The columns had to give way to
+    # rows that predate them; nothing being written now has that excuse, and this is
+    # where the guarantee lives instead.
     source_id: str
     frame_index: int
     type: ViolationType
@@ -76,9 +80,11 @@ class ViolationResponse(BaseModel):
     id: str
     site_id: str
     # Carried on the way out too: whoever renders the detail view is the one that has
-    # to fetch the video and seek to the moment.
-    source_id: str
-    frame_index: int
+    # to fetch the video and seek to the moment. None on a violation recorded before
+    # these existed — its evidence cannot be re-derived, and a reader that pretended
+    # otherwise would send someone looking for a video nothing named.
+    source_id: str | None = None
+    frame_index: int | None = None
     type: ViolationType
     status: ViolationStatus
     detected_at: datetime

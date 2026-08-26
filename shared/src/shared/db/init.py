@@ -114,11 +114,18 @@ CREATE TABLE IF NOT EXISTS traffic_violations (
     -- Restricting, like sites(id) above and for the same reason: a source is
     -- configuration, a violation is a record of something that happened, and deleting
     -- the first should not silently destroy the second.
-    source_id VARCHAR NOT NULL REFERENCES site_sources(id),
+    --
+    -- NULLABLE, and that is a deliberate concession rather than a looser rule. These
+    -- arrived after rows already existed, and NOT NULL cannot be added to a table with
+    -- rows in it without either a default nobody means or throwing the rows away. A
+    -- violation recorded before this existed genuinely does not know which source it
+    -- came from, and NULL says exactly that. Everything written from now on has both,
+    -- because ViolationCreate requires them — the guarantee lives there instead.
+    source_id VARCHAR REFERENCES site_sources(id),
     -- Absolute, in the source's own frames. Frames rather than an offset in seconds
     -- because variable-rate footage makes a time offset ambiguous — the same reason
     -- FrameRange is in frames and SourceMetadata keeps fps and nominal_fps apart.
-    frame_index INTEGER NOT NULL,
+    frame_index INTEGER,
     type VARCHAR NOT NULL CHECK (
         type IN ('red_light_running', 'pedestrian_right_of_way')
     ),
@@ -162,6 +169,37 @@ CREATE TABLE IF NOT EXISTS violation_metadata (
 """
 
 
+# Columns that arrived after the tables did. CREATE TABLE IF NOT EXISTS does nothing
+# to a table that already exists, so a database created before one of these was written
+# would never grow it — and the alternative, recreating the table, throws away the rows
+# it was holding.
+#
+# ADD COLUMN is the whole mechanism, and it is enough because it is the only kind of
+# change made here: existing rows keep everything they had and get NULL for the new
+# column. That is why these are nullable and why none of them has a default. A change
+# that needed more than this — narrowing a column, adding NOT NULL to one with rows
+# under it — would need a real migration tool, and is worth avoiding for exactly that
+# reason.
+ADDED_COLUMNS = (
+    ("traffic_violations", "source_id", "VARCHAR REFERENCES site_sources(id)"),
+    ("traffic_violations", "frame_index", "INTEGER"),
+)
+
+
+def _add_missing_columns(con: sqlite3.Connection) -> None:
+    """Bring an existing database up to the schema above, without touching its rows.
+
+    Idempotent, and cheap: PRAGMA table_info on a handful of tables, then nothing on
+    every run after the first. A foreign key added this way is enforced on new rows and
+    not applied retroactively to old ones, which is the behaviour wanted — the old rows
+    reference nothing.
+    """
+    for table, column, ddl in ADDED_COLUMNS:
+        present = {row[1] for row in con.execute(f"PRAGMA table_info({table})")}
+        if column not in present:
+            con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+
 def init_db(con: sqlite3.Connection) -> None:
     # files first — every other table references it.
     con.execute(FILES_TABLE)
@@ -172,3 +210,6 @@ def init_db(con: sqlite3.Connection) -> None:
     con.execute(TRAFFIC_VIOLATIONS_TABLE)
     con.execute(TRAFFIC_VIOLATIONS_INDEX)
     con.execute(VIOLATION_METADATA_TABLE)
+    # After every CREATE, so a fresh database has the tables to inspect and finds
+    # nothing missing. An existing one picks up whatever it was built before.
+    _add_missing_columns(con)

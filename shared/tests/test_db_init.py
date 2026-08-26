@@ -330,26 +330,49 @@ def test_traffic_violations_rejects_an_unknown_type():
         con.execute(VIOLATION, ["v1", "jaywalking_backwards"])
 
 
-def test_traffic_violations_must_say_which_video_it_came_from():
-    # Evidence frames are not stored — they are re-derived from the source on demand —
-    # so a row with no source is a detection nobody can ever review.
+def test_a_violation_recorded_before_the_source_columns_existed_keeps_its_row():
+    # They are nullable because they arrived after rows did, and a row that predates
+    # them genuinely does not know which source it came from. NULL says that; throwing
+    # the row away to get a NOT NULL constraint says nothing and loses the record.
     con = _with_source()
 
-    with pytest.raises(sqlite3.IntegrityError):
-        con.execute(
-            "INSERT INTO traffic_violations (id, site_id, frame_index, type, detected_at)"
-            " VALUES ('v1', 's1', 912, 'red_light_running', '2026-08-21 10:00:00')"
-        )
+    con.execute(
+        "INSERT INTO traffic_violations (id, site_id, type, detected_at)"
+        " VALUES ('v-old', 's1', 'red_light_running', '2026-08-21 10:00:00')"
+    )
+
+    assert con.execute(
+        "SELECT source_id, frame_index FROM traffic_violations WHERE id = 'v-old'"
+    ).fetchone() == (None, None)
 
 
-def test_traffic_violations_must_say_where_in_the_video():
-    con = _with_source()
+def test_an_existing_database_grows_the_new_columns_without_losing_its_rows():
+    # The whole point of _add_missing_columns. CREATE TABLE IF NOT EXISTS does nothing
+    # to a table that already exists, and recreating it would throw away what it held.
+    con = _fresh()
+    con.execute("INSERT INTO sites (id, name) VALUES ('s1', 'Junction 5')")
+    con.execute(
+        "INSERT INTO traffic_violations (id, site_id, type, detected_at)"
+        " VALUES ('v-old', 's1', 'red_light_running', '2026-08-21 10:00:00')"
+    )
+    con.execute("ALTER TABLE traffic_violations DROP COLUMN source_id")
+    con.execute("ALTER TABLE traffic_violations DROP COLUMN frame_index")
 
-    with pytest.raises(sqlite3.IntegrityError):
-        con.execute(
-            "INSERT INTO traffic_violations (id, site_id, source_id, type, detected_at)"
-            " VALUES ('v1', 's1', 'src1', 'red_light_running', '2026-08-21 10:00:00')"
-        )
+    init_db(con)
+
+    assert {"source_id", "frame_index"} <= _columns(con, "traffic_violations")
+    assert con.execute(
+        "SELECT COUNT(*) FROM traffic_violations WHERE id = 'v-old'"
+    ).fetchone()[0] == 1
+
+
+def test_bringing_a_database_up_to_date_twice_changes_nothing():
+    con = _fresh()
+
+    init_db(con)
+    init_db(con)
+
+    assert {"source_id", "frame_index"} <= _columns(con, "traffic_violations")
 
 
 def test_traffic_violations_rejects_a_source_that_does_not_exist():
