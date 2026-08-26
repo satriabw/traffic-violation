@@ -4,19 +4,22 @@ The last few seconds of what every tracked object was doing, kept until somethin
 makes it worth recording.
 
 ```python
-from evidence_collector import FrameBuffer, FrameEntry, ObjectState
+from evidence_collector import EvidenceCollector, ObjectState
 
-buffer = FrameBuffer.over(seconds=5, fps=30)
+collector = EvidenceCollector.over(seconds=5, fps=30)
 
 for frame_index, tracked in analysed_frames:
-    buffer.add(FrameEntry(
-        frame_index=frame_index,
-        objects=[ObjectState(track_id=7, bbox=(x1, y1, x2, y2), class_name="car")],
-    ))
+    collector.observe(frame_index, [
+        ObjectState(track_id=7, bbox=(x1, y1, x2, y2), class_name="car"),
+    ])
 
-    if something_happened:
-        window = buffer.entries()   # the lead-up, oldest first
+    for track_id in whatever_just_happened:
+        windows = collector.window_for([track_id])   # the lead-up, oldest first
 ```
+
+`observe` takes **every** frame, including the empty ones. A window is a duration, and
+a caller that recorded only the interesting frames would hand back five entries
+spanning four minutes while claiming to be five seconds of lead-up.
 
 ## Records, not pixels
 
@@ -49,12 +52,59 @@ make room and leave every window a frame short.
 them.** A window that reaches back past the start of a chunk is truncated in silence,
 and the record simply looks like a shorter one.
 
-## What it will not do
 
-**It does not know what anything is.** `class_name` is carried and never compared to
-anything. Which names are vehicles and which are pedestrians is a question about
-traffic rules, answered in one place elsewhere; a second copy in here would be a copy
-to keep in step. Hold the label, decide what it means when you read the window.
+## Frames in, tracks out
+
+The buffer records by frame, because that is how frames arrive and because expiry is a
+property of a frame rather than of a track. Anyone reading the evidence wants the
+opposite cut — what did *this* object do — and `window_for` is that pivot.
+
+A `TrackWindow` is six parallel tuples: `frame_indices`, `positions`, `speeds`,
+`bboxes`, `class_names`, `timestamps`. **Index *i* of every one describes the same
+frame**, which is what makes a position matchable to the box it was measured from. It
+is checked on construction rather than trusted, because the failure is otherwise silent
+and arrives as a box drawn around the wrong second of footage.
+
+**A track missing from a frame is absent, not padded.** Detection flickers; a car
+behind a bus for half a second is not a car that was nowhere. Padding the gap with a
+repeated position would invent evidence and padding it with a zero would invent worse,
+so the window is simply shorter and `frame_indices` says where the holes were.
+
+`window_for()` with no argument takes every track in the buffer — what you want when
+the question is "who else was there", and bounded by the window rather than by the run.
+A track nobody recorded comes back as nothing at all rather than as an empty window:
+handing one back invites a caller to write it down as evidence that the track did
+nothing.
+
+Reading does not consume. Two things firing on one frame each get their own answer.
+
+## Nothing is computed here
+
+Every number in a window is a number somebody handed in. Positions come from whoever
+projected them, boxes from whoever detected them; this package only decides which
+frames belong to which track.
+
+`positions` and `speeds` are `None` on any frame nothing projected — not a stand-in
+derived from the box. Without a camera model there is no ground plane and no honest
+position to report, which is exactly why `trajectory_collector.NullCollector` reports
+nothing at all. A reader that wants somewhere to draw has `bboxes`, which is always
+present.
+
+The frame is still part of the record either way. An object above the horizon, or one
+in its filter's first frames, was visibly there.
+
+## Classification is carried, not judged
+
+`class_name` is carried and never compared to anything. Which names are vehicles and
+which are pedestrians is a question about traffic rules, answered in one place
+elsewhere; a second copy in here would be a copy to keep in step.
+
+It is kept **per frame**, because classification flickers: an object read as a car for
+forty frames and a truck for two was read both ways. `TrackWindow.class_name` is a
+derived convenience for a caller that has to pick one — most often seen, ties going to
+the most recent — and the per-frame record stays the truth.
+
+## What else it will not do
 
 **It does not read a clock.** `FrameEntry.timestamp` is the caller's. `time.time()` at
 the moment of recording is when the *analysis* ran, which for a video file is hours
