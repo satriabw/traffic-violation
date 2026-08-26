@@ -47,8 +47,13 @@ class ViolationMetadata(BaseModel):
     vehicles: list[TrackSummary] = Field(default_factory=list)
     pedestrians: list[TrackSummary] = Field(default_factory=list)
     # S3 object keys, not URLs — presigned links expire, so they are minted per read
-    # the same way file downloads are. The objects are uploaded *before* the violation
-    # row is written, so a key here always has something behind it.
+    # the same way file downloads are.
+    #
+    # EMPTY, on everything the worker writes, and that is settled rather than pending.
+    # Frames are re-derived from the source when somebody opens the detail view, which
+    # the row's source_id and frame_index are there to make possible. The field stays
+    # for the case that would need it — a durable artifact baked at confirmation time,
+    # or a stream, which has no source to seek back into.
     frames: list[str] = Field(default_factory=list)
 
 
@@ -56,6 +61,12 @@ class ViolationCreate(BaseModel):
     """What the worker has when a rule fires. Everything else is defaulted."""
 
     site_id: str
+    # The source version the job was pinned to, and the frame within it. Together they
+    # are what lets evidence be re-derived on demand instead of uploaded here — see the
+    # DDL. The worker has both already: the job message carries the source it was
+    # created against, and a Violation carries its own frame index.
+    source_id: str
+    frame_index: int
     type: ViolationType
     detected_at: datetime
     metadata: ViolationMetadata = Field(default_factory=ViolationMetadata)
@@ -64,6 +75,10 @@ class ViolationCreate(BaseModel):
 class ViolationResponse(BaseModel):
     id: str
     site_id: str
+    # Carried on the way out too: whoever renders the detail view is the one that has
+    # to fetch the video and seek to the moment.
+    source_id: str
+    frame_index: int
     type: ViolationType
     status: ViolationStatus
     detected_at: datetime

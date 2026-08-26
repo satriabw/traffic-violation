@@ -17,6 +17,16 @@ def con():
     connection = get_connection(":memory:")
     init_db(connection)
     connection.execute("INSERT INTO sites (id, name) VALUES ('s1', 'Junction 5')")
+    connection.execute(
+        "INSERT INTO files (id, name, url, type, status)"
+        " VALUES ('f1', 'junction.mp4', 'video/f1/junction.mp4', 'video', 'uploaded')"
+    )
+    connection.execute(
+        """
+        INSERT INTO site_sources (id, site_id, version, kind, file_id)
+        VALUES ('src-1', 's1', 3, 'video', 'f1')
+        """
+    )
     return connection
 
 
@@ -24,6 +34,8 @@ def _violation(**overrides) -> ViolationCreate:
     return ViolationCreate(
         **{
             "site_id": "s1",
+            "source_id": "src-1",
+            "frame_index": 912,
             "type": ViolationType.RED_LIGHT_RUNNING,
             "detected_at": DETECTED_AT,
             "metadata": ViolationMetadata(
@@ -36,7 +48,7 @@ def _violation(**overrides) -> ViolationCreate:
                         bboxes=[(0, 0, 10, 10), (1, 1, 11, 11)],
                     )
                 ],
-                frames=["evidence_frame/f1/a.jpg"],
+
             ),
             **overrides,
         }
@@ -97,3 +109,56 @@ def test_a_violation_for_an_unknown_site_leaves_nothing_behind(con):
     # write would otherwise fail with "cannot start a transaction within a transaction".
     record(con, _violation())
     assert con.execute("SELECT COUNT(*) FROM traffic_violations").fetchone()[0] == 1
+
+
+def test_a_violation_records_which_video_it_came_from_and_where(con):
+    """The whole reason no frames are uploaded. Without these two a violation cannot
+    say what to open or where to seek, and the evidence can never be re-derived."""
+    violation_id = record(con, _violation())
+
+    assert con.execute(
+        "SELECT source_id, frame_index FROM traffic_violations WHERE id = ?",
+        [violation_id],
+    ).fetchone() == ("src-1", 912)
+
+
+def test_the_pinned_source_is_the_version_the_job_ran_against(con):
+    """site_sources appends a row per version and its id is the primary key, so the
+    id pins the version on its own — no second column to disagree with it."""
+    con.execute(
+        """
+        INSERT INTO site_sources (id, site_id, version, kind, file_id)
+        VALUES ('src-2', 's1', 4, 'video', 'f1')
+        """
+    )
+    violation_id = record(con, _violation())
+
+    assert con.execute(
+        """
+        SELECT s.version FROM traffic_violations v
+        JOIN site_sources s ON s.id = v.source_id
+        WHERE v.id = ?
+        """,
+        [violation_id],
+    ).fetchone()[0] == 3
+
+
+def test_a_violation_naming_a_source_that_does_not_exist_leaves_nothing_behind(con):
+    """A row that cannot locate its own footage is a detection nobody can review, so
+    it is refused rather than written and puzzled over later."""
+    with pytest.raises(sqlite3.IntegrityError):
+        record(con, _violation(source_id="no-such-source"))
+
+    assert con.execute("SELECT COUNT(*) FROM traffic_violations").fetchone()[0] == 0
+    assert con.execute("SELECT COUNT(*) FROM violation_metadata").fetchone()[0] == 0
+
+
+def test_no_evidence_frames_are_recorded(con):
+    """Settled, not pending: the pixels come back from the source on demand."""
+    violation_id = record(con, _violation())
+
+    blob = con.execute(
+        "SELECT json_blob FROM violation_metadata WHERE traffic_violation_id = ?",
+        [violation_id],
+    ).fetchone()[0]
+    assert ViolationMetadata.model_validate_json(blob).frames == []

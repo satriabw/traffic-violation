@@ -204,10 +204,15 @@ def test_delete_site_returns_409_when_it_has_violations():
     # 409 rather than 422: the request is well formed, and the same request succeeds
     # once the violations are dealt with.
     created = client.post(SITES, json={"name": "Busy", "source": STREAM}).json()
+    # A violation pins the source it was found in — the one this site was created with.
+    source_id = _test_con.execute(
+        "SELECT id FROM site_sources WHERE site_id = ?", [created["id"]]
+    ).fetchone()[0]
     _test_con.execute(
-        "INSERT INTO traffic_violations (id, site_id, type, detected_at)"
-        " VALUES ('v-routes-1', ?, 'red_light_running', '2026-08-21 10:00:00')",
-        [created["id"]],
+        "INSERT INTO traffic_violations"
+        " (id, site_id, source_id, frame_index, type, detected_at)"
+        " VALUES ('v-routes-1', ?, ?, 912, 'red_light_running', '2026-08-21 10:00:00')",
+        [created["id"], source_id],
     )
 
     response = client.delete(f"{SITES}/{created['id']}")

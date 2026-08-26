@@ -291,16 +291,24 @@ def test_deleting_a_site_cascades_to_everything_that_hangs_off_it():
 
 
 VIOLATION = (
-    "INSERT INTO traffic_violations (id, site_id, type, detected_at)"
-    " VALUES (?, 's1', ?, '2026-08-21 10:00:00')"
+    "INSERT INTO traffic_violations"
+    " (id, site_id, source_id, frame_index, type, detected_at)"
+    " VALUES (?, 's1', 'src1', 912, ?, '2026-08-21 10:00:00')"
 )
+
+
+def _with_source():
+    """A site, a file and the video version a violation can be pinned to."""
+    con = _with_site_and_file()
+    _insert_source(con, "video", file_id="f1")
+    return con
 
 
 def test_init_db_creates_the_violation_tables():
     con = _fresh()
 
     assert _columns(con, "traffic_violations") == {
-        "id", "site_id", "type", "status", "detected_at",
+        "id", "site_id", "source_id", "frame_index", "type", "status", "detected_at",
         "explanation", "severity", "created_at", "updated_at",
     }
     assert _columns(con, "violation_metadata") == {
@@ -309,21 +317,65 @@ def test_init_db_creates_the_violation_tables():
 
 
 def test_traffic_violations_defaults_to_detected():
-    con = _with_site_and_file()
+    con = _with_source()
     con.execute(VIOLATION, ["v1", "red_light_running"])
 
     assert con.execute("SELECT status FROM traffic_violations").fetchone()[0] == "detected"
 
 
 def test_traffic_violations_rejects_an_unknown_type():
-    con = _with_site_and_file()
+    con = _with_source()
 
     with pytest.raises(sqlite3.IntegrityError):
         con.execute(VIOLATION, ["v1", "jaywalking_backwards"])
 
 
+def test_traffic_violations_must_say_which_video_it_came_from():
+    # Evidence frames are not stored — they are re-derived from the source on demand —
+    # so a row with no source is a detection nobody can ever review.
+    con = _with_source()
+
+    with pytest.raises(sqlite3.IntegrityError):
+        con.execute(
+            "INSERT INTO traffic_violations (id, site_id, frame_index, type, detected_at)"
+            " VALUES ('v1', 's1', 912, 'red_light_running', '2026-08-21 10:00:00')"
+        )
+
+
+def test_traffic_violations_must_say_where_in_the_video():
+    con = _with_source()
+
+    with pytest.raises(sqlite3.IntegrityError):
+        con.execute(
+            "INSERT INTO traffic_violations (id, site_id, source_id, type, detected_at)"
+            " VALUES ('v1', 's1', 'src1', 'red_light_running', '2026-08-21 10:00:00')"
+        )
+
+
+def test_traffic_violations_rejects_a_source_that_does_not_exist():
+    con = _with_source()
+
+    with pytest.raises(sqlite3.IntegrityError):
+        con.execute(
+            "INSERT INTO traffic_violations"
+            " (id, site_id, source_id, frame_index, type, detected_at)"
+            " VALUES ('v1', 's1', 'no-such-source', 912, 'red_light_running',"
+            " '2026-08-21 10:00:00')"
+        )
+
+
+def test_deleting_a_source_a_violation_points_at_is_refused():
+    # A source is configuration; a violation is a record of something that happened.
+    # The same reasoning that keeps sites(id) restricting rather than cascading.
+    con = _with_source()
+    con.execute(VIOLATION, ["v1", "red_light_running"])
+
+    with pytest.raises(sqlite3.IntegrityError):
+        con.execute("DELETE FROM site_sources WHERE id = 'src1'")
+
+
 def test_traffic_violations_rejects_an_unknown_status():
-    con = _with_site_and_file()
+    con = _with_source()
 
     with pytest.raises(sqlite3.IntegrityError):
         con.execute(
@@ -349,7 +401,7 @@ def test_a_site_with_violations_cannot_be_deleted():
     without it. A violation is a record of something that happened, and deleting a
     site should not take it along silently.
     """
-    con = _with_site_and_file()
+    con = _with_source()
     con.execute(VIOLATION, ["v1", "red_light_running"])
 
     with pytest.raises(sqlite3.IntegrityError):
@@ -357,7 +409,7 @@ def test_a_site_with_violations_cannot_be_deleted():
 
 
 def test_violation_metadata_goes_with_its_violation():
-    con = _with_site_and_file()
+    con = _with_source()
     con.execute(VIOLATION, ["v1", "red_light_running"])
     con.execute(
         "INSERT INTO violation_metadata (id, traffic_violation_id, json_blob)"
@@ -372,7 +424,7 @@ def test_violation_metadata_goes_with_its_violation():
 def test_a_violation_cannot_have_two_metadata_blobs():
     # One-to-one in the LLD. A second blob would be a bug, not an addition, and
     # whichever one a reader picked up would be arbitrary.
-    con = _with_site_and_file()
+    con = _with_source()
     con.execute(VIOLATION, ["v1", "red_light_running"])
     con.execute(
         "INSERT INTO violation_metadata (id, traffic_violation_id, json_blob)"

@@ -102,6 +102,23 @@ TRAFFIC_VIOLATIONS_TABLE = """
 CREATE TABLE IF NOT EXISTS traffic_violations (
     id VARCHAR PRIMARY KEY,
     site_id VARCHAR NOT NULL REFERENCES sites(id),
+    -- WHICH VIDEO, AND WHERE IN IT. Evidence frames are not stored; they are
+    -- re-derived from the source when somebody opens the detail view, and without
+    -- these two a violation cannot say what to open or where to seek. A row that
+    -- cannot locate its own footage is a detection nobody can review.
+    --
+    -- site_sources appends a row per version and its id is the primary key, so this
+    -- pins the exact version on its own — a separate version column would be a second
+    -- copy of the same fact, free to disagree with it.
+    --
+    -- Restricting, like sites(id) above and for the same reason: a source is
+    -- configuration, a violation is a record of something that happened, and deleting
+    -- the first should not silently destroy the second.
+    source_id VARCHAR NOT NULL REFERENCES site_sources(id),
+    -- Absolute, in the source's own frames. Frames rather than an offset in seconds
+    -- because variable-rate footage makes a time offset ambiguous — the same reason
+    -- FrameRange is in frames and SourceMetadata keeps fps and nominal_fps apart.
+    frame_index INTEGER NOT NULL,
     type VARCHAR NOT NULL CHECK (
         type IN ('red_light_running', 'pedestrian_right_of_way')
     ),

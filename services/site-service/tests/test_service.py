@@ -72,9 +72,16 @@ def test_delete_site_refuses_a_site_that_has_violations(con):
     the delete is refused rather than quietly taking them along.
     """
     site = create_site(con, SiteCreate(name="Busy Junction"))
+    # A violation pins the source it was found in, so one has to exist to point at.
     con.execute(
-        "INSERT INTO traffic_violations (id, site_id, type, detected_at)"
-        " VALUES ('v1', ?, 'red_light_running', '2026-08-21 10:00:00')",
+        "INSERT INTO site_sources (id, site_id, version, kind, stream_url)"
+        " VALUES ('src-busy', ?, 1, 'stream', 'rtsp://camera')",
+        [site.id],
+    )
+    con.execute(
+        "INSERT INTO traffic_violations"
+        " (id, site_id, source_id, frame_index, type, detected_at)"
+        " VALUES ('v1', ?, 'src-busy', 912, 'red_light_running', '2026-08-21 10:00:00')",
         [site.id],
     )
 
