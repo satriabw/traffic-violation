@@ -10,6 +10,7 @@ from shared.models.detection import DetectionJob, FrameRange, JobSource
 from shared.models.violation import TrackSummary, ViolationCreate, ViolationMetadata
 from violation_detector import Violation
 
+from detection_worker import context
 from detection_worker.violations import detected_at, record, summary, to_create
 
 DETECTED_AT = datetime(2026, 8, 21, 10, 0, tzinfo=timezone.utc)
@@ -146,6 +147,36 @@ def test_the_pinned_source_is_the_version_the_job_ran_against(con):
     ).fetchone()[0] == 3
 
 
+def test_record_writes_the_documents_the_violation_was_judged_against(con):
+    """The reader needs both: to filter a site's violations down to the setup it runs
+    under now, and to draw the evidence with the polygons that actually convicted."""
+    for table, doc_id in (("camera_calibrations", "cal-1"), ("configurations", "cfg-1")):
+        con.execute(
+            f"INSERT INTO {table} (id, site_id, file_id, version) VALUES (?, 's1', 'f1', 1)",
+            [doc_id],
+        )
+
+    violation_id = record(
+        con, _violation(calibration_id="cal-1", configuration_id="cfg-1")
+    )
+
+    assert con.execute(
+        "SELECT calibration_id, configuration_id FROM traffic_violations WHERE id = ?",
+        [violation_id],
+    ).fetchone() == ("cal-1", "cfg-1")
+
+
+def test_a_violation_from_an_uncalibrated_site_records_no_documents(con):
+    """Not an edge case: detection runs on a site with a video and no camera model, so
+    the write path has to accept one rather than fail on exactly those sites."""
+    violation_id = record(con, _violation())
+
+    assert con.execute(
+        "SELECT calibration_id, configuration_id FROM traffic_violations WHERE id = ?",
+        [violation_id],
+    ).fetchone() == (None, None)
+
+
 def test_a_violation_naming_a_source_that_does_not_exist_leaves_nothing_behind(con):
     """A row that cannot locate its own footage is a detection nobody can review, so
     it is refused rather than written and puzzled over later."""
@@ -170,6 +201,15 @@ def test_no_evidence_frames_are_recorded(con):
 # --- assembling the row -------------------------------------------------------
 
 ANCHOR = datetime(2026, 8, 21, 10, 0, tzinfo=timezone.utc)
+
+
+def _context(**overrides) -> context.JobContext:
+    """A resolved job context, carrying nothing but the anchor unless asked.
+
+    The default is the uncalibrated site — no calibration, no configuration — because
+    that is a normal state and the one a row still has to be writable from.
+    """
+    return context.JobContext(source_created_at=ANCHOR, **overrides)
 
 
 def _job(fps: float | None = 30.0) -> DetectionJob:
@@ -222,13 +262,41 @@ def test_a_violation_becomes_a_row_that_can_find_its_own_footage():
         _job(),
         Violation(type="red_light_running", track_id=7, frame_index=900),
         _window(),
-        ANCHOR,
+        _context(),
     )
 
     assert created.source_id == "src-1"
     assert created.frame_index == 900
     assert created.type is ViolationType.RED_LIGHT_RUNNING
     assert created.detected_at == ANCHOR + timedelta(seconds=30)
+
+
+def test_the_row_pins_what_the_violation_was_judged_against():
+    # Not the versions the job named but the rows they resolved to, so the reader can
+    # tell which violations hold under the site's current setup and can draw the
+    # evidence with the polygons that actually convicted, not whatever is current now.
+    created = to_create(
+        _job(),
+        Violation(type="red_light_running", track_id=7, frame_index=900),
+        _window(),
+        _context(calibration_id="cal-1", configuration_id="cfg-1"),
+    )
+
+    assert created.calibration_id == "cal-1"
+    assert created.configuration_id == "cfg-1"
+
+
+def test_a_job_with_no_documents_pins_nothing_rather_than_guessing():
+    # A site with a video and no calibration is ordinary, and None says exactly that.
+    created = to_create(
+        _job(),
+        Violation(type="red_light_running", track_id=7, frame_index=900),
+        _window(),
+        _context(),
+    )
+
+    assert created.calibration_id is None
+    assert created.configuration_id is None
 
 
 def test_the_row_carries_the_violation_s_own_frame_not_the_loop_s():
@@ -238,7 +306,7 @@ def test_the_row_carries_the_violation_s_own_frame_not_the_loop_s():
         _job(),
         Violation(type="red_light_running", track_id=7, frame_index=870),
         _window(),
-        ANCHOR,
+        _context(),
     )
 
     assert created.frame_index == 870
@@ -246,7 +314,7 @@ def test_the_row_carries_the_violation_s_own_frame_not_the_loop_s():
 
 def test_the_violator_is_summarised_as_a_vehicle():
     created = to_create(
-        _job(), Violation(type="red_light_running", track_id=7, frame_index=900), _window(), ANCHOR
+        _job(), Violation(type="red_light_running", track_id=7, frame_index=900), _window(), _context()
     )
 
     assert [v.track_id for v in created.metadata.vehicles] == [7]
@@ -256,7 +324,7 @@ def test_a_violation_with_no_window_still_becomes_a_row():
     # What the rules were holding at the end of a job. A violation with no history is
     # still a violation.
     created = to_create(
-        _job(), Violation(type="red_light_running", track_id=7, frame_index=900), None, ANCHOR
+        _job(), Violation(type="red_light_running", track_id=7, frame_index=900), None, _context()
     )
 
     assert created.metadata.vehicles == []
@@ -264,13 +332,12 @@ def test_a_violation_with_no_window_still_becomes_a_row():
 
 def test_the_counterparty_is_not_recorded_yet():
     """The pedestrian rule's whole subject is somebody the module does not name in what
-    it returns, so `pedestrians` stays empty. Filling it in means either widening
-    Violation or having the analyzer keep every window rather than the ones that fired."""
+    it returns, so `pedestrians` stays empty. Filling it in is the next change."""
     created = to_create(
         _job(),
         Violation(type="pedestrian_right_of_way", track_id=7, frame_index=900),
         _window(),
-        ANCHOR,
+        _context(),
     )
 
     assert created.metadata.pedestrians == []
@@ -279,7 +346,7 @@ def test_the_counterparty_is_not_recorded_yet():
 def test_a_row_assembled_this_way_is_writable(con):
     """The two halves meet: what to_create builds is what record takes."""
     created = to_create(
-        _job(), Violation(type="red_light_running", track_id=7, frame_index=900), _window(), ANCHOR
+        _job(), Violation(type="red_light_running", track_id=7, frame_index=900), _window(), _context()
     )
 
     violation_id = record(con, created)
@@ -324,7 +391,7 @@ def test_a_row_for_an_uncalibrated_job_survives_the_round_trip(con):
             class_names=("car",),
             timestamps=(None,),
         ),
-        ANCHOR,
+        _context(),
     )
 
     violation_id = record(con, created)

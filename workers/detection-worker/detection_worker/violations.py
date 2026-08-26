@@ -18,6 +18,8 @@ from shared.models.violation import (
 )
 from violation_detector import Violation
 
+from detection_worker import context
+
 
 def summary(window: TrackWindow) -> TrackSummary:
     """One track's window, in the shape the metadata blob keeps.
@@ -57,7 +59,7 @@ def to_create(
     job: DetectionJob,
     violation: Violation,
     window: TrackWindow | None,
-    anchor: datetime,
+    job_context: context.JobContext,
 ) -> ViolationCreate:
     """A firing rule and its record, as the row that gets written.
 
@@ -65,12 +67,17 @@ def to_create(
     produced. A module working on a clip reports several frames late, and recording the
     loop's position would misdate it by the length of the window.
 
+    The whole context rather than the anchor alone. Three of the values written here —
+    the anchor, and the two documents this was judged against — are facts about the
+    job's context that always travel together and always come from the same object, so
+    passing that object is one parameter instead of three. It also means the pending fix
+    to `detected_at` (footage time rather than upload time) lands inside `context` with
+    no signature to change out here.
+
     ONLY THE VIOLATOR IS SUMMARISED. Both rules that ship report against a vehicle, so
     `vehicles` holds its window and `pedestrians` stays empty — even for the pedestrian
     rule, whose whole subject is somebody the module does not name in what it returns.
-    Filling that in means either widening `Violation` or having the analyzer keep every
-    window rather than the ones that fired, and neither belongs in the change that
-    first makes a row appear.
+    Filling that in is the next change, and does not belong in this one.
 
     `frames` stays empty by design: the pixels come back from the source on demand.
     """
@@ -78,8 +85,12 @@ def to_create(
         site_id=job.site_id,
         source_id=job.source.source_id,
         frame_index=violation.frame_index,
+        calibration_id=job_context.calibration_id,
+        configuration_id=job_context.configuration_id,
         type=ViolationType(violation.type),
-        detected_at=detected_at(anchor, violation.frame_index, job.source.fps),
+        detected_at=detected_at(
+            job_context.source_created_at, violation.frame_index, job.source.fps
+        ),
         metadata=ViolationMetadata(vehicles=[summary(window)] if window else []),
     )
 
@@ -106,14 +117,17 @@ def record(con: sqlite3.Connection, violation: ViolationCreate) -> str:
         con.execute(
             """
             INSERT INTO traffic_violations
-                (id, site_id, source_id, frame_index, type, detected_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (id, site_id, source_id, frame_index, calibration_id, configuration_id,
+                 type, detected_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 violation_id,
                 violation.site_id,
                 violation.source_id,
                 violation.frame_index,
+                violation.calibration_id,
+                violation.configuration_id,
                 violation.type.value,
                 violation.detected_at,
             ],

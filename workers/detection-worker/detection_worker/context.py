@@ -68,6 +68,19 @@ class JobContext:
 
     calibration: bytes | None = None
     configuration: dict | None = None
+    # WHICH ROWS THOSE TWO DOCUMENTS CAME FROM, so a violation can record what it was
+    # judged against. Resolved here because this is already the only thing that looks
+    # them up — `_document` joins each versioned table to `files`, so the id comes back
+    # on a query that was running anyway.
+    #
+    # The id rather than the version the job named: each is the primary key of one
+    # version's row, so it pins that version by itself. Same reasoning as the column it
+    # ends up in — see shared.db.init.
+    #
+    # None wherever the document is None, and for the same ordinary reason: a site with
+    # a video and no calibration runs detection without one.
+    calibration_id: str | None = None
+    configuration_id: str | None = None
     # How many seconds of lead-up this site's violations should carry. Read out of the
     # configuration document here, where the document is already in hand, and passed on
     # as a number — nothing downstream of this is handed the document to go digging in.
@@ -86,12 +99,19 @@ class JobContext:
     source_created_at: datetime = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
-def _document_key(
+def _document(
     con: sqlite3.Connection, table: str, site_id: str, version: int
-) -> str:
+) -> tuple[str, str]:
+    """The document's own id and the object key holding it, for one pinned version.
+
+    Both from one query, because both describe the same row. The id is what a violation
+    records to say what it was judged against, and looking it up separately would be a
+    second read of a row this one already found — free to disagree with it if a version
+    were appended in between.
+    """
     row = con.execute(
         f"""
-        SELECT files.url
+        SELECT {table}.id, files.url
         FROM {table}
         JOIN files ON files.id = {table}.file_id
         WHERE {table}.site_id = ? AND {table}.version = ?
@@ -102,7 +122,7 @@ def _document_key(
         raise ContextMissing(f"{table} v{version} for site {site_id} does not exist")
     # `url` on a files row is the object key, not a URL — the column name is inherited
     # from the LLD, the same way JobSource.key is.
-    return row[0]
+    return row[0], row[1]
 
 
 def _evidence_seconds(document: dict | None) -> float:
@@ -146,6 +166,29 @@ def _source_created_at(con: sqlite3.Connection, source_id: str) -> datetime:
     return created_at
 
 
+def _resolve(
+    con: sqlite3.Connection,
+    table: str,
+    site_id: str,
+    version: int | None,
+    fetch: Callable[[str], dict] | Callable[[str], bytes],
+):
+    """One pinned document, and the id of the row it came from.
+
+    `(None, None)` when the job named no version. That is an ordinary state and not a
+    missing document — a site with a video and no calibration runs detection without
+    one — which is why it is answered here rather than raising ContextMissing.
+
+    Written once and used for both, though the two are fetched differently: what
+    differs between a configuration and a calibration is only which fetcher reads the
+    key. See JobContext for why that asymmetry exists.
+    """
+    if version is None:
+        return None, None
+    document_id, key = _document(con, table, site_id, version)
+    return document_id, fetch(key)
+
+
 def load(
     con: sqlite3.Connection,
     job: DetectionJob,
@@ -157,22 +200,17 @@ def load(
     Both fetchers are injectable so tests resolve real keys out of a real database
     without object storage anywhere in reach.
     """
-    configuration = (
-        None
-        if job.configuration_version is None
-        else fetch_json(
-            _document_key(con, CONFIGURATIONS, job.site_id, job.configuration_version)
-        )
+    configuration_id, configuration = _resolve(
+        con, CONFIGURATIONS, job.site_id, job.configuration_version, fetch_json
+    )
+    calibration_id, calibration = _resolve(
+        con, CALIBRATIONS, job.site_id, job.calibration_version, fetch_bytes
     )
     return JobContext(
         configuration=configuration,
+        configuration_id=configuration_id,
+        calibration=calibration,
+        calibration_id=calibration_id,
         evidence_seconds=_evidence_seconds(configuration),
         source_created_at=_source_created_at(con, job.source.source_id),
-        calibration=(
-            None
-            if job.calibration_version is None
-            else fetch_bytes(
-                _document_key(con, CALIBRATIONS, job.site_id, job.calibration_version)
-            )
-        ),
     )

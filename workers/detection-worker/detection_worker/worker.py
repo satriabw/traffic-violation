@@ -112,7 +112,7 @@ def make_handler(
                         job,
                         violation,
                         result.evidence.get(violation.track_id),
-                        job_context.source_created_at,
+                        job_context,
                     )
                 )
                 recorded_count += 1
@@ -136,7 +136,7 @@ def make_handler(
         # silence. These carry no window — see FrameAnalyzer.finish — and are recorded
         # anyway: a violation with no history is still a violation.
         for violation in analyzer.finish():
-            save(violations.to_create(job, violation, None, job_context.source_created_at))
+            save(violations.to_create(job, violation, None, job_context))
             violation_count += 1
             recorded_count += 1
 
