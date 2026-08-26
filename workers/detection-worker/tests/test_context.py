@@ -127,6 +127,49 @@ def test_calibration_and_configuration_resolve_independently(con):
     assert (resolved.calibration, resolved.configuration) == (b"%YAML:1.0", {"roi": [2]})
 
 
+def test_the_context_carries_the_id_of_each_row_it_resolved(con):
+    """What a violation records to say what it was judged against. The id rather than
+    the version the job named: it is the primary key of one version's row, so it pins
+    that version by itself."""
+    _file(con, "f1", "calibration/f1/a.yml", "calibration")
+    _file(con, "f2", "configuration/f2/b.json", "configuration")
+    _doc(con, CALIBRATIONS, "c1", "f1", version=1)
+    _doc(con, "configurations", "g1", "f2", version=3)
+
+    resolved = load(
+        con,
+        _job(calibration_version=1, configuration_version=3),
+        **_fetchers({"calibration/f1/a.yml": b"x", "configuration/f2/b.json": {}}),
+    )
+
+    assert (resolved.calibration_id, resolved.configuration_id) == ("c1", "g1")
+
+
+def test_the_id_resolved_belongs_to_the_version_the_job_named(con):
+    """The same guarantee the document itself gets. A job pinned to v1 records v1's
+    row, even though v2 is what the site is on now."""
+    _file(con, "f1", "calibration/f1/v1.yml")
+    _file(con, "f2", "calibration/f2/v2.yml")
+    _doc(con, CALIBRATIONS, "c1", "f1", version=1)
+    _doc(con, CALIBRATIONS, "c2", "f2", version=2)
+
+    resolved = load(
+        con,
+        _job(calibration_version=1),
+        **_fetchers({"calibration/f1/v1.yml": b"v1", "calibration/f2/v2.yml": b"v2"}),
+    )
+
+    assert resolved.calibration_id == "c1"
+
+
+def test_a_job_with_no_versions_resolves_to_no_ids(con):
+    # None means the site had none, which is ordinary — the same absence the documents
+    # themselves report, arrived at without anyone deciding anything.
+    resolved = load(con, _job(), **_fetchers({}))
+
+    assert (resolved.calibration_id, resolved.configuration_id) == (None, None)
+
+
 def test_only_one_of_the_two_being_present_is_fine(con):
     _file(con, "f2", "configuration/f2/b.json", "configuration")
     _doc(con, "configurations", "g1", "f2", version=1)
