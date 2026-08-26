@@ -1,0 +1,23 @@
+[project]
+name = "evidence-collector"
+version = "0.1.0"
+description = "The recent history of tracked objects, kept until something makes it worth recording"
+requires-python = ">=3.11"
+# NOTHING. Not numpy, not OpenCV, and nothing from this repository.
+#
+# The other two distributions here each earn a dependency: trajectory-collector
+# projects with a matrix and violation-detector runs point-in-polygon tests. This one
+# keeps records and hands them back, which is a deque and some tuples. A dependency
+# added later would be worth asking twice about — anything that needs an array is
+# almost certainly work that belongs on one side of this package or the other.
+#
+# The same "liftable back out" rule the other two hold themselves to, in its strongest
+# form: this installs into any Python 3.11 and has nothing to conflict with.
+dependencies = []
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
