@@ -215,11 +215,20 @@ class FrameAnalyzer:
         )
 
     def _evidence_for(self, violations: list[Violation]) -> dict[int, TrackWindow]:
-        """The lead-up to whatever just fired, keyed by the track it fired on.
+        """The lead-up to everything that was on the scene, when something just fired.
+
+        THE WHOLE SCENE, not only the convicted track. What a violation is worth
+        reviewing against is who else was there — the pedestrian in the crossing above
+        all, whose window is the one thing that could never be recovered afterwards
+        from a record of the vehicle alone. Which of them mattered is a question about
+        regions, and it is answered by whoever holds the polygons at read time; nothing
+        here decides it, and nothing here computes any geometry to.
+
+        `window_for()` with no argument is every track the buffer holds, which the
+        evidence package documents as being for exactly this question.
 
         Nothing at all on the overwhelming majority of frames, where nothing fires —
-        and reading a window costs nothing on those, because there is nothing to ask
-        for.
+        and the buffer is never pivoted on those, because there is nothing to ask for.
 
         Keyed by track id rather than aligned with `violations`, so two rules
         convicting one vehicle on one frame share the one history they both describe
@@ -227,10 +236,7 @@ class FrameAnalyzer:
         """
         if not violations:
             return {}
-        return {
-            window.track_id: window
-            for window in self._evidence.window_for({v.track_id for v in violations})
-        }
+        return {window.track_id: window for window in self._evidence.window_for()}
 
     @property
     def evidence_capacity(self) -> int:

@@ -107,18 +107,16 @@ def make_handler(
                 # end. A job that dies half way through has recorded what it saw up to
                 # then, which is worth more than nothing — and each write is its own
                 # transaction, so there is no batch to lose.
-                save(
-                    violations.to_create(
-                        job,
-                        violation,
-                        result.evidence.get(violation.track_id),
-                        job_context,
-                    )
-                )
+                save(violations.to_create(job, violation, result.evidence, job_context))
                 recorded_count += 1
-            short_windows += sum(
-                1 for window in result.evidence.values() if len(window) < capacity
-            )
+                # The violator's window alone, though the record now holds the whole
+                # scene. What this counts is whether a violation reached back past the
+                # start of its own chunk; every object that had only just walked into
+                # view is short too, and counting those would bury the signal under
+                # them on exactly the busy junctions where it matters.
+                convicted = result.evidence.get(violation.track_id)
+                if convicted is not None and len(convicted) < capacity:
+                    short_windows += 1
 
             # Per-frame detail is DEBUG because a 30-second chunk is ~900 of these,
             # and the summary below is what anyone watching a normal run wants.
@@ -136,7 +134,7 @@ def make_handler(
         # silence. These carry no window — see FrameAnalyzer.finish — and are recorded
         # anyway: a violation with no history is still a violation.
         for violation in analyzer.finish():
-            save(violations.to_create(job, violation, None, job_context))
+            save(violations.to_create(job, violation, {}, job_context))
             violation_count += 1
             recorded_count += 1
 
@@ -171,9 +169,11 @@ def make_handler(
             # both normal, and neither distinguishable from a clean stretch of footage
             # by this number alone.
             violation_count,
-            # How many of those came with a history. Short of `violations` only where
-            # two rules convicted one vehicle on one frame, since they share the one
-            # window that describes them both.
+            # How many track histories went into the records — the whole scene at each
+            # firing frame, not one per violation. So this is roughly how busy the
+            # junction was at the moments that mattered, and it is what the size of the
+            # metadata blobs scales with: a number far above `violations` means each
+            # record is carrying a crowd.
             evidence_count,
             # How many of those histories were cut short. A few is ordinary — objects
             # that had only just appeared. Most of them, on a job that is not the first

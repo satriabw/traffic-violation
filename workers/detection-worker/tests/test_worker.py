@@ -64,6 +64,7 @@ class FakeAnalyzer:
         held: int = 0,
         window: int = 3,
         capacity: int = 3,
+        bystanders: int = 0,
     ):
         self.job = job
         self.job_context = job_context
@@ -77,6 +78,9 @@ class FakeAnalyzer:
         # The handler's whole interest in evidence is telling those two apart.
         self._window = window
         self._capacity = capacity
+        # Other tracks the ring held when the rule fired. The record keeps the whole
+        # scene, so these arrive alongside the violator rather than being filtered out.
+        self._bystanders = bystanders
 
     @property
     def evidence_capacity(self) -> int:
@@ -91,6 +95,30 @@ class FakeAnalyzer:
             for track_id in range(1, self._held + 1)
         ]
 
+    def _window_of(self, track_id: int, index: int, length: int) -> TrackWindow:
+        return TrackWindow(
+            track_id=track_id,
+            frame_indices=tuple(range(index - length + 1, index + 1)),
+            positions=((0.0, 0.0),) * length,
+            speeds=(1.0,) * length,
+            bboxes=((0.0, 0.0, 1.0, 1.0),) * length,
+            class_names=("car",) * length,
+            timestamps=(None,) * length,
+        )
+
+    def _scene(self, index: int) -> dict[int, TrackWindow]:
+        """Track 1 is the one convicted; the bystanders are everyone else in the ring.
+
+        Theirs are deliberately one frame long, so a test can tell a window the handler
+        should count as short from ones it should ignore — with the whole scene in the
+        record, an object that had only just walked into view is short every time and
+        says nothing about whether the chunk overlap is big enough.
+        """
+        scene = {1: self._window_of(1, index, self._window)}
+        for track_id in range(2, self._bystanders + 2):
+            scene[track_id] = self._window_of(track_id, index, 1)
+        return scene
+
     def analyze(self, frame: np.ndarray, index: int) -> FrameResult:
         self.analyzed.append((frame, index))
         if self._count == 0:
@@ -104,19 +132,7 @@ class FakeAnalyzer:
             ]
             if self._violates
             else [],
-            evidence={
-                1: TrackWindow(
-                    track_id=1,
-                    frame_indices=tuple(range(index - self._window + 1, index + 1)),
-                    positions=((0.0, 0.0),) * self._window,
-                    speeds=(1.0,) * self._window,
-                    bboxes=((0.0, 0.0, 1.0, 1.0),) * self._window,
-                    class_names=("car",) * self._window,
-                    timestamps=(None,) * self._window,
-                )
-            }
-            if self._violates
-            else {},
+            evidence=self._scene(index) if self._violates else {},
             # Whether a job has trajectories at all depends on its calibration, which
             # the analyzer resolves — the handler only counts and logs them.
             trajectories={
@@ -146,13 +162,15 @@ def _analyzers(
     held: int = 0,
     window: int = 3,
     capacity: int = 3,
+    bystanders: int = 0,
 ):
     """An analyzer factory that records every analyzer it was asked to build."""
     made: list[FakeAnalyzer] = []
 
     def factory(job, job_context):
         analyzer = FakeAnalyzer(
-            job, job_context, detections_per_frame, locates, violates, held, window, capacity
+            job, job_context, detections_per_frame, locates, violates, held, window,
+            capacity, bystanders,
         )
         made.append(analyzer)
         return analyzer
@@ -501,6 +519,53 @@ def test_a_window_cut_short_is_counted_separately(caplog):
 
     assert "evidence=2" in caplog.text
     assert "short=2" in caplog.text
+
+
+def test_a_bystander_with_a_short_window_is_not_counted_as_a_short_one(caplog):
+    # The record keeps the whole scene, so most frames that fire carry objects that had
+    # only just walked into view. Counting theirs would put `short=` at nearly the
+    # number of tracks on every busy junction — burying the one thing it is for, which
+    # is a violation reaching back past the start of its own chunk.
+    with caplog.at_level("INFO"):
+        _handler(
+            read=_reader_of(frame_count=2),
+            new_analyzer=_analyzers(
+                detections_per_frame=1, violates=True, window=3, capacity=3, bystanders=4
+            ),
+        )(_job("job-1"))
+
+    # Five windows recorded per firing frame, over two frames — the whole scene.
+    assert "evidence=10" in caplog.text
+    # None of them the violator's, whose window is full.
+    assert "short=0" in caplog.text
+
+
+def test_the_violator_s_own_short_window_is_still_counted(caplog):
+    with caplog.at_level("INFO"):
+        _handler(
+            read=_reader_of(frame_count=2),
+            new_analyzer=_analyzers(
+                detections_per_frame=1, violates=True, window=2, capacity=151, bystanders=4
+            ),
+        )(_job("job-1"))
+
+    assert "short=2" in caplog.text
+
+
+def test_the_whole_scene_reaches_the_record_not_only_the_violator(caplog):
+    """Who else was there is what a violation gets reviewed against, and the reader
+    holds the polygons that say which of them was in the crossing."""
+    store = FakeStore()
+
+    _handler(
+        read=_reader_of(frame_count=1),
+        new_analyzer=_analyzers(detections_per_frame=1, violates=True, bystanders=2),
+        save=store,
+    )(_job("job-1"))
+
+    [written] = store.saved
+    assert [v.track_id for v in written.metadata.vehicles] == [1, 2, 3]
+    assert written.metadata.violator_track_id == 1
 
 
 def test_the_capacity_is_read_once_per_job_not_once_per_frame():

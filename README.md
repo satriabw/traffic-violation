@@ -460,13 +460,30 @@ from evidence_collector import EvidenceCollector
 
 collector = EvidenceCollector.over(seconds=5, fps=30)
 collector.observe(frame_index, object_states)     # every frame, empty ones included
-windows = collector.window_for([track_id])        # the lead-up, oldest first
+windows = collector.window_for()                  # every track's lead-up, oldest first
 ```
 
 A firing rule becomes a row: `detection_worker.violations.to_create` turns the
-`Violation` and the window that came with it into a `ViolationCreate`, and `record`
+`Violation` and the windows that came with it into a `ViolationCreate`, and `record`
 writes it. Rows are written as violations are found rather than batched to the end, so
 a job that dies half way through keeps what it had already seen.
+
+**The record is the whole scene, not just the accused.** Every track the ring held goes
+in, split into `vehicles` and `pedestrians` by what the detector called each one, with
+`violator_track_id` naming the one that was convicted. The pedestrian a driver failed
+to yield to is in there for the first time — and so is the car queued behind, which had
+nothing to do with it.
+
+That is deliberate. Narrowing it to the objects that *mattered* means testing their
+boxes against the regions in force, and the worker computes no geometry: it records
+what was there and interprets none of it. The row pins `configuration_id`, so whoever
+reads it holds the exact polygons that convicted and can answer the question then. The
+research pipeline this is ported from bounded the record at write time instead, by
+stamping each object's region during parsing — same evidence, decided a step earlier.
+
+The cost is size, and it scales with how busy the junction is: roughly 13KB per track
+over a five-second window, so a record carrying ten tracks is ~130KB against ~15KB for
+one. `evidence=` in the job summary is what that scales with.
 
 **It keeps records, not pixels.** Where each object was and how fast it was going,
 against the frame index that finds the moment in the footage again — some hundreds of
