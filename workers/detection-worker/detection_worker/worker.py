@@ -5,11 +5,9 @@ created against, reads the frames it asks for, and hands each frame to an analyz
 The pipeline now runs end to end: detection, tracking, ground positions, and the rules
 a site's configuration asks for.
 
-What a firing rule produces is counted and logged, and goes no further — but it now
-arrives with the few seconds that led up to it. Turning a `Violation` and its window
-into a row means assembling a `ViolationCreate` and calling
-`detection_worker.violations.record`, which is the next piece of work and deliberately
-not this one. The seam is `FrameResult.violations` and `FrameResult.evidence`.
+A firing rule now becomes a row. `detection_worker.violations` turns the `Violation`
+and the window that came with it into a `ViolationCreate` and writes it; the pipeline
+runs end to end.
 
 NO FRAMES ARE UPLOADED HERE, and that is settled rather than pending. The record keeps
 the frame index, and the source is an immutable object in storage that can be seeked
@@ -23,10 +21,11 @@ import logging
 from typing import Any, Callable, Iterable
 
 from shared.models.detection import DetectionJob, FrameRange
+from shared.models.violation import ViolationCreate
 from shared.queue.client import from_config
 from shared.s3.client import presigned_get
 
-from detection_worker import context
+from detection_worker import context, violations
 from detection_worker.analysis.frame_analyzer import FrameAnalyzer, make_analyzer
 from detection_worker.db import get_db
 from detection_worker.detection.model import from_config as model_from_config
@@ -38,6 +37,7 @@ logger = logging.getLogger(__name__)
 def make_handler(
     load_context: Callable[[DetectionJob], context.JobContext],
     new_analyzer: Callable[[DetectionJob, context.JobContext], FrameAnalyzer],
+    save: Callable[[ViolationCreate], str],
     sign: Callable[[str], str] = presigned_get,
     read: Callable[[str, FrameRange], Iterable[tuple[int, Any]]] = read_frames,
 ) -> Callable[[DetectionJob], None]:
@@ -81,6 +81,7 @@ def make_handler(
         detection_count = 0
         violation_count = 0
         evidence_count = 0
+        recorded_count = 0
         # Windows that came back shorter than the ring can hold. A track seen for half
         # a second only has half a second of history and is unremarkable, but so is a
         # violation early in a chunk that reaches back past its own first frame — and
@@ -101,6 +102,20 @@ def make_handler(
             located_tracks.update(result.trajectories)
             violation_count += len(result.violations)
             evidence_count += len(result.evidence)
+            for violation in result.violations:
+                # Written as they are found rather than collected and written at the
+                # end. A job that dies half way through has recorded what it saw up to
+                # then, which is worth more than nothing — and each write is its own
+                # transaction, so there is no batch to lose.
+                save(
+                    violations.to_create(
+                        job,
+                        violation,
+                        result.evidence.get(violation.track_id),
+                        job_context.source_created_at,
+                    )
+                )
+                recorded_count += 1
             short_windows += sum(
                 1 for window in result.evidence.values() if len(window) < capacity
             )
@@ -118,13 +133,17 @@ def make_handler(
         # Once, after the loop. A rule reports on the frame it was given and holds
         # nothing, but a module working on a clip is still holding a partial one here,
         # and without this drain the last seconds of every chunk would be dropped in
-        # silence.
-        violation_count += len(analyzer.finish())
+        # silence. These carry no window — see FrameAnalyzer.finish — and are recorded
+        # anyway: a violation with no history is still a violation.
+        for violation in analyzer.finish():
+            save(violations.to_create(job, violation, None, job_context.source_created_at))
+            violation_count += 1
+            recorded_count += 1
 
         logger.info(
             "detection job %s site=%s source=%s v%d calib=%s config=%s frames=%d-%d "
             "read=%d detections=%d tracks=%d located=%d violations=%d evidence=%d "
-            "short=%d types=%s",
+            "short=%d recorded=%d types=%s",
             job.id,
             job.site_id,
             job.source.source_id,
@@ -161,6 +180,11 @@ def make_handler(
             # chunk of its video, means the window is longer than the overlap between
             # chunks and every record is missing its approach.
             short_windows,
+            # Rows written. Equal to `violations` on a run that finished, and the pair
+            # is worth logging together anyway: a handler that raised part way through
+            # keeps whatever it had already committed, so the two diverging is the
+            # signal that a job did not get to the end.
+            recorded_count,
             [t.value for t in job.types],
         )
 
@@ -210,7 +234,8 @@ def main() -> None:
         from_config(),
         make_handler(
             lambda job: context.load(con, job),
-            lambda job, job_context: make_analyzer(
+            save=lambda violation: violations.record(con, violation),
+            new_analyzer=lambda job, job_context: make_analyzer(
                 model,
                 job.source.fps,
                 job_context.calibration,

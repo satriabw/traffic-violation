@@ -32,10 +32,17 @@ class TrackSummary(BaseModel):
     """
 
     track_id: int
-    # Image coordinates unless a calibration was applied, in which case ground-plane
-    # metres. Which one it is follows from whether the job carried a calibration.
-    trajectory: list[tuple[float, float]] = Field(default_factory=list)
-    speed: list[float] = Field(default_factory=list)
+    # Ground-plane metres, and None on any frame nothing projected — a job with no
+    # calibration has no ground plane, so every entry is None and `bboxes` is the whole
+    # of what was seen. Nothing substitutes image coordinates here: a position that is
+    # sometimes metres and sometimes pixels is a hundred-fold error nobody downstream
+    # could detect, and the box's own bottom edge is one line for a reader that wants
+    # somewhere to draw.
+    trajectory: list[tuple[float, float] | None] = Field(default_factory=list)
+    # None wherever nothing measured one — during a filter's warmup, and throughout a
+    # window that was never projected. Not 0.0, which is a speed somebody could have
+    # measured.
+    speed: list[float | None] = Field(default_factory=list)
     frame_idxs: list[int] = Field(default_factory=list)
     # (x1, y1, x2, y2), the same convention supervision uses.
     bboxes: list[tuple[float, float, float, float]] = Field(default_factory=list)
