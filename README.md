@@ -454,6 +454,11 @@ collector.observe(frame_index, object_states)     # every frame, empty ones incl
 windows = collector.window_for([track_id])        # the lead-up, oldest first
 ```
 
+A firing rule becomes a row: `detection_worker.violations.to_create` turns the
+`Violation` and the window that came with it into a `ViolationCreate`, and `record`
+writes it. Rows are written as violations are found rather than batched to the end, so
+a job that dies half way through keeps what it had already seen.
+
 **It keeps records, not pixels.** Where each object was and how fast it was going,
 against the frame index that finds the moment in the footage again — some hundreds of
 bytes a frame against megabytes for the image. The pixels are re-derived from the

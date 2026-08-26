@@ -16,6 +16,7 @@ plausible enough that nobody notices.
 
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Callable
 
 from shared.models.detection import DetectionJob
@@ -71,6 +72,18 @@ class JobContext:
     # configuration document here, where the document is already in hand, and passed on
     # as a number — nothing downstream of this is handed the document to go digging in.
     evidence_seconds: float = DEFAULT_EVIDENCE_SECONDS
+    # When the source this job reads was added to the site. The anchor a violation's
+    # `detected_at` is measured from — the frame index gives the offset into the
+    # footage, and this is what turns that into a moment.
+    #
+    # IT IS THE UPLOAD, NOT THE RECORDING. Nothing in the system knows when footage was
+    # shot: the probe does not read the container's creation_time, and neither
+    # SourceMetadata nor JobSource carries one. So every `detected_at` is late by
+    # however long the video sat between being filmed and being uploaded — a constant
+    # per source, which leaves violations correctly ordered within a video and
+    # correctly spaced, and only wrong in absolute terms. When a real recording time
+    # lands this is the one line that changes.
+    source_created_at: datetime = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
 def _document_key(
@@ -115,6 +128,22 @@ def _evidence_seconds(document: dict | None) -> float:
             f"{EVIDENCE_SECONDS_KEY} must be positive, got {declared!r}"
         )
     return seconds
+def _source_created_at(con: sqlite3.Connection, source_id: str) -> datetime:
+    row = con.execute(
+        "SELECT created_at FROM site_sources WHERE id = ?", [source_id]
+    ).fetchone()
+    if row is None:
+        # The same refusal as a missing calibration, for the same reason: the message
+        # and the database disagree, and a job that cannot say when its violations
+        # happened should stop rather than guess.
+        raise ContextMissing(f"source {source_id} does not exist")
+    created_at = row[0]
+    # SQLite's CURRENT_TIMESTAMP is UTC and carries no offset, so it comes back naive.
+    # Stamped rather than left that way: detected_at is written aware, and one column
+    # holding both kinds is a comparison that raises the first time anyone sorts it.
+    if created_at.tzinfo is None:
+        return created_at.replace(tzinfo=timezone.utc)
+    return created_at
 
 
 def load(
@@ -138,6 +167,7 @@ def load(
     return JobContext(
         configuration=configuration,
         evidence_seconds=_evidence_seconds(configuration),
+        source_created_at=_source_created_at(con, job.source.source_id),
         calibration=(
             None
             if job.calibration_version is None

@@ -1,13 +1,16 @@
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from shared.db.connection import get_connection
 from shared.db.init import init_db
 from shared.models.detection import ViolationType
+from evidence_collector import TrackWindow
+from shared.models.detection import DetectionJob, FrameRange, JobSource
 from shared.models.violation import TrackSummary, ViolationCreate, ViolationMetadata
+from violation_detector import Violation
 
-from detection_worker.violations import record
+from detection_worker.violations import detected_at, record, summary, to_create
 
 DETECTED_AT = datetime(2026, 8, 21, 10, 0, tzinfo=timezone.utc)
 
@@ -162,3 +165,172 @@ def test_no_evidence_frames_are_recorded(con):
         [violation_id],
     ).fetchone()[0]
     assert ViolationMetadata.model_validate_json(blob).frames == []
+
+
+# --- assembling the row -------------------------------------------------------
+
+ANCHOR = datetime(2026, 8, 21, 10, 0, tzinfo=timezone.utc)
+
+
+def _job(fps: float | None = 30.0) -> DetectionJob:
+    return DetectionJob(
+        id="job-1",
+        site_id="s1",
+        source=JobSource(source_id="src-1", version=3, key="video/f1/a.mp4", fps=fps),
+        frame_range=FrameRange(start=0, end=1000),
+        types=[ViolationType.RED_LIGHT_RUNNING],
+    )
+
+
+def _window(track_id: int = 7) -> TrackWindow:
+    return TrackWindow(
+        track_id=track_id,
+        frame_indices=(898, 899, 900),
+        positions=((1.0, 2.0), (1.5, 2.5), (2.0, 3.0)),
+        speeds=(11.0, 12.0, 13.0),
+        bboxes=((0, 0, 10, 10), (1, 1, 11, 11), (2, 2, 12, 12)),
+        class_names=("car", "car", "car"),
+        timestamps=(None, None, None),
+    )
+
+
+def test_a_window_becomes_a_summary_field_for_field():
+    # A rename and nothing else. The evidence package answers in its own vocabulary
+    # because it depends on nothing, and this is the whole cost of that.
+    assert summary(_window()) == TrackSummary(
+        track_id=7,
+        trajectory=[(1.0, 2.0), (1.5, 2.5), (2.0, 3.0)],
+        speed=[11.0, 12.0, 13.0],
+        frame_idxs=[898, 899, 900],
+        bboxes=[(0, 0, 10, 10), (1, 1, 11, 11), (2, 2, 12, 12)],
+    )
+
+
+def test_detected_at_is_the_anchor_plus_the_offset_into_the_footage():
+    assert detected_at(ANCHOR, frame_index=900, fps=30.0) == ANCHOR + timedelta(seconds=30)
+
+
+def test_a_source_with_no_frame_rate_cannot_place_a_violation_in_time():
+    # Visibly wrong rather than quietly wrong: every violation in such a job lands on
+    # the anchor, instead of on a moment computed from a frame rate nobody measured.
+    assert detected_at(ANCHOR, frame_index=900, fps=None) == ANCHOR
+    assert detected_at(ANCHOR, frame_index=900, fps=0) == ANCHOR
+
+
+def test_a_violation_becomes_a_row_that_can_find_its_own_footage():
+    created = to_create(
+        _job(),
+        Violation(type="red_light_running", track_id=7, frame_index=900),
+        _window(),
+        ANCHOR,
+    )
+
+    assert created.source_id == "src-1"
+    assert created.frame_index == 900
+    assert created.type is ViolationType.RED_LIGHT_RUNNING
+    assert created.detected_at == ANCHOR + timedelta(seconds=30)
+
+
+def test_the_row_carries_the_violation_s_own_frame_not_the_loop_s():
+    # A module working on a clip reports several frames late, and recording the loop's
+    # position would misdate it by the length of the window.
+    created = to_create(
+        _job(),
+        Violation(type="red_light_running", track_id=7, frame_index=870),
+        _window(),
+        ANCHOR,
+    )
+
+    assert created.frame_index == 870
+
+
+def test_the_violator_is_summarised_as_a_vehicle():
+    created = to_create(
+        _job(), Violation(type="red_light_running", track_id=7, frame_index=900), _window(), ANCHOR
+    )
+
+    assert [v.track_id for v in created.metadata.vehicles] == [7]
+
+
+def test_a_violation_with_no_window_still_becomes_a_row():
+    # What the rules were holding at the end of a job. A violation with no history is
+    # still a violation.
+    created = to_create(
+        _job(), Violation(type="red_light_running", track_id=7, frame_index=900), None, ANCHOR
+    )
+
+    assert created.metadata.vehicles == []
+
+
+def test_the_counterparty_is_not_recorded_yet():
+    """The pedestrian rule's whole subject is somebody the module does not name in what
+    it returns, so `pedestrians` stays empty. Filling it in means either widening
+    Violation or having the analyzer keep every window rather than the ones that fired."""
+    created = to_create(
+        _job(),
+        Violation(type="pedestrian_right_of_way", track_id=7, frame_index=900),
+        _window(),
+        ANCHOR,
+    )
+
+    assert created.metadata.pedestrians == []
+
+
+def test_a_row_assembled_this_way_is_writable(con):
+    """The two halves meet: what to_create builds is what record takes."""
+    created = to_create(
+        _job(), Violation(type="red_light_running", track_id=7, frame_index=900), _window(), ANCHOR
+    )
+
+    violation_id = record(con, created)
+
+    assert con.execute(
+        "SELECT source_id, frame_index FROM traffic_violations WHERE id = ?", [violation_id]
+    ).fetchone() == ("src-1", 900)
+
+
+def test_an_unprojected_window_is_summarised_without_inventing_positions():
+    """A job with no calibration writes a trajectory of Nones beside a full set of
+    boxes. Honest about what was known, rather than plausible about what was not."""
+    window = TrackWindow(
+        track_id=7,
+        frame_indices=(899, 900),
+        positions=(None, None),
+        speeds=(None, None),
+        bboxes=((0, 0, 10, 10), (1, 1, 11, 11)),
+        class_names=("car", "car"),
+        timestamps=(None, None),
+    )
+
+    written = summary(window)
+
+    assert written.trajectory == [None, None]
+    assert written.speed == [None, None]
+    assert written.bboxes == [(0, 0, 10, 10), (1, 1, 11, 11)]
+
+
+def test_a_row_for_an_uncalibrated_job_survives_the_round_trip(con):
+    """The failure this guards is a validation error at write time, on exactly the
+    sites that have no calibration — which is a normal state, not an edge case."""
+    created = to_create(
+        _job(),
+        Violation(type="red_light_running", track_id=7, frame_index=900),
+        TrackWindow(
+            track_id=7,
+            frame_indices=(900,),
+            positions=(None,),
+            speeds=(None,),
+            bboxes=((0, 0, 10, 10),),
+            class_names=("car",),
+            timestamps=(None,),
+        ),
+        ANCHOR,
+    )
+
+    violation_id = record(con, created)
+
+    blob = con.execute(
+        "SELECT json_blob FROM violation_metadata WHERE traffic_violation_id = ?",
+        [violation_id],
+    ).fetchone()[0]
+    assert ViolationMetadata.model_validate_json(blob).vehicles[0].trajectory == [None]

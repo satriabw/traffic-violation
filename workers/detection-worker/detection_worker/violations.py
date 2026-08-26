@@ -7,8 +7,81 @@ configuration — resolve by version and are handled elsewhere.
 import json
 import sqlite3
 import uuid
+from datetime import datetime, timedelta
 
-from shared.models.violation import ViolationCreate
+from evidence_collector import TrackWindow
+from shared.models.detection import DetectionJob, ViolationType
+from shared.models.violation import (
+    TrackSummary,
+    ViolationCreate,
+    ViolationMetadata,
+)
+from violation_detector import Violation
+
+
+def summary(window: TrackWindow) -> TrackSummary:
+    """One track's window, in the shape the metadata blob keeps.
+
+    A rename and nothing else. The four parallel lists are the same four the window
+    already holds, in the same order — the evidence package answers in its own
+    vocabulary because it depends on nothing, and this is the whole cost of that.
+
+    Nothing is filled in on the way past. A frame nothing projected keeps its None,
+    which is why `TrackSummary` accepts one: a job with no calibration writes a
+    trajectory of Nones beside a full set of boxes, and that is an honest record of
+    what was known rather than a plausible one of what was not.
+    """
+    return TrackSummary(
+        track_id=window.track_id,
+        trajectory=list(window.positions),
+        speed=list(window.speeds),
+        frame_idxs=list(window.frame_indices),
+        bboxes=list(window.bboxes),
+    )
+
+
+def detected_at(anchor: datetime, frame_index: int, fps: float | None) -> datetime:
+    """When in the footage this happened, as a moment.
+
+    The frame index is the offset; `anchor` turns it into a time. A source with no
+    probed frame rate cannot convert one into the other at all, so it reports the
+    anchor itself rather than inventing a rate — every violation in such a job lands on
+    the same timestamp, which is visibly wrong rather than quietly wrong.
+    """
+    if not fps or fps <= 0:
+        return anchor
+    return anchor + timedelta(seconds=frame_index / fps)
+
+
+def to_create(
+    job: DetectionJob,
+    violation: Violation,
+    window: TrackWindow | None,
+    anchor: datetime,
+) -> ViolationCreate:
+    """A firing rule and its record, as the row that gets written.
+
+    `violation.frame_index`, never the index of the frame being analysed when this was
+    produced. A module working on a clip reports several frames late, and recording the
+    loop's position would misdate it by the length of the window.
+
+    ONLY THE VIOLATOR IS SUMMARISED. Both rules that ship report against a vehicle, so
+    `vehicles` holds its window and `pedestrians` stays empty — even for the pedestrian
+    rule, whose whole subject is somebody the module does not name in what it returns.
+    Filling that in means either widening `Violation` or having the analyzer keep every
+    window rather than the ones that fired, and neither belongs in the change that
+    first makes a row appear.
+
+    `frames` stays empty by design: the pixels come back from the source on demand.
+    """
+    return ViolationCreate(
+        site_id=job.site_id,
+        source_id=job.source.source_id,
+        frame_index=violation.frame_index,
+        type=ViolationType(violation.type),
+        detected_at=detected_at(anchor, violation.frame_index, job.source.fps),
+        metadata=ViolationMetadata(vehicles=[summary(window)] if window else []),
+    )
 
 
 def record(con: sqlite3.Connection, violation: ViolationCreate) -> str:

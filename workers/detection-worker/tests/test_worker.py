@@ -1,3 +1,5 @@
+import sqlite3
+
 import numpy as np
 import pytest
 import supervision as sv
@@ -159,12 +161,27 @@ def _analyzers(
     return factory
 
 
-def _handler(sign=None, read=None, new_analyzer=None, load_context=None):
+class FakeStore:
+    """Records every violation it was asked to write, and numbers them."""
+
+    def __init__(self, fails_on: int | None = None):
+        self.saved: list = []
+        self._fails_on = fails_on
+
+    def __call__(self, violation) -> str:
+        self.saved.append(violation)
+        if self._fails_on is not None and len(self.saved) == self._fails_on:
+            raise sqlite3.IntegrityError("no such site")
+        return f"v-{len(self.saved)}"
+
+
+def _handler(sign=None, read=None, new_analyzer=None, load_context=None, save=None):
     return make_handler(
         # A site with neither document is the default here: these tests are about
         # frames, detections and ids, and context has its own suite.
         load_context or (lambda job: JobContext()),
         new_analyzer or _analyzers(),
+        save or FakeStore(),
         sign=sign or (lambda key: "u"),
         read=read if read is not None else _reader_of(frame_count=0),
     )
@@ -513,3 +530,115 @@ def test_violations_held_back_until_the_end_do_not_invent_a_record(caplog):
 
     assert "violations=2" in caplog.text
     assert "evidence=0" in caplog.text
+
+
+# --- writing the row ----------------------------------------------------------
+
+
+def test_every_violation_becomes_a_row():
+    store = FakeStore()
+
+    _handler(
+        read=_reader_of(frame_count=3),
+        new_analyzer=_analyzers(detections_per_frame=1, violates=True),
+        save=store,
+    )(_job("job-1"))
+
+    assert len(store.saved) == 3
+
+
+def test_a_job_where_nothing_fired_writes_nothing():
+    store = FakeStore()
+
+    _handler(read=_reader_of(frame_count=3), new_analyzer=_analyzers(1), save=store)(
+        _job("job-1")
+    )
+
+    assert store.saved == []
+
+
+def test_a_row_pins_the_video_it_came_from_and_the_frame():
+    # The whole reason no frames are uploaded: without these the evidence can never be
+    # re-derived. The frame is the violation's own, not the loop's position.
+    store = FakeStore()
+
+    _handler(
+        read=_reader_of(frame_count=1),
+        new_analyzer=_analyzers(detections_per_frame=1, violates=True),
+        save=store,
+    )(_job("job-1", start=900, end=1000))
+
+    written = store.saved[0]
+    assert (written.site_id, written.source_id, written.frame_index) == (
+        "site-1",
+        "source-1",
+        900,
+    )
+
+
+def test_a_row_carries_the_window_that_led_up_to_it():
+    store = FakeStore()
+
+    _handler(
+        read=_reader_of(frame_count=1),
+        new_analyzer=_analyzers(detections_per_frame=1, violates=True, window=3),
+        save=store,
+    )(_job("job-1", start=900, end=1000))
+
+    (vehicle,) = store.saved[0].metadata.vehicles
+    assert vehicle.track_id == 1
+    assert vehicle.frame_idxs == [898, 899, 900]
+
+
+def test_no_evidence_frames_are_written():
+    # Settled, not pending. The pixels come back from the source on demand.
+    store = FakeStore()
+
+    _handler(
+        read=_reader_of(frame_count=1),
+        new_analyzer=_analyzers(detections_per_frame=1, violates=True),
+        save=store,
+    )(_job("job-1"))
+
+    assert store.saved[0].metadata.frames == []
+
+
+def test_violations_held_back_until_the_end_are_still_written():
+    # They come with no window — the ring rolled past the frame they report on — and a
+    # violation with no history is still a violation.
+    store = FakeStore()
+
+    _handler(read=_reader_of(frame_count=2), new_analyzer=_analyzers(held=2), save=store)(
+        _job("job-1")
+    )
+
+    assert len(store.saved) == 2
+    assert store.saved[0].metadata.vehicles == []
+
+
+def test_the_rows_written_are_counted_in_the_summary(caplog):
+    with caplog.at_level("INFO"):
+        _handler(
+            read=_reader_of(frame_count=3),
+            new_analyzer=_analyzers(detections_per_frame=1, violates=True),
+            save=FakeStore(),
+        )(_job("job-1"))
+
+    assert "violations=3" in caplog.text
+    assert "recorded=3" in caplog.text
+
+
+def test_a_write_that_fails_stops_the_worker_and_keeps_what_landed():
+    # Failing loudly beats losing work quietly, and each write is its own transaction —
+    # so the rows already committed stay committed. Retries and a dead-letter queue are
+    # marked FUTURE in the LLD.
+    store = FakeStore(fails_on=2)
+
+    with pytest.raises(sqlite3.IntegrityError):
+        _handler(
+            read=_reader_of(frame_count=4),
+            new_analyzer=_analyzers(detections_per_frame=1, violates=True),
+            save=store,
+        )(_job("job-1"))
+
+    assert len(store.saved) == 2

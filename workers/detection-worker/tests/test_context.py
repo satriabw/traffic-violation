@@ -1,3 +1,5 @@
+from datetime import timezone
+
 import pytest
 from shared.db.connection import get_connection
 from shared.db.init import init_db
@@ -19,6 +21,12 @@ def con():
     connection = get_connection(":memory:")
     init_db(connection)
     connection.execute("INSERT INTO sites (id, name) VALUES ('s1', 'Junction 5')")
+    # The source every job here reads. Its created_at is what a violation's
+    # detected_at is measured from, so resolving context needs it to exist.
+    connection.execute(
+        "INSERT INTO site_sources (id, site_id, version, kind, stream_url)"
+        " VALUES ('src1', 's1', 1, 'stream', 'rtsp://camera')"
+    )
     return connection
 
 
@@ -71,7 +79,9 @@ def test_a_job_with_no_versions_resolves_to_no_context(con):
     def fetch(key):
         raise AssertionError(f"nothing should have been fetched, got {key}")
 
-    assert load(con, _job(), fetch_json=fetch, fetch_bytes=fetch) == JobContext()
+    resolved = load(con, _job(), fetch_json=fetch, fetch_bytes=fetch)
+
+    assert (resolved.calibration, resolved.configuration) == (None, None)
 
 
 def test_the_version_in_the_job_is_the_one_resolved_not_the_active_one(con):
@@ -114,7 +124,7 @@ def test_calibration_and_configuration_resolve_independently(con):
     # A calibration arrives as the document itself, unparsed — what is inside it is the
     # trajectory package's business, not this module's. A configuration is ours, so it
     # arrives parsed.
-    assert resolved == JobContext(calibration=b"%YAML:1.0", configuration={"roi": [2]})
+    assert (resolved.calibration, resolved.configuration) == (b"%YAML:1.0", {"roi": [2]})
 
 
 def test_only_one_of_the_two_being_present_is_fine(con):
@@ -204,3 +214,25 @@ def test_a_window_that_is_not_positive_stops_the_job(con, declared):
 def test_a_window_that_is_not_a_number_stops_the_job(con, declared):
     with pytest.raises(ConfigurationInvalid, match="evidence_seconds must be a number"):
         _with_configuration(con, _document(evidence_seconds=declared))
+def test_the_context_carries_the_anchor_a_detected_at_is_measured_from(con):
+    """The frame index gives the offset into the footage; this turns it into a moment.
+
+    It is the upload time, not the recording time — nothing in the system knows when
+    footage was shot — so it is late by a constant per source, which leaves violations
+    correctly ordered and spaced within a video.
+    """
+    anchor = load(con, _job()).source_created_at
+
+    assert anchor == con.execute(
+        "SELECT created_at FROM site_sources WHERE id = 'src1'"
+    ).fetchone()[0].replace(tzinfo=timezone.utc)
+    # Aware, because detected_at is written aware and one column holding both kinds is
+    # a comparison that raises the first time anyone sorts it.
+    assert anchor.tzinfo is not None
+
+
+def test_a_job_naming_a_source_that_is_not_in_the_database_is_an_error(con):
+    """The message and the database disagree. A job that cannot say when its
+    violations happened should stop rather than guess."""
+    with pytest.raises(ContextMissing, match="source no-such-source does not exist"):
+        load(con, _job(source=JobSource(source_id="no-such-source", version=1, key="k")))
