@@ -15,11 +15,15 @@ from violation_detector import (
     Violation,
 )
 
+from evidence_collector import EvidenceCollector, FrameBuffer, ObjectState
+
 from detection_worker.analysis.frame_analyzer import (
     FrameAnalyzer,
+    _object_states,
     _tracked_objects,
     make_analyzer,
 )
+from detection_worker.context import DEFAULT_EVIDENCE_SECONDS
 from detection_worker.detection.tracker import DEFAULT_FPS
 
 
@@ -550,3 +554,236 @@ def test_a_configuration_that_cannot_be_parsed_stops_the_job():
             configuration={"version": 99, "violations": ["rlr_violation"], "regions": {}},
             new_tracker=_trackers(),
         )
+
+
+# --- evidence ---------------------------------------------------------------
+#
+# The record of what led up to a violation. Kept every frame, read on the few where
+# something fires. What is kept is where each object was, never the pixels.
+
+
+class QuietDetector(Detector):
+    """Fires on demand, so a test can say exactly which frames produced a violation."""
+
+    def __init__(self, on: dict[int, list[int]] | None = None):
+        super().__init__()
+        self._on = on or {}
+
+    def detect(self, frame, tracked_objects, frame_index):
+        return [
+            Violation(type="red_light_running", track_id=track_id, frame_index=frame_index)
+            for track_id in self._on.get(frame_index, [])
+        ]
+
+    def finish(self):
+        return []
+
+
+def _analyzer(detector=None, evidence=None, detections=2, **kwargs):
+    return FrameAnalyzer(
+        FakeModel(detections_per_frame=detections, **kwargs),
+        FakeTracker(),
+        FakeCollector(),
+        detector or QuietDetector(),
+        evidence,
+    )
+
+
+def test_a_frame_that_fires_nothing_carries_no_evidence():
+    # Almost every frame of almost every video. Reading a window here would be work
+    # done to produce something nobody asked for.
+    result = _analyzer().analyze(_frame(), index=900)
+
+    assert result.evidence == {}
+
+
+def test_a_violation_arrives_with_the_frames_that_led_up_to_it():
+    analyzer = _analyzer(QuietDetector(on={904: [1]}))
+
+    for index in range(900, 905):
+        result = analyzer.analyze(_frame(), index=index)
+
+    window = result.evidence[1]
+    assert window.frame_indices == (900, 901, 902, 903, 904)
+
+
+def test_the_frame_it_fired_on_is_part_of_the_record():
+    # The violation is the end of the story, not something that happened after it. This
+    # is what the `+ 1` in the ring's sizing is for.
+    analyzer = _analyzer(QuietDetector(on={900: [1]}))
+
+    result = analyzer.analyze(_frame(), index=900)
+
+    assert result.evidence[1].frame_indices == (900,)
+
+
+def test_nothing_after_the_violation_is_in_the_record():
+    analyzer = _analyzer(QuietDetector(on={901: [1]}))
+
+    for index in range(900, 904):
+        result = analyzer.analyze(_frame(), index=index)
+        if index == 901:
+            fired = result.evidence[1]
+
+    assert fired.frame_indices == (900, 901)
+
+
+def test_only_the_track_that_fired_is_recorded():
+    analyzer = _analyzer(QuietDetector(on={900: [2]}))
+
+    result = analyzer.analyze(_frame(), index=900)
+
+    assert list(result.evidence) == [2]
+
+
+def test_two_rules_convicting_one_vehicle_share_the_one_history():
+    # Keyed by track id rather than aligned with the violations, so the history they
+    # both describe is carried once.
+    class TwoRules(Detector):
+        def detect(self, frame, tracked_objects, frame_index):
+            return [
+                Violation(type=type, track_id=1, frame_index=frame_index)
+                for type in ("red_light_running", "pedestrian_right_of_way")
+            ]
+
+        def finish(self):
+            return []
+
+    result = _analyzer(TwoRules()).analyze(_frame(), index=900)
+
+    assert len(result.violations) == 2
+    assert list(result.evidence) == [1]
+
+
+def test_the_record_keeps_boxes_and_positions_but_never_the_frame():
+    analyzer = _analyzer(QuietDetector(on={900: [1]}))
+
+    result = analyzer.analyze(_frame(), index=900)
+
+    window = result.evidence[1]
+    assert window.bboxes == ((0.0, 0.0, 10.0, 10.0),)
+    # FakeCollector names one trajectory per track at (track_id, 0.0).
+    assert window.positions == ((1.0, 0.0),)
+    assert window.speeds == (1.0,)
+
+
+def test_frames_where_a_track_was_absent_are_not_invented():
+    # Detection flickers. A car behind a bus for half a second is not a car that was
+    # nowhere, and padding the gap would invent evidence.
+    analyzer = FrameAnalyzer(
+        FakeModel(detections_per_frame=1), FakeTracker(), FakeCollector(),
+        QuietDetector(on={902: [1]}),
+    )
+    analyzer.analyze(_frame(), index=900)
+    analyzer._evidence.observe(901, [])
+    result = analyzer.analyze(_frame(), index=902)
+
+    assert result.evidence[1].frame_indices == (900, 902)
+
+
+def test_a_track_that_has_rolled_out_of_the_window_is_gone():
+    analyzer = _analyzer(
+        QuietDetector(on={903: [1]}), evidence=EvidenceCollector(FrameBuffer(frames=2))
+    )
+
+    for index in range(900, 904):
+        result = analyzer.analyze(_frame(), index=index)
+
+    assert result.evidence[1].frame_indices == (902, 903)
+
+
+def test_the_capacity_is_the_window_the_job_was_built_with():
+    # The handler needs it to tell a window that is short because the track had only
+    # just appeared from one that is short because the chunk started too late.
+    analyzer = _analyzer(evidence=EvidenceCollector.over(seconds=5, fps=30))
+
+    assert analyzer.evidence_capacity == 151
+
+
+def test_a_job_with_no_calibration_simply_records_no_positions():
+    # Nothing has to be configured for this. A job without a calibration produces no
+    # trajectories, so the record has no positions in it — the same absence, arrived at
+    # without anyone deciding anything.
+    analyzer = make_analyzer(
+        FakeModel(detections_per_frame=1), fps=30.0, new_tracker=lambda fps: FakeTracker()
+    )
+    analyzer.analyze(_frame(), index=900)
+
+    (window,) = analyzer._evidence.window_for()
+    assert window.positions == (None,)
+    assert window.bboxes != ()
+
+
+def test_the_record_is_sized_at_the_same_frame_rate_as_everything_else():
+    # A third thing that scales by fps. A job whose tracker aged lost tracks at 30
+    # while its record held five seconds of something else would disagree with itself
+    # about how much time a frame is worth.
+    analyzer = make_analyzer(FakeModel(), fps=25.0, new_tracker=lambda fps: FakeTracker())
+
+    assert analyzer.evidence_capacity == round(DEFAULT_EVIDENCE_SECONDS * 25.0) + 1
+
+
+def test_a_job_whose_source_never_reported_a_frame_rate_falls_back_with_the_rest():
+    analyzer = make_analyzer(FakeModel(), fps=None, new_tracker=lambda fps: FakeTracker())
+
+    assert analyzer.evidence_capacity == round(DEFAULT_EVIDENCE_SECONDS * DEFAULT_FPS) + 1
+
+
+def test_what_the_rules_were_still_holding_arrives_without_a_window():
+    # A module flushing a partial clip reports on a frame the ring has already rolled
+    # past, so the window it would be handed describes the end of the job rather than
+    # the moment convicted — worse than none, because it would look right.
+    held = [Violation(type="red_light_running", track_id=1, frame_index=900)]
+    analyzer = _analyzer(FakeDetector(held=held))
+
+    analyzer.analyze(_frame(), index=930)
+
+    assert analyzer.finish() == held
+
+
+def test_the_record_adapter_joins_a_box_to_the_position_measured_from_it():
+    # The third adapter, and the last of the boundary. The two packages answer
+    # separately because neither knows about the other; this puts them back together.
+    objects = [TrackedObject(track_id=7, bbox=(0.0, 0.0, 10.0, 20.0), class_name="car")]
+    trajectories = {7: Trajectory(position=(12.5, -3.0), speed=8.25)}
+
+    assert _object_states(objects, trajectories) == [
+        ObjectState(
+            track_id=7,
+            bbox=(0.0, 0.0, 10.0, 20.0),
+            class_name="car",
+            position=(12.5, -3.0),
+            speed=8.25,
+        )
+    ]
+
+
+def test_a_track_with_no_position_is_still_recorded():
+    # An object above the horizon, or one in its filter's first frames, was visibly
+    # there. Its box is evidence; what to do about the missing position is decided per
+    # window, not per frame.
+    objects = [TrackedObject(track_id=7, bbox=(0.0, 0.0, 10.0, 20.0), class_name="car")]
+
+    (state,) = _object_states(objects, {})
+
+    assert (state.track_id, state.position, state.speed) == (7, None, None)
+
+
+def test_the_record_adapter_reports_nothing_for_an_untracked_frame():
+    assert _object_states([], {}) == []
+
+
+def test_the_window_it_is_given_is_the_window_it_records():
+    # A number, not a document. make_analyzer is never handed a configuration to go
+    # digging in for it.
+    analyzer = make_analyzer(
+        FakeModel(), fps=30.0, seconds=2, new_tracker=lambda fps: FakeTracker()
+    )
+
+    assert analyzer.evidence_capacity == 61
+
+
+def test_an_analyzer_told_nothing_falls_back_to_the_default_window():
+    analyzer = make_analyzer(FakeModel(), fps=30.0, new_tracker=lambda fps: FakeTracker())
+
+    assert analyzer.evidence_capacity == round(DEFAULT_EVIDENCE_SECONDS * 30.0) + 1

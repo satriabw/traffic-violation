@@ -28,6 +28,11 @@ dependencies = [
     # repository — not shared, not this worker, and no detection library. The two
     # adapters in analysis.frame_analyzer are the whole of the boundary.
     "violation-detector",
+    # The few seconds leading up to a violation, kept as records rather than pixels.
+    # A third distribution on the same terms as the two above, and the only one with no
+    # dependencies at all — keeping a ring of the recent past is a deque and some
+    # tuples. `_object_states` in analysis.frame_analyzer is the whole of its boundary.
+    "evidence-collector",
     # boto3 (to sign its own download urls), the job model, and the shared database
     # connection all come with shared. Still no http client: the worker reads the same
     # SQLite file as site-service but never calls it — see detection_worker.db.

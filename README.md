@@ -5,7 +5,7 @@
 ```
 python3 -m venv .venv
 .venv/bin/pip install -e ./shared -e ./packages/trajectory-collector \
-  -e ./packages/violation-detector \
+  -e ./packages/violation-detector -e ./packages/evidence-collector \
   -e ./services/site-service -e ./workers/detection-worker
 ```
 
@@ -89,7 +89,7 @@ PYTHONPATH=shared/src:services/site-service .venv/bin/uvicorn site_service.main:
 
 # 3. the detection worker
 set -a; source .env; set +a
-PYTHONPATH=shared/src:packages/trajectory-collector/src:packages/violation-detector/src:workers/detection-worker \
+PYTHONPATH=shared/src:packages/trajectory-collector/src:packages/violation-detector/src:packages/evidence-collector/src:workers/detection-worker \
   .venv/bin/python -m detection_worker.worker
 ```
 
@@ -341,7 +341,7 @@ worker's entrypoint ordinary Python rather than a framework's. `LPUSH` at the he
 `BRPOP` at the tail — that pairing is what makes it FIFO.
 
 ```
-PYTHONPATH=shared/src:packages/trajectory-collector/src:packages/violation-detector/src:workers/detection-worker \
+PYTHONPATH=shared/src:packages/trajectory-collector/src:packages/violation-detector/src:packages/evidence-collector/src:workers/detection-worker \
   .venv/bin/python -m detection_worker.worker
 ```
 
@@ -435,6 +435,72 @@ on the frame a vehicle *enters* a region, not on every frame it spends there. A 
 already inside the box when the light changed was caught by the change rather than
 running it; a car already stopped in a crossing when somebody steps off the kerb has
 not failed to give way to them. Neither is an offence, and neither is reported.
+
+## The record a violation carries
+
+A violation on its own is a type, a track id and a frame number, which is enough to
+find it and nothing like enough to review it. What makes it reviewable is the few
+seconds before it: the approach, the speed the vehicle was carrying, whether anybody
+was already in the crossing.
+
+That work lives in **`packages/evidence-collector/`**, a fourth distribution with **no
+dependencies at all** — not numpy, not OpenCV, and nothing from this repository.
+
+```python
+from evidence_collector import EvidenceCollector
+
+collector = EvidenceCollector.over(seconds=5, fps=30)
+collector.observe(frame_index, object_states)     # every frame, empty ones included
+windows = collector.window_for([track_id])        # the lead-up, oldest first
+```
+
+**It keeps records, not pixels.** Where each object was and how fast it was going,
+against the frame index that finds the moment in the footage again — some hundreds of
+bytes a frame against megabytes for the image. The pixels are re-derived from the
+source when somebody opens the detail view, by whatever knows how to draw them then,
+rather than guessed at now by the process that happened to be running. `frames` in a
+violation's metadata stays empty at write time, deliberately.
+
+**The window ends at the violation.** By the time a rule fires the thing has already
+happened, and `prev_in_roi` means a track is convicted once per crossing rather than on
+every frame of it. What came after is the consequence and is still in the source.
+Buffering forward would mean holding every frame until enough future had arrived to
+prove nothing happened, on the overwhelming majority of frames where nothing ever does.
+
+**How long a window is, is the site's decision.** `evidence_seconds` is a top-level
+key in the configuration document, beside `violations` and `regions`; a site that says
+nothing gets five seconds. A junction is the thing that knows better — an approach with
+a long sight line wants more, a tight one-way needs less.
+
+It is read in `detection_worker.context`, where the document is already in hand, and
+travels on as a plain number — nothing downstream is handed the document to go digging
+in. Not by `Configuration.from_document` either: how long to keep records is a question
+about evidence, not about traffic rules, and the rules package has no business holding
+an answer to it. Its parser leaves unknown top-level keys alone precisely so a document
+can carry something like this. A value that is not a positive number stops the job
+before a frame is decoded, by name.
+
+The ring holds `seconds * fps + 1`. The `+ 1` is the moment itself, since the frame is
+recorded before the window is read — and the pipeline this is ported from bears the
+number out: its output for a convicted car carries ninety-five frames of lead-up at
+19fps, and the car is outside the region of interest on every one of them.
+
+**Keep the window no longer than the overlap between chunks.** One that reaches back
+past the start of a chunk is truncated in silence, and the record just looks shorter.
+Nothing can check that, because a chunk's overlap is not in the document — so the
+handler logs `short=`, and a few is ordinary while mostly-all means the window has
+outgrown the overlap.
+
+The join between a rule's boxes and a collector's ground positions is
+`frame_analyzer._object_states`, the third and last adapter on that boundary.
+
+**The record computes nothing.** Every number in it is a number something else
+produced. A job with no calibration produces no trajectories, so its records simply
+carry no positions — `None` beside a full set of boxes, rather than image coordinates
+standing in for metres. Nothing has to be configured for that; it is the same absence,
+arrived at without anyone deciding anything.
+
+## Which rules a job runs
 
 Which rules a job runs is the intersection of two things. The site's configuration says
 what this junction is annotated for; the job's `types` say what was asked for. Either
@@ -637,6 +703,7 @@ against.
 {
   "version": 1,
   "violations": ["rlr_violation"],
+  "evidence_seconds": 5,
   "regions": {
     "lanes":          [{"id": "lane_1", "points": [[115, 640], [232, 1069], [807, 1067], [354, 639]]}],
     "traffic_lights": [{"id": "tl_1", "points": [[33, 470], [31, 516], [50, 519], [53, 458]],

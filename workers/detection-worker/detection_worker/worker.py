@@ -5,10 +5,16 @@ created against, reads the frames it asks for, and hands each frame to an analyz
 The pipeline now runs end to end: detection, tracking, ground positions, and the rules
 a site's configuration asks for.
 
-What a firing rule produces is counted and logged, and goes no further. Turning a
-`Violation` into a row means cropping evidence frames, uploading them, assembling a
-`ViolationCreate` and calling `detection_worker.violations.record` — which is the next
-piece of work, and deliberately not this one. The seam is `FrameResult.violations`.
+What a firing rule produces is counted and logged, and goes no further — but it now
+arrives with the few seconds that led up to it. Turning a `Violation` and its window
+into a row means assembling a `ViolationCreate` and calling
+`detection_worker.violations.record`, which is the next piece of work and deliberately
+not this one. The seam is `FrameResult.violations` and `FrameResult.evidence`.
+
+NO FRAMES ARE UPLOADED HERE, and that is settled rather than pending. The record keeps
+the frame index, and the source is an immutable object in storage that can be seeked
+back into, so the pixels are re-derived when somebody opens the detail view — by
+whatever knows how to draw them then, rather than by this process guessing now.
 
 Everything here is per-job. Per-frame work lives in `detection_worker.analysis`.
 """
@@ -67,10 +73,21 @@ def make_handler(
         # because it is built *from* it — a job's calibration is what the trajectory
         # collector projects with.
         analyzer = new_analyzer(job, job_context)
+        # Read once, before the loop. It is a property of the job, and asking the
+        # analyzer per frame would be the same answer every time.
+        capacity = analyzer.evidence_capacity
 
         read_count = 0
         detection_count = 0
         violation_count = 0
+        evidence_count = 0
+        # Windows that came back shorter than the ring can hold. A track seen for half
+        # a second only has half a second of history and is unremarkable, but so is a
+        # violation early in a chunk that reaches back past its own first frame — and
+        # the second one is a truncated record that looks exactly like a short one.
+        # Counted rather than warned about per violation, because the number that
+        # matters is whether it is a handful or all of them.
+        short_windows = 0
         seen_tracks: set[int] = set()
         located_tracks: set[int] = set()
 
@@ -83,6 +100,10 @@ def make_handler(
             seen_tracks.update(ids)
             located_tracks.update(result.trajectories)
             violation_count += len(result.violations)
+            evidence_count += len(result.evidence)
+            short_windows += sum(
+                1 for window in result.evidence.values() if len(window) < capacity
+            )
 
             # Per-frame detail is DEBUG because a 30-second chunk is ~900 of these,
             # and the summary below is what anyone watching a normal run wants.
@@ -102,7 +123,8 @@ def make_handler(
 
         logger.info(
             "detection job %s site=%s source=%s v%d calib=%s config=%s frames=%d-%d "
-            "read=%d detections=%d tracks=%d located=%d violations=%d types=%s",
+            "read=%d detections=%d tracks=%d located=%d violations=%d evidence=%d "
+            "short=%d types=%s",
             job.id,
             job.site_id,
             job.source.source_id,
@@ -130,6 +152,15 @@ def make_handler(
             # both normal, and neither distinguishable from a clean stretch of footage
             # by this number alone.
             violation_count,
+            # How many of those came with a history. Short of `violations` only where
+            # two rules convicted one vehicle on one frame, since they share the one
+            # window that describes them both.
+            evidence_count,
+            # How many of those histories were cut short. A few is ordinary — objects
+            # that had only just appeared. Most of them, on a job that is not the first
+            # chunk of its video, means the window is longer than the overlap between
+            # chunks and every record is missing its approach.
+            short_windows,
             [t.value for t in job.types],
         )
 
@@ -188,6 +219,9 @@ def main() -> None:
                 # ViolationType to the names a configuration document uses. The
                 # registry is the only place that knows both.
                 [t.value for t in job.types],
+                # A number, not a document. Which number is the site's decision, taken
+                # where its configuration was resolved.
+                seconds=job_context.evidence_seconds,
             ),
         ),
     )
