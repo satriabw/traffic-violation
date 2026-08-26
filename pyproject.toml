@@ -3,6 +3,7 @@ pythonpath = [
     "shared/src",
     "packages/trajectory-collector/src",
     "packages/violation-detector/src",
+    "packages/evidence-collector/src",
     "services/site-service",
     "workers/detection-worker",
 ]
