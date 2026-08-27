@@ -1,13 +1,20 @@
 """S3 helper, used against Cloudflare R2.
 
-Only presigning and existence checks live here: file bytes never pass through any
-service, so there is deliberately no upload() or download() call to reach for.
+Mostly presigning and existence checks. THE RULE IS THAT FILE BYTES NEVER PASS THROUGH
+A REQUEST PATH — a client uploading a video gets a presigned URL and talks to R2
+itself, and no service ever holds the body — which is why there is no download() here
+and never will be.
 
-One bounded exception exists outside this module. shared.video.probe hands a
+`upload()` is not an exception to that rule; it is on the other side of it. A worker
+that produced an artifact is the origin of those bytes, not a relay for somebody
+else's, and it has nowhere to hand them but storage. Evidence-worker cuts a thumbnail
+and a clip out of a source video and puts them here. Nothing serving an HTTP request
+may call it.
+
+One bounded exception does exist outside this module. shared.video.probe hands a
 presigned URL to ffprobe, which range-requests a video's container header — a couple
 of megabytes whatever the object's size — to read its metadata once at source
-creation. That is a header read, not a transfer, and it is still no reason to add a
-download() here.
+creation. That is a header read, not a transfer.
 """
 
 import json
@@ -93,6 +100,25 @@ def download_url(key: str, expires_in: int | None = None) -> str:
     """Prefer the public URL when one is configured — it is stable and cacheable —
     and fall back to a presigned URL, which always works but expires."""
     return public_url(key) or presigned_get(key, expires_in)
+
+
+def upload(key: str, path: str, content_type: str | None = None) -> str:
+    """Put a local file at `key`, and give the key back.
+
+    A path rather than bytes, because every caller has just written a file: ffmpeg
+    produces one, and reading it into memory only to hand it to boto3 — which would
+    stream it from disk anyway — buys nothing.
+
+    Returns the key it was given, so a caller can write `thumbnail_key=upload(...)`
+    without repeating it. The key is what goes on the row; a URL is minted per read.
+
+    Overwrites. Keys are namespaced by the id of the thing they belong to, so the only
+    way to collide is to cut the same violation twice — which is a retry, and wants the
+    second cut to win rather than to fail.
+    """
+    extra = {"ContentType": content_type} if content_type else None
+    get_client().upload_file(path, config.S3_BUCKET, key, ExtraArgs=extra)
+    return key
 
 
 def get_json(key: str) -> dict:

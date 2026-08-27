@@ -1,0 +1,24 @@
+[project]
+name = "evidence-worker"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    # ONE DEPENDENCY, and that is the argument for this being its own distribution
+    # rather than a module in detection-worker. That one brings onnxruntime, supervision
+    # and three local packages, and its image adds a CUDA runtime, a pinned
+    # onnxruntime-gpu and a cuDNN from pip — none of which is needed to seek a video and
+    # copy some frames out of it. Here `shared` carries boto3, the job model, the queue
+    # and the database connection, and nothing else is imported at all.
+    #
+    # NOT opencv, and not numpy: the cut is two ffmpeg invocations, so no picture data
+    # is ever decoded in this process. ffmpeg itself is a system package — see
+    # docker/evidence-worker.Dockerfile.
+    "shared",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["evidence_worker*"]

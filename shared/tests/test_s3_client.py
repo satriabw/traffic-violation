@@ -149,3 +149,41 @@ def test_get_bytes_closes_the_body(monkeypatch):
     client.get_bytes("calibration/f1/camera_model.yml")
 
     assert body.closed
+
+
+def test_upload_puts_the_file_in_the_configured_bucket_under_its_key(monkeypatch, tmp_path):
+    path = tmp_path / "thumbnail.jpg"
+    path.write_bytes(b"jpeg")
+    calls = []
+    monkeypatch.setattr(
+        client.get_client(),
+        "upload_file",
+        lambda filename, bucket, key, ExtraArgs=None: calls.append(
+            (filename, bucket, key, ExtraArgs)
+        ),
+    )
+
+    key = client.upload("evidence/v-1/thumbnail.jpg", str(path), "image/jpeg")
+
+    assert calls == [
+        (str(path), "test-bucket", "evidence/v-1/thumbnail.jpg", {"ContentType": "image/jpeg"})
+    ]
+    # The key comes back so a caller can write `thumbnail_key=upload(...)` rather than
+    # repeating it — the key is what goes on the row, never a URL.
+    assert key == "evidence/v-1/thumbnail.jpg"
+
+
+def test_upload_without_a_content_type_sends_no_extra_arguments(monkeypatch, tmp_path):
+    # None rather than {"ContentType": None}, which boto3 rejects.
+    path = tmp_path / "blob"
+    path.write_bytes(b"x")
+    calls = []
+    monkeypatch.setattr(
+        client.get_client(),
+        "upload_file",
+        lambda filename, bucket, key, ExtraArgs=None: calls.append(ExtraArgs),
+    )
+
+    client.upload("evidence/v-1/blob", str(path))
+
+    assert calls == [None]
