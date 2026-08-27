@@ -1,15 +1,18 @@
-"""Recording a violation.
+"""Turning what a rule reported into what gets recorded.
 
-The only thing in this process that writes. Reads — a site's calibration and
-configuration — resolve by version and are handled elsewhere.
+Shape only: this is where a `Violation` and the windows around it become a
+`ViolationCreate`. The SQL that writes one lives in `shared.db.violations`, because
+evidence-worker writes to the same tables afterwards and one copy of those statements
+is the only way they stay in step with the schema.
+
+`record` is re-exported here so callers keep one import for the whole job of
+recording a violation, which is how `worker.py` already reads.
 """
 
-import json
-import sqlite3
-import uuid
 from datetime import datetime, timedelta
 
 from evidence_collector import TrackWindow
+from shared.db.violations import record as record  # re-exported; see the module docstring
 from shared.models.detection import DetectionJob, ViolationType
 from shared.models.violation import (
     TrackSummary,
@@ -122,54 +125,3 @@ def to_create(
         ),
         metadata=scene(windows, violator_track_id=violation.track_id),
     )
-
-
-def record(con: sqlite3.Connection, violation: ViolationCreate) -> str:
-    """Write the violation and its metadata, and return the new id.
-
-    No evidence frames are uploaded, here or anywhere. The row pins the source and the
-    frame index, and the source is an immutable object in storage that can be seeked
-    back into, so the pixels are re-derived when somebody opens the detail view — by
-    whatever knows how to draw them then, rather than by this process guessing now.
-    `ViolationMetadata.frames` stays empty, and the ordering problem the LLD worried
-    about (a row pointing at frames nobody uploaded) cannot arise.
-
-    The two inserts share one transaction. Connections here are autocommit, so the
-    BEGIN is explicit — without it a crash between the statements leaves a violation
-    with no trajectories behind it, which reads as a detection nobody can review.
-    BEGIN IMMEDIATE rather than plain BEGIN so the write lock is taken up front and
-    two writers contend at the start rather than half way through.
-    """
-    violation_id = str(uuid.uuid4())
-    con.execute("BEGIN IMMEDIATE")
-    try:
-        con.execute(
-            """
-            INSERT INTO traffic_violations
-                (id, site_id, source_id, frame_index, calibration_id, configuration_id,
-                 type, detected_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                violation_id,
-                violation.site_id,
-                violation.source_id,
-                violation.frame_index,
-                violation.calibration_id,
-                violation.configuration_id,
-                violation.type.value,
-                violation.detected_at,
-            ],
-        )
-        con.execute(
-            """
-            INSERT INTO violation_metadata (id, traffic_violation_id, json_blob)
-            VALUES (?, ?, ?)
-            """,
-            [str(uuid.uuid4()), violation_id, violation.metadata.model_dump_json()],
-        )
-    except Exception:
-        con.execute("ROLLBACK")
-        raise
-    con.execute("COMMIT")
-    return violation_id

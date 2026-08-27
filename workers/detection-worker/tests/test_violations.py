@@ -188,7 +188,12 @@ def test_a_violation_naming_a_source_that_does_not_exist_leaves_nothing_behind(c
 
 
 def test_no_evidence_frames_are_recorded(con):
-    """Settled, not pending: the pixels come back from the source on demand."""
+    """Still empty, and now for a different reason.
+
+    The durable artifact this field was held open for exists — but it is a thumbnail
+    and a clip, on the row, where the list endpoint can reach them without joining this
+    table. Nothing writes `frames`.
+    """
     violation_id = record(con, _violation())
 
     blob = con.execute(
