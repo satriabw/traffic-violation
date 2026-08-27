@@ -4,7 +4,13 @@ import pytest
 
 from shared.db.connection import get_connection
 from shared.db.init import init_db
-from shared.db.violations import EvidenceTarget, evidence_target, record, set_evidence
+from shared.db.violations import (
+    EvidenceTarget,
+    evidence_target,
+    list_for_setup,
+    record,
+    set_evidence,
+)
 from shared.models.detection import ViolationType
 from shared.models.violation import EvidenceStatus, ViolationCreate
 
@@ -34,17 +40,48 @@ def _source(con, metadata=None, source_id="src1", version=1):
     return source_id
 
 
-def _violation(con, source_id="src1", frame_index=912):
+def _violation(
+    con,
+    source_id="src1",
+    frame_index=912,
+    site_id="s1",
+    calibration_id=None,
+    configuration_id=None,
+    detected_at=DETECTED_AT,
+):
     return record(
         con,
         ViolationCreate(
-            site_id="s1",
+            site_id=site_id,
             source_id=source_id,
             frame_index=frame_index,
+            calibration_id=calibration_id,
+            configuration_id=configuration_id,
             type=ViolationType.RED_LIGHT_RUNNING,
-            detected_at=DETECTED_AT,
+            detected_at=detected_at,
         ),
     )
+
+
+def _calibration(con, doc_id, version=1, site_id="s1"):
+    con.execute(
+        "INSERT INTO camera_calibrations (id, site_id, file_id, version)"
+        " VALUES (?, ?, 'f1', ?)",
+        [doc_id, site_id, version],
+    )
+    return doc_id
+
+
+def _configuration(con, doc_id, version=1, site_id="s1"):
+    con.execute(
+        "INSERT INTO configurations (id, site_id, file_id, version) VALUES (?, ?, 'f1', ?)",
+        [doc_id, site_id, version],
+    )
+    return doc_id
+
+
+def _ids(page):
+    return [item["id"] for item in page]
 
 
 # --- what record leaves behind ------------------------------------------------
@@ -209,3 +246,134 @@ def test_evidence_written_for_one_violation_leaves_the_others_alone(con):
     assert con.execute(
         "SELECT evidence_status FROM traffic_violations WHERE id = ?", [theirs]
     ).fetchone()[0] is None
+
+
+# --- listing a site's violations under one setup ------------------------------
+
+
+def test_the_list_is_scoped_to_the_setup_the_violations_were_judged_against(con):
+    # The whole point of the two id columns. A site re-calibrated yesterday still holds
+    # every violation found under the old camera model, and drawing those with today's
+    # polygons puts the vehicle outside the box it was convicted in.
+    _source(con)
+    old_cal, new_cal = _calibration(con, "cal1"), _calibration(con, "cal2", version=2)
+    cfg = _configuration(con, "cfg1")
+    under_old = _violation(con, calibration_id=old_cal, configuration_id=cfg)
+    _violation(con, calibration_id=new_cal, configuration_id=cfg)
+
+    page, total = list_for_setup(con, "s1", old_cal, cfg, limit=10, offset=0)
+
+    assert _ids(page) == [under_old]
+    assert total == 1
+
+
+def test_a_site_with_no_calibration_finds_the_violations_that_had_none(con):
+    # `calibration_id = NULL` is NULL, never true, so an `=` here would return an empty
+    # page for a site that is running perfectly well without a camera model. This test
+    # fails on `=` and passes on `IS`.
+    _source(con)
+    cfg = _configuration(con, "cfg1")
+    without = _violation(con, calibration_id=None, configuration_id=cfg)
+
+    page, total = list_for_setup(con, "s1", None, cfg, limit=10, offset=0)
+
+    assert _ids(page) == [without]
+    assert total == 1
+
+
+def test_a_violation_judged_under_a_calibration_is_not_returned_for_a_site_with_none(con):
+    # The other direction of the same clause: null-safe matching must still exclude,
+    # not wave everything through.
+    _source(con)
+    cal, cfg = _calibration(con, "cal1"), _configuration(con, "cfg1")
+    _violation(con, calibration_id=cal, configuration_id=cfg)
+
+    assert list_for_setup(con, "s1", None, cfg, limit=10, offset=0) == ([], 0)
+
+
+def test_one_site_never_sees_another_sites_violations(con):
+    con.execute("INSERT INTO sites (id, name) VALUES ('s2', 'Junction 6')")
+    con.execute(
+        "INSERT INTO site_sources (id, site_id, version, kind, file_id)"
+        " VALUES ('src2', 's2', 1, 'video', 'f1')"
+    )
+    mine = _violation(con, source_id=_source(con))
+    _violation(con, site_id="s2", source_id="src2")
+
+    page, total = list_for_setup(con, "s1", None, None, limit=10, offset=0)
+
+    assert _ids(page) == [mine]
+    assert total == 1
+
+
+def test_the_newest_violation_comes_first(con):
+    _source(con)
+    older = _violation(con, detected_at=datetime(2026, 8, 21, 9, 0, tzinfo=timezone.utc))
+    newer = _violation(con, detected_at=datetime(2026, 8, 21, 11, 0, tzinfo=timezone.utc))
+
+    page, _ = list_for_setup(con, "s1", None, None, limit=10, offset=0)
+
+    assert _ids(page) == [newer, older]
+
+
+def test_violations_sharing_a_moment_do_not_repeat_or_vanish_across_pages(con):
+    # One frame can fire a rule for more than one track, so a tie on detected_at is
+    # ordinary rather than exotic. Without the id tiebreak SQLite may order the tied
+    # rows differently per statement, and two pages read that way overlap.
+    _source(con)
+    recorded = {_violation(con) for _ in range(4)}
+
+    first, total = list_for_setup(con, "s1", None, None, limit=2, offset=0)
+    second, _ = list_for_setup(con, "s1", None, None, limit=2, offset=2)
+
+    assert total == 4
+    assert set(_ids(first)) | set(_ids(second)) == recorded
+    assert not set(_ids(first)) & set(_ids(second))
+
+
+def test_the_total_counts_the_whole_filter_not_the_page(con):
+    _source(con)
+    for _ in range(3):
+        _violation(con)
+
+    page, total = list_for_setup(con, "s1", None, None, limit=1, offset=0)
+
+    assert len(page) == 1
+    assert total == 3
+
+
+def test_the_list_carries_the_evidence_keys_without_reaching_for_the_blob(con):
+    # The reason the keys are columns. A page of violations has to render a thumbnail
+    # each, and violation_metadata is a separate table precisely so the list never
+    # touches it.
+    _source(con)
+    violation_id = _violation(con)
+    set_evidence(
+        con,
+        violation_id,
+        EvidenceStatus.READY,
+        thumbnail_key="evidence/v/thumbnail.jpg",
+        clip_key="evidence/v/clip.mp4",
+    )
+
+    (item,), _ = list_for_setup(con, "s1", None, None, limit=10, offset=0)
+
+    assert item["thumbnail_key"] == "evidence/v/thumbnail.jpg"
+    assert item["clip_key"] == "evidence/v/clip.mp4"
+    assert item["evidence_status"] == EvidenceStatus.READY.value
+    assert "metadata" not in item and "json_blob" not in item
+
+
+def test_a_violation_nobody_has_cut_evidence_for_carries_no_keys(con):
+    _source(con)
+    _violation(con)
+
+    (item,), _ = list_for_setup(con, "s1", None, None, limit=10, offset=0)
+
+    # All three None together — the state that says nothing will ever build this,
+    # which a reader has to tell apart from 'pending'.
+    assert (item["thumbnail_key"], item["clip_key"], item["evidence_status"]) == (
+        None,
+        None,
+        None,
+    )
