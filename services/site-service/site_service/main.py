@@ -11,6 +11,7 @@ from site_service.routers.detection import router as detection_router
 from site_service.routers.file import router as file_router
 from site_service.routers.site import router as site_router
 from site_service.routers.source import router as source_router
+from site_service.routers.violation import router as violation_router
 
 
 @asynccontextmanager
@@ -36,6 +37,7 @@ app.include_router(configuration_router, prefix=API_V1_PREFIX)
 app.include_router(file_router, prefix=API_V1_PREFIX)
 app.include_router(source_router, prefix=API_V1_PREFIX)
 app.include_router(detection_router, prefix=API_V1_PREFIX)
+app.include_router(violation_router, prefix=API_V1_PREFIX)
 
 
 @app.get("/health", include_in_schema=False)

@@ -618,6 +618,51 @@ happen.
 There is no retry and no dead-letter queue, the same as the detection queue. A `failed`
 row is visible, which is the difference from where this started.
 
+### Reading violations back
+
+```
+GET /api/v1/sites/{site_id}/violations?limit=20&offset=0
+```
+
+One page of the violations that hold under **the setup this site is running now**, each
+with its thumbnail and clip as links a reviewer can open.
+
+**There are no filter parameters, and the absence is the design.** The calibration and
+configuration are resolved here to the site's active versions — the same
+`get_active_version` the detection endpoint calls to pin a job's versions — so the list
+filters on the same notion of "active" that detection runs under rather than a second
+one free to disagree with it. Re-calibrate a site and the list changes without a single
+violation being touched. That is what `calibration_id` and `configuration_id` on the row
+are for: the old records are not invalidated, they simply stop describing the setup in
+force, and drawing them with today's polygons would put the vehicle outside the box it
+was convicted in.
+
+**A site with no calibration matches the violations that had none**, because its active
+version resolves to `None` and the filter underneath is null-safe — `IS`, not `=`, since
+`calibration_id = NULL` is NULL rather than true for every row and would hand an
+ordinary site running without a camera model an empty page. That also sweeps in anything
+recorded before those columns existed; the row cannot tell those two causes apart, and
+this takes the permissive reading rather than hiding rows a site genuinely holds.
+
+**The links are minted per read**, from the keys on the row, exactly the way a file's
+`download_url` is minted from `files.url` — a presigned URL written to a row is a fact
+that stops being true with nothing having changed. Both are `null` on anything that is
+not a finished cut, and no branch on `evidence_status` produces that: `set_evidence`
+rewrites both keys on every transition, so a key never survives without an object behind
+it.
+
+**No item carries the metadata blob.** `violation_metadata` is a separate table so that
+a page of violations does not drag every track's trajectory along at ~13.5KB per track,
+and the thumbnail the list actually wants is a column on the row for the same reason.
+A detail endpoint serving the boxes for one violation — what a reviewer needs to draw
+over the clip — is the obvious next piece and does not exist yet.
+
+Ordering is `detected_at DESC`, with the id breaking ties. The tiebreak is not
+decoration: one frame can fire a rule for more than one track, so violations sharing a
+`detected_at` are ordinary, and an ORDER BY they all tie on lets SQLite return them in
+any order it likes per statement — two pages read that way repeat one violation and skip
+another.
+
 ## Which rules a job runs
 
 Which rules a job runs is the intersection of two things. The site's configuration says
