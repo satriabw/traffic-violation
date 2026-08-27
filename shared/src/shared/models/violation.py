@@ -170,7 +170,35 @@ class ViolationResponse(BaseModel):
     thumbnail_key: str | None = None
     clip_key: str | None = None
     evidence_status: EvidenceStatus | None = None
+    # The same two objects, signed. Minted per read from the keys above rather than
+    # stored beside them, exactly as FileResponse.download_url is minted from
+    # files.url — a presigned link expires, so one written to a row would be a fact
+    # that stops being true without anything having changed.
+    #
+    # Both None wherever the key is. A key is only ever non-null on a row the worker
+    # finished, because set_evidence rewrites both keys on every transition including
+    # the Nones a 'pending' or 'failed' write carries — so there is no state where a
+    # key survives without an object behind it, and no second check on
+    # `evidence_status` to make here.
+    thumbnail_url: str | None = None
+    clip_url: str | None = None
     created_at: datetime
     updated_at: datetime
     # Absent on list reads, which never join the metadata table.
     metadata: ViolationMetadata | None = None
+
+
+class ViolationListResponse(BaseModel):
+    """A page of violations. Same shape as SiteListResponse, deliberately.
+
+    `items` never carries `metadata`: the blob is a separate table precisely so a page
+    of violations does not drag every track's trajectory along with it, and a list that
+    joined it would undo that at exactly the scale it was split to survive.
+    """
+
+    items: list[ViolationResponse]
+    # Every violation matching the filter, not the length of `items` — a caller
+    # paginating needs to know what it is paginating through.
+    total: int
+    limit: int
+    offset: int

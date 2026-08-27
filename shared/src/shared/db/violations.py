@@ -6,6 +6,11 @@ the footage that goes with it. Two processes, one pair of tables, and the SQL th
 touches them belongs in the place they both already depend on rather than copied into
 each — a second copy of an INSERT is a second copy free to fall behind the schema.
 
+There is one reader too, and it is here for the weaker version of the same reason: the
+column set it selects has to agree with the one `record` inserts, and site-service
+holding its own copy of that list is a copy free to drift. What it does NOT do is
+decide anything — the setup it filters on arrives already resolved.
+
 Reads of a site's calibration and configuration are NOT here. Those resolve by version
 and are only ever wanted by a job that is about to run, which is what keeps them in
 detection_worker.context.
@@ -17,6 +22,77 @@ import uuid
 from dataclasses import dataclass
 
 from shared.models.violation import EvidenceStatus, ViolationCreate
+
+
+# Everything the list read carries, which is every column on the row and none of the
+# blob beside it. Names are the model's field names, so a caller builds a
+# ViolationResponse straight off the dict without a translation table in between.
+_LIST_COLUMNS = (
+    "id", "site_id", "source_id", "frame_index",
+    "calibration_id", "configuration_id",
+    "type", "status", "detected_at", "explanation", "severity",
+    "thumbnail_key", "clip_key", "evidence_status",
+    "created_at", "updated_at",
+)
+
+# `IS` on the two document ids, NOT `=`, and that is the whole correctness of this
+# filter. A site with no calibration resolves to None, and `calibration_id = NULL` is
+# NULL rather than true for every row — so the ordinary case of a site running without
+# a camera model would return an empty page while holding violations. `IS` is SQLite's
+# null-safe equality and binds a parameter the same way, so one clause covers both
+# "judged under this calibration" and "judged under none".
+_SETUP_WHERE = "site_id = ? AND calibration_id IS ? AND configuration_id IS ?"
+
+
+def list_for_setup(
+    con: sqlite3.Connection,
+    site_id: str,
+    calibration_id: str | None,
+    configuration_id: str | None,
+    limit: int,
+    offset: int,
+) -> tuple[list[dict], int]:
+    """One page of a site's violations judged under one setup, and how many there are.
+
+    THE IDS ARE PASSED IN, ALREADY RESOLVED. Deciding which calibration is *active* is
+    a read of camera_calibrations, and this module deliberately does not do those — see
+    the note at the top. It also keeps the meaning of the filter at the caller: a
+    reader that wants the setup a site runs now and one that wants the setup a
+    particular job ran under ask the same question here with different arguments.
+
+    NO JOIN ON violation_metadata, which is the reason that table exists. A page of
+    violations carrying every track's trajectory is ~13.5KB per track per row, and the
+    thumbnail a list actually wants is on this row precisely so the list can render
+    without reaching for it.
+
+    Two statements rather than a window function: the count is over the whole filter
+    and the page is a slice of it, and a caller paginating needs both. They are read
+    on one autocommit connection with no writer in between worth serialising against —
+    a violation appearing between them costs a total that is low by one, not a page
+    that disagrees with itself.
+
+    Dicts rather than rows, keyed by column name. The tuple order is this module's
+    business and nobody else's, and a caller in another distribution zipping a column
+    list it imported from here would break silently the day a column moves.
+    """
+    params = [site_id, calibration_id, configuration_id]
+    total = con.execute(
+        f"SELECT COUNT(*) FROM traffic_violations WHERE {_SETUP_WHERE}", params
+    ).fetchone()[0]
+    rows = con.execute(
+        f"""
+        SELECT {', '.join(_LIST_COLUMNS)} FROM traffic_violations
+        WHERE {_SETUP_WHERE}
+        ORDER BY detected_at DESC, id
+        LIMIT ? OFFSET ?
+        """,
+        # `id` breaks the tie, and it is not decoration: several violations routinely
+        # share a detected_at — one frame can fire a rule for more than one track — and
+        # an ORDER BY they all tie on lets SQLite return them in any order it likes per
+        # statement. Two pages read that way can repeat a violation and skip another.
+        [*params, limit, offset],
+    ).fetchall()
+    return [dict(zip(_LIST_COLUMNS, row)) for row in rows], total
 
 
 def record(con: sqlite3.Connection, violation: ViolationCreate) -> str:
