@@ -40,6 +40,13 @@ S3_PUBLIC_BASE_URL = os.environ.get("S3_PUBLIC_BASE_URL", "").rstrip("/")
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 DETECTION_QUEUE_NAME = os.environ.get("DETECTION_QUEUE_NAME", "detection:jobs")
 
+# A second list, carrying one job per violation from detection-worker to
+# evidence-worker. Its own list rather than a type tag on the first: the two are
+# consumed by different processes at wildly different rates — one is a GPU decoding a
+# video, the other is ffmpeg cutting a few seconds out of one — and a shared list would
+# make each pop a message the popper cannot handle.
+EVIDENCE_QUEUE_NAME = os.environ.get("EVIDENCE_QUEUE_NAME", "evidence:jobs")
+
 
 # --- Detection model ------------------------------------------------------
 # A local filesystem path to an ONNX export. Pulling the weights from R2 instead —
