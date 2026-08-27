@@ -11,6 +11,7 @@ from shared.models.violation import TrackSummary, ViolationCreate, ViolationMeta
 from violation_detector import Violation
 
 from detection_worker import context
+from detection_worker import violations
 from detection_worker.violations import detected_at, record, summary, to_create
 
 DETECTED_AT = datetime(2026, 8, 21, 10, 0, tzinfo=timezone.utc)
@@ -490,3 +491,91 @@ def test_a_row_for_an_uncalibrated_job_survives_the_round_trip(con):
         [violation_id],
     ).fetchone()[0]
     assert ViolationMetadata.model_validate_json(blob).vehicles[0].trajectory == [None]
+
+
+# --- asking for the evidence --------------------------------------------------
+
+
+class FakeQueue:
+    """A queue that records what it was handed, or refuses to take it."""
+
+    def __init__(self, error: Exception | None = None, on_enqueue=None):
+        self.enqueued: list = []
+        self._error = error
+        self._on_enqueue = on_enqueue
+
+    def enqueue(self, job) -> None:
+        if self._on_enqueue:
+            self._on_enqueue()
+        if self._error:
+            raise self._error
+        self.enqueued.append(job)
+
+
+def _status(con, violation_id):
+    return con.execute(
+        "SELECT evidence_status FROM traffic_violations WHERE id = ?", [violation_id]
+    ).fetchone()[0]
+
+
+def test_queueing_evidence_asks_for_the_violation_that_was_written(con):
+    violation_id = record(con, _violation())
+    queue = FakeQueue()
+
+    violations.queue_evidence(con, queue, violation_id, 5.0)
+
+    assert [job.violation_id for job in queue.enqueued] == [violation_id]
+    assert _status(con, violation_id) == "pending"
+
+
+def test_the_job_carries_the_window_the_record_was_kept_over(con):
+    # The site's number, already resolved when the job's context was loaded. The
+    # violation row cannot answer for it — it lives in a configuration document in
+    # object storage — and reading it again over there would be an S3 fetch per
+    # violation for an answer this process is holding.
+    violation_id = record(con, _violation())
+    queue = FakeQueue()
+
+    violations.queue_evidence(con, queue, violation_id, 12.0)
+
+    assert [job.evidence_seconds for job in queue.enqueued] == [12.0]
+
+
+def test_the_row_says_pending_before_the_job_is_handed_over(con):
+    # The race this ordering exists for. Evidence-worker is a different process and may
+    # be idle; enqueue first and it can write 'ready' before this does anything, at
+    # which point 'pending' would overwrite a violation that already has its evidence.
+    violation_id = record(con, _violation())
+    seen = []
+    queue = FakeQueue(on_enqueue=lambda: seen.append(_status(con, violation_id)))
+
+    violations.queue_evidence(con, queue, violation_id, 5.0)
+
+    assert seen == ["pending"]
+
+
+def test_a_queue_that_refuses_the_job_does_not_stop_the_detector(con):
+    # The violation is already on disk. Giving up GPU throughput because a second queue
+    # is unreachable would trade the expensive half of the pipeline for the cheap one.
+    violation_id = record(con, _violation())
+
+    violations.queue_evidence(
+        con, FakeQueue(error=RuntimeError("no redis")), violation_id, 5.0
+    )
+
+    # Marked failed rather than left pending, which would be a promise nobody kept.
+    assert _status(con, violation_id) == "failed"
+
+
+def test_a_queue_that_refuses_the_job_says_why(con, caplog):
+    violation_id = record(con, _violation())
+
+    with caplog.at_level("ERROR"):
+        violations.queue_evidence(
+        con, FakeQueue(error=RuntimeError("no redis")), violation_id, 5.0
+    )
+
+    # The traceback, not just a message: a broad `except` that hides it makes a bug in
+    # here look exactly like Redis being down.
+    assert "no redis" in caplog.text
+    assert violation_id in caplog.text

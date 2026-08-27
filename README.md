@@ -495,10 +495,10 @@ one. `evidence=` in the job summary is what that scales with.
 
 **It keeps records, not pixels.** Where each object was and how fast it was going,
 against the frame index that finds the moment in the footage again — some hundreds of
-bytes a frame against megabytes for the image. The pixels are re-derived from the
-source when somebody opens the detail view, by whatever knows how to draw them then,
-rather than guessed at now by the process that happened to be running. `frames` in a
-violation's metadata stays empty at write time, deliberately.
+bytes a frame against megabytes for the image. The pixels are cut out of the source
+afterwards, by evidence-worker, and land as two columns on the violation's row rather
+than in this blob. `frames` in a violation's metadata stays empty, deliberately — see
+[The evidence a violation is reviewed with](#the-evidence-a-violation-is-reviewed-with).
 
 **The window ends at the violation.** By the time a rule fires the thing has already
 happened, and `prev_in_roi` means a track is convicted once per crossing rather than on

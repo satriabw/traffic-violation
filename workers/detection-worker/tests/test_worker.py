@@ -193,13 +193,21 @@ class FakeStore:
         return f"v-{len(self.saved)}"
 
 
-def _handler(sign=None, read=None, new_analyzer=None, load_context=None, save=None):
+def _handler(
+    sign=None,
+    read=None,
+    new_analyzer=None,
+    load_context=None,
+    save=None,
+    queue_evidence=None,
+):
     return make_handler(
         # A site with neither document is the default here: these tests are about
         # frames, detections and ids, and context has its own suite.
         load_context or (lambda job: JobContext()),
         new_analyzer or _analyzers(),
         save or FakeStore(),
+        queue_evidence=queue_evidence or (lambda violation_id, seconds: None),
         sign=sign or (lambda key: "u"),
         read=read if read is not None else _reader_of(frame_count=0),
     )
@@ -656,7 +664,8 @@ def test_a_row_carries_the_window_that_led_up_to_it():
 
 
 def test_no_evidence_frames_are_written():
-    # Settled, not pending. The pixels come back from the source on demand.
+    # Still empty, and now for a different reason: the thumbnail and the clip are
+    # columns on the row, cut by evidence-worker, not entries in this list.
     store = FakeStore()
 
     _handler(
@@ -707,3 +716,84 @@ def test_a_write_that_fails_stops_the_worker_and_keeps_what_landed():
         )(_job("job-1"))
 
     assert len(store.saved) == 2
+
+
+# --- asking for the evidence --------------------------------------------------
+
+
+def test_every_row_written_is_queued_for_a_cut():
+    store = FakeStore()
+    queued: list[str] = []
+
+    _handler(
+        read=_reader_of(frame_count=3),
+        new_analyzer=_analyzers(detections_per_frame=1, violates=True),
+        save=store,
+        queue_evidence=lambda violation_id, seconds: queued.append(violation_id),
+    )(_job("job-1"))
+
+    # By the id `save` handed back, which is the only thing that identifies the row it
+    # just wrote — the worker never sees a violation id before that.
+    assert queued == ["v-1", "v-2", "v-3"]
+
+
+def test_the_cut_is_asked_for_over_the_window_the_record_was_kept_over():
+    # The same number the analyzer sized its ring buffer with, so the clip covers
+    # exactly the frames the record holds boxes for. Anything else and the two disagree.
+    asked: list[tuple[str, float]] = []
+
+    _handler(
+        load_context=lambda job: JobContext(evidence_seconds=12.0),
+        read=_reader_of(frame_count=1),
+        new_analyzer=_analyzers(detections_per_frame=1, violates=True),
+        save=FakeStore(),
+        queue_evidence=lambda violation_id, seconds: asked.append((violation_id, seconds)),
+    )(_job("job-1"))
+
+    assert asked == [("v-1", 12.0)]
+
+
+def test_nothing_is_queued_for_a_violation_that_was_not_written():
+    # The order the handler writes in. A job naming a violation that is not in the
+    # database is one evidence-worker picks up, fails to find, and marks failed — a row
+    # poisoned by the sequence it was written in rather than by anything about it.
+    queued: list[str] = []
+
+    with pytest.raises(sqlite3.IntegrityError):
+        _handler(
+            read=_reader_of(frame_count=3),
+            new_analyzer=_analyzers(detections_per_frame=1, violates=True),
+            save=FakeStore(fails_on=2),
+            queue_evidence=lambda violation_id, seconds: queued.append(violation_id),
+        )(_job("job-1"))
+
+    assert queued == ["v-1"]
+
+
+def test_violations_held_back_until_the_end_are_queued_too():
+    # They carry no window, but the clip is cut from the source rather than from what
+    # the ring held — so a drained violation has exactly as much evidence available as
+    # one that fired mid-chunk, and skipping it would lose nothing but the evidence.
+    queued: list[str] = []
+
+    _handler(
+        read=_reader_of(frame_count=2),
+        new_analyzer=_analyzers(held=2),
+        save=FakeStore(),
+        queue_evidence=lambda violation_id, seconds: queued.append(violation_id),
+    )(_job("job-1"))
+
+    assert queued == ["v-1", "v-2"]
+
+
+def test_a_job_where_nothing_fired_queues_nothing():
+    queued: list[str] = []
+
+    _handler(
+        read=_reader_of(frame_count=3),
+        new_analyzer=_analyzers(1),
+        save=FakeStore(),
+        queue_evidence=lambda violation_id, seconds: queued.append(violation_id),
+    )(_job("job-1"))
+
+    assert queued == []

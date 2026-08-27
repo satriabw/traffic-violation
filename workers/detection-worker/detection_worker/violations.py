@@ -1,20 +1,24 @@
-"""Turning what a rule reported into what gets recorded.
+"""What happens when a rule fires.
 
-Shape only: this is where a `Violation` and the windows around it become a
-`ViolationCreate`. The SQL that writes one lives in `shared.db.violations`, because
-evidence-worker writes to the same tables afterwards and one copy of those statements
-is the only way they stay in step with the schema.
+Two things: the `Violation` and the windows around it become a `ViolationCreate`, and
+once that is written a cut of the footage is asked for.
 
-`record` is re-exported here so callers keep one import for the whole job of
-recording a violation, which is how `worker.py` already reads.
+The SQL that writes one lives in `shared.db.violations`, because evidence-worker writes
+to the same tables afterwards and one copy of those statements is the only way they
+stay in step with the schema. `record` is re-exported here so callers keep one import
+for the whole job of recording a violation, which is how `worker.py` already reads.
 """
 
+import logging
 from datetime import datetime, timedelta
 
 from evidence_collector import TrackWindow
 from shared.db.violations import record as record  # re-exported; see the module docstring
+from shared.db.violations import set_evidence
 from shared.models.detection import DetectionJob, ViolationType
+from shared.models.evidence import EvidenceJob
 from shared.models.violation import (
+    EvidenceStatus,
     TrackSummary,
     ViolationCreate,
     ViolationMetadata,
@@ -22,6 +26,47 @@ from shared.models.violation import (
 from violation_detector import PEDESTRIANS, Violation
 
 from detection_worker import context
+
+logger = logging.getLogger(__name__)
+
+
+def queue_evidence(con, queue, violation_id: str, evidence_seconds: float) -> None:
+    """Ask for this violation's thumbnail and clip to be cut.
+
+    `evidence_seconds` is the site's, resolved once when the job's context was loaded
+    and already used to size the ring buffer this violation's window came out of. It
+    travels on the message because the violation row cannot answer for it — it lives in
+    a configuration document in object storage — and because passing the number the
+    record was kept over is what makes the clip cover the same frames the record
+    describes. Reading it again over there would be an S3 fetch per violation for an
+    answer this process is holding.
+
+    PENDING IS WRITTEN FIRST, AND THE ORDER IS THE WHOLE OF THE DESIGN HERE. Enqueue
+    first and evidence-worker — a different process, possibly already idle — can finish
+    the cut and write 'ready' before this line runs, and 'pending' would then overwrite
+    a violation that already has its evidence. Writing first cannot lose that race: the
+    only thing that can follow it is the worker's own verdict.
+
+    A QUEUE THAT WILL NOT TAKE THE JOB DOES NOT STOP THE DETECTOR. This is the one place
+    in the worker that swallows an exception, and it is deliberate: everything else here
+    raises because losing a job silently is worse than stopping loudly, but the job in
+    question has already been recorded — the violation is safe on disk, and giving up
+    GPU throughput because a second queue is unreachable trades the expensive half of
+    the pipeline for the cheap one.
+
+    So the row is marked failed instead, which is a true statement — nothing is going to
+    produce this evidence — and one a backfill can find. `logger.exception` rather than
+    a message, because a broad `except` that hides its traceback is how a bug in here
+    would look exactly like Redis being down.
+    """
+    set_evidence(con, violation_id, EvidenceStatus.PENDING)
+    try:
+        queue.enqueue(
+            EvidenceJob(violation_id=violation_id, evidence_seconds=evidence_seconds)
+        )
+    except Exception:
+        logger.exception("could not queue evidence for violation %s", violation_id)
+        set_evidence(con, violation_id, EvidenceStatus.FAILED)
 
 
 def summary(window: TrackWindow) -> TrackSummary:
@@ -111,7 +156,8 @@ def to_create(
     for the red-light rule too whenever somebody happened to be there. Empty stays the
     ordinary answer on an empty crossing.
 
-    `frames` stays empty by design: the pixels come back from the source on demand.
+    `frames` stays empty by design. The thumbnail and the clip are columns on the row,
+    cut by evidence-worker once this has been written — not entries in this list.
     """
     return ViolationCreate(
         site_id=job.site_id,

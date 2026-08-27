@@ -111,9 +111,10 @@ class ViolationCreate(BaseModel):
 
     site_id: str
     # The source version the job was pinned to, and the frame within it. Together they
-    # are what lets evidence be re-derived on demand instead of uploaded here — see the
-    # DDL. The worker has both already: the job message carries the source it was
-    # created against, and a Violation carries its own frame index.
+    # are what evidence-worker seeks to when it cuts this violation's thumbnail and
+    # clip — and the only thing that could ever cut them again. The worker has both
+    # already: the job message carries the source it was created against, and a
+    # Violation carries its own frame index.
     #
     # REQUIRED HERE, though the columns are nullable. The columns had to give way to
     # rows that predate them; nothing being written now has that excuse, and this is
@@ -140,10 +141,10 @@ class ViolationCreate(BaseModel):
 class ViolationResponse(BaseModel):
     id: str
     site_id: str
-    # Carried on the way out too: whoever renders the detail view is the one that has
-    # to fetch the video and seek to the moment. None on a violation recorded before
-    # these existed — its evidence cannot be re-derived, and a reader that pretended
-    # otherwise would send someone looking for a video nothing named.
+    # Carried on the way out too: a reader that wants the footage itself, rather than
+    # the cut of it on the row, is the one that has to seek to the moment. None on a
+    # violation recorded before these existed — nothing can cut its evidence, which is
+    # exactly what a NULL `evidence_status` says beside it.
     source_id: str | None = None
     frame_index: int | None = None
     # Carried out too, because the reader is the one that needs them: filtering a site's
