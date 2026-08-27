@@ -6,8 +6,8 @@
 python3 -m venv .venv
 .venv/bin/pip install -e ./shared -e ./packages/trajectory-collector \
   -e ./packages/violation-detector -e ./packages/evidence-collector \
-  -e ./services/site-service -e ./workers/detection-worker \
-  -e ./workers/evidence-worker
+  -e ./services/site-service -e ./services/llm-service \
+  -e ./workers/detection-worker -e ./workers/evidence-worker
 ```
 
 Note: on macOS, `pip install -e` can silently no-op — files it creates starting
@@ -40,13 +40,23 @@ printf 'DOCKER_UID=%s\nDOCKER_GID=%s\n' "$(id -u)" "$(id -g)" >> .env
 docker compose up --build
 ```
 
-Four services — `redis`, `api`, `worker`, `evidence-worker` — and naming one starts
-just that one, so `docker compose up redis` is how you run the queue alone against
-host processes. Only `worker` wants the GPU; `evidence-worker` is `python:3.11-slim`
-plus ffmpeg and scales sideways (`--scale evidence-worker=3`). The
+Five services — `redis`, `api`, `worker`, `evidence-worker`, `llm-service` — and
+naming one starts just that one, so `docker compose up redis` is how you run the queue
+alone against host processes. Only `worker` wants the GPU; `evidence-worker` is
+`python:3.11-slim` plus ffmpeg and scales sideways (`--scale evidence-worker=3`). The
 API is on `127.0.0.1:8001`; reach it from another machine with
 `ssh -L 8001:localhost:8001` rather than by widening `API_BIND`, because nothing here
 authenticates anything.
+
+`llm-service` publishes no port at all. It spends an API key on every request and the
+only thing meant to ask it to is `api`, so it is reachable at `http://llm-service:8002`
+from the compose network and from nowhere on the host. It also checks a shared
+`LLM_SERVICE_TOKEN` header, which is what still holds the day somebody publishes a port
+to debug something. To exercise it directly, go through the container:
+
+```
+docker compose exec llm-service python -c "..."   # rather than curl from the host
+```
 
 The repository is bind-mounted at `/repo` and `PYTHONPATH` puts it ahead of the copy
 pip installed into the image, so an edit on the host is what runs — uvicorn reloads,
@@ -99,7 +109,14 @@ PYTHONPATH=shared/src:packages/trajectory-collector/src:packages/violation-detec
 # 4. the evidence worker
 set -a; source .env; set +a
 PYTHONPATH=shared/src:workers/evidence-worker .venv/bin/python -m evidence_worker.worker
+
+# 5. the explanation service
+set -a; source .env; set +a
+PYTHONPATH=shared/src:services/llm-service .venv/bin/uvicorn llm_service.main:app --reload --port 8002
 ```
+
+Running on the host, `llm-service` is on `127.0.0.1:8002` and `LLM_SERVICE_URL` has to
+say so — the default names the compose service, which resolves to nothing outside it.
 
 Source `.env` in **each** shell that needs it. The worker reads `REDIS_URL` from the
 same environment uvicorn does, so a worker started in an unsourced shell quietly talks

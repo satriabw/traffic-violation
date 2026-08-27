@@ -5,6 +5,7 @@ pythonpath = [
     "packages/violation-detector/src",
     "packages/evidence-collector/src",
     "services/site-service",
+    "services/llm-service",
     "workers/detection-worker",
     "workers/evidence-worker",
 ]

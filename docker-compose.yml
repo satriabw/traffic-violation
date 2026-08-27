@@ -106,6 +106,47 @@ services:
       redis:
         condition: service_healthy
 
+  # Explaining a violation, on demand, for whoever opens one. Its own service for two
+  # reasons. The provider behind it is going to change — that is the whole point of
+  # llm_service.providers — and the thing that changes should be replaceable without
+  # touching the service that owns the database. And the call takes as long as a model
+  # takes to think, which is not work that belongs in the process serving every other
+  # endpoint.
+  #
+  # NO `ports:`, deliberately. This service spends an API key on every request, and the
+  # only thing that should be able to ask it to is site-service. Unpublished, it is
+  # reachable at http://llm-service:8002 from the compose network and from nowhere on
+  # the host; the X-LLM-Token check in llm_service.main is the other half, for the day
+  # somebody adds a port mapping to debug something and forgets to take it out.
+  llm-service:
+    image: traffic-violation-llm
+    build:
+      context: .
+      dockerfile: docker/llm.Dockerfile
+    <<: *run-as-host-user
+    # ANTHROPIC_API_KEY above all, without which the service refuses to start and names
+    # what is missing — the same startup check site-service applies to object storage.
+    env_file:
+      - .env
+    environment:
+      PYTHONPATH: /repo/shared/src:/repo/services/llm-service
+    volumes: *repo-mount
+    # No database, no Redis, no object storage. It is handed a description of one event
+    # and returns an account of it, which is what keeps `depends_on` empty.
+    command: >
+      uvicorn llm_service.main:app
+      --host 0.0.0.0 --port 8002 --reload
+      --reload-dir /repo/services/llm-service
+      --reload-dir /repo/shared/src
+    healthcheck:
+      # /health takes no token: a liveness probe that can fail for authorisation
+      # reasons reports the wrong thing.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health')"]
+      interval: 10s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
   # Cutting the thumbnail and the clip for each violation the detector records. Its
   # own service rather than a thread inside `worker`, and the dependency lists are the
   # argument: that one needs a CUDA runtime and an ONNX session, this one needs ffmpeg.
