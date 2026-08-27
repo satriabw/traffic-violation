@@ -5,14 +5,14 @@ created against, reads the frames it asks for, and hands each frame to an analyz
 The pipeline now runs end to end: detection, tracking, ground positions, and the rules
 a site's configuration asks for.
 
-A firing rule now becomes a row. `detection_worker.violations` turns the `Violation`
-and the window that came with it into a `ViolationCreate` and writes it; the pipeline
-runs end to end.
+A firing rule now becomes a row, and then a second job. `detection_worker.violations`
+turns the `Violation` and the window that came with it into a `ViolationCreate`, writes
+it, and asks evidence-worker for a cut of the footage; the pipeline runs end to end.
 
-NO FRAMES ARE UPLOADED HERE, and that is settled rather than pending. The record keeps
-the frame index, and the source is an immutable object in storage that can be seeked
-back into, so the pixels are re-derived when somebody opens the detail view — by
-whatever knows how to draw them then, rather than by this process guessing now.
+NO FRAMES ARE CUT HERE, and that is the point of the second queue rather than a gap in
+this one. This process holds the GPU — the one resource that cannot be scaled sideways
+— and cutting a clip is ffmpeg and a network round trip. It goes to a worker that needs
+neither, on a queue, where the job outlives a process that dies.
 
 Everything here is per-job. Per-frame work lives in `detection_worker.analysis`.
 """
@@ -22,7 +22,7 @@ from typing import Any, Callable, Iterable
 
 from shared.models.detection import DetectionJob, FrameRange
 from shared.models.violation import ViolationCreate
-from shared.queue.client import from_config
+from shared.queue.client import evidence_from_config, from_config
 from shared.s3.client import presigned_get
 
 from detection_worker import context, violations
@@ -38,6 +38,7 @@ def make_handler(
     load_context: Callable[[DetectionJob], context.JobContext],
     new_analyzer: Callable[[DetectionJob, context.JobContext], FrameAnalyzer],
     save: Callable[[ViolationCreate], str],
+    queue_evidence: Callable[[str, float], None],
     sign: Callable[[str], str] = presigned_get,
     read: Callable[[str, FrameRange], Iterable[tuple[int, Any]]] = read_frames,
 ) -> Callable[[DetectionJob], None]:
@@ -47,12 +48,13 @@ def make_handler(
     `Callable[[DetectionJob], None]` and tests substitute a fake signer, reader and
     analyzer without S3, a video or a weights file anywhere in reach.
 
-    Neither argument has a default, unlike the two below them. Each of those has a
-    sensible production value; these two do not. `load_context` needs a database
-    connection, and defaulting it would mean quietly opening one — turning a missing
-    TRAFFIC_DB_PATH into a job that runs with no calibration rather than a worker that
-    will not start. `new_analyzer` needs the process's detection model, which is loaded
-    once in `main` and has nowhere to hide.
+    None of the first four has a default, unlike the two below them. Each of those has a
+    sensible production value; these do not. `load_context` needs a database connection,
+    and defaulting it would mean quietly opening one — turning a missing TRAFFIC_DB_PATH
+    into a job that runs with no calibration rather than a worker that will not start.
+    `new_analyzer` needs the process's detection model, which is loaded once in `main`
+    and has nowhere to hide. `queue_evidence` needs a Redis connection and the same
+    database handle `save` writes through, for the same reason.
     """
 
     def handle(job: DetectionJob) -> None:
@@ -107,8 +109,18 @@ def make_handler(
                 # end. A job that dies half way through has recorded what it saw up to
                 # then, which is worth more than nothing — and each write is its own
                 # transaction, so there is no batch to lose.
-                save(violations.to_create(job, violation, result.evidence, job_context))
+                violation_id = save(
+                    violations.to_create(job, violation, result.evidence, job_context)
+                )
                 recorded_count += 1
+                # After the write, never before: a job naming a violation that is not in
+                # the database yet is one evidence-worker would pick up, fail to find,
+                # and mark failed — a row poisoned by the order it was written in.
+                #
+                # The window goes with it: the same number the analyzer above sized its
+                # ring buffer with, so the clip covers exactly the frames the record it
+                # just wrote holds boxes for.
+                queue_evidence(violation_id, job_context.evidence_seconds)
                 # The violator's window alone, though the record now holds the whole
                 # scene. What this counts is whether a violation reached back past the
                 # start of its own chunk; every object that had only just walked into
@@ -134,7 +146,13 @@ def make_handler(
         # silence. These carry no window — see FrameAnalyzer.finish — and are recorded
         # anyway: a violation with no history is still a violation.
         for violation in analyzer.finish():
-            save(violations.to_create(job, violation, {}, job_context))
+            # Queued like any other. These carry no window, but the clip is cut from the
+            # source rather than from what the buffer held, so a drained violation has
+            # exactly as much evidence available as one that fired mid-chunk.
+            queue_evidence(
+                save(violations.to_create(job, violation, {}, job_context)),
+                job_context.evidence_seconds,
+            )
             violation_count += 1
             recorded_count += 1
 
@@ -229,12 +247,19 @@ def main() -> None:
     # that is missing or has no schema stops the worker while it still has no claim on
     # any job.
     con = get_db()
+    # A second connection to the same Redis, opened here for the same reason the first
+    # one is: before the queue is consumed, so a worker that cannot reach it says so
+    # rather than discovering it on the first violation of a long job.
+    evidence_queue = evidence_from_config()
     logger.info("detection-worker waiting for jobs")
     run(
         from_config(),
         make_handler(
             lambda job: context.load(con, job),
             save=lambda violation: violations.record(con, violation),
+            queue_evidence=lambda violation_id, seconds: violations.queue_evidence(
+                con, evidence_queue, violation_id, seconds
+            ),
             new_analyzer=lambda job, job_context: make_analyzer(
                 model,
                 job.source.fps,
