@@ -5,6 +5,7 @@ import pytest
 from shared.db import init
 from shared.db.connection import get_connection
 from shared.db.init import init_db
+from shared.models.violation import EvidenceStatus
 
 
 def _fresh():
@@ -319,6 +320,7 @@ def test_init_db_creates_the_violation_tables():
 
     assert _columns(con, "traffic_violations") == {
         "id", "site_id", "source_id", "frame_index",
+        "thumbnail_key", "clip_key", "evidence_status",
         "calibration_id", "configuration_id",
         "type", "status", "detected_at",
         "explanation", "severity", "created_at", "updated_at",
@@ -340,6 +342,47 @@ def test_traffic_violations_rejects_an_unknown_type():
 
     with pytest.raises(sqlite3.IntegrityError):
         con.execute(VIOLATION, ["v1", "jaywalking_backwards"])
+
+
+@pytest.mark.parametrize("status", list(EvidenceStatus))
+def test_the_evidence_statuses_the_enum_offers_are_the_ones_the_column_accepts(status):
+    # The CHECK constraint and the enum are two copies of the same three strings, in
+    # two languages, and nothing but this test makes them agree. Parametrised over the
+    # enum rather than a literal list so adding a member fails here instead of at the
+    # first write that uses it.
+    con = _with_source()
+    con.execute(VIOLATION, ["v1", "red_light_running"])
+
+    con.execute(
+        "UPDATE traffic_violations SET evidence_status = ? WHERE id = 'v1'",
+        [status.value],
+    )
+
+    assert con.execute(
+        "SELECT evidence_status FROM traffic_violations WHERE id = 'v1'"
+    ).fetchone()[0] == status.value
+
+
+def test_traffic_violations_rejects_an_unknown_evidence_status():
+    con = _with_source()
+    con.execute(VIOLATION, ["v1", "red_light_running"])
+
+    with pytest.raises(sqlite3.IntegrityError):
+        con.execute("UPDATE traffic_violations SET evidence_status = 'nearly' WHERE id = 'v1'")
+
+
+def test_a_violation_with_no_evidence_job_is_not_pending():
+    # The distinction the nullable column exists for. A row the detector has just
+    # written has no evidence yet and no job queued for it either, and that is not the
+    # same as one waiting on a worker — nothing will ever move it on. PR5 is what sets
+    # 'pending', at the moment the job is actually enqueued.
+    con = _with_source()
+
+    con.execute(VIOLATION, ["v1", "red_light_running"])
+
+    assert con.execute(
+        "SELECT thumbnail_key, clip_key, evidence_status FROM traffic_violations"
+    ).fetchone() == (None, None, None)
 
 
 def test_a_violation_recorded_before_the_source_columns_existed_keeps_its_row():

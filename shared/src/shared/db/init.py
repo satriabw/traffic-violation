@@ -102,10 +102,10 @@ TRAFFIC_VIOLATIONS_TABLE = """
 CREATE TABLE IF NOT EXISTS traffic_violations (
     id VARCHAR PRIMARY KEY,
     site_id VARCHAR NOT NULL REFERENCES sites(id),
-    -- WHICH VIDEO, AND WHERE IN IT. Evidence frames are not stored; they are
-    -- re-derived from the source when somebody opens the detail view, and without
-    -- these two a violation cannot say what to open or where to seek. A row that
-    -- cannot locate its own footage is a detection nobody can review.
+    -- WHICH VIDEO, AND WHERE IN IT. What evidence-worker seeks to when it cuts the
+    -- thumbnail and the clip below, and the only thing that could ever cut them
+    -- again. A row that cannot locate its own footage is a detection nobody can
+    -- review, and one nobody can re-derive either.
     --
     -- site_sources appends a row per version and its id is the primary key, so this
     -- pins the exact version on its own — a separate version column would be a second
@@ -126,6 +126,35 @@ CREATE TABLE IF NOT EXISTS traffic_violations (
     -- because variable-rate footage makes a time offset ambiguous — the same reason
     -- FrameRange is in frames and SourceMetadata keeps fps and nominal_fps apart.
     frame_index INTEGER,
+    -- THE BAKED EVIDENCE, and the state of the job that bakes it. Written by
+    -- evidence-worker once the violation row exists, never by the detector — cutting a
+    -- clip is ffmpeg and a network round trip, and doing it on the GPU box would spend
+    -- the one resource that cannot be scaled sideways.
+    --
+    -- ON THE ROW RATHER THAN IN violation_metadata, which is where the S3 keys of
+    -- evidence otherwise live. The list endpoint never joins that table — that is the
+    -- entire reason it is a separate one — and a thumbnail the list cannot reach
+    -- without a second query per violation is a thumbnail the list cannot render.
+    --
+    -- Object keys, not URLs, for the reason ViolationMetadata.frames already gives:
+    -- presigned links expire, so they are minted per read.
+    thumbnail_key VARCHAR,
+    clip_key VARCHAR,
+    -- 'pending' from the moment the job is queued, one of the other two once the
+    -- worker has finished with it.
+    --
+    -- SEPARATE FROM `status` BELOW, which is about the LLM explanation. The two move
+    -- independently — a violation can be explained while its clip is still cutting, or
+    -- explained after the cut failed — and one enum covering both would make those
+    -- states unrepresentable.
+    --
+    -- NULL is a fourth state rather than an oversight: every row written before this
+    -- column existed has no evidence and no queued job that will ever produce it. A
+    -- reader that showed a spinner for those would spin for good, which is why this is
+    -- worth distinguishing from 'pending' rather than defaulting.
+    evidence_status VARCHAR CHECK (
+        evidence_status IN ('pending', 'ready', 'failed')
+    ),
     -- WHICH CAMERA MODEL AND WHICH ANNOTATION THIS WAS JUDGED AGAINST. The job message
     -- pins both, so the run is reproducible; without them on the row the record is not.
     -- Two things need them. A reader asking "which violations hold under the setup this
@@ -205,6 +234,16 @@ ADDED_COLUMNS = (
     ("traffic_violations", "frame_index", "INTEGER"),
     ("traffic_violations", "calibration_id", "VARCHAR REFERENCES camera_calibrations(id)"),
     ("traffic_violations", "configuration_id", "VARCHAR REFERENCES configurations(id)"),
+    ("traffic_violations", "thumbnail_key", "VARCHAR"),
+    ("traffic_violations", "clip_key", "VARCHAR"),
+    (
+        "traffic_violations",
+        "evidence_status",
+        # The same CHECK the CREATE above carries, so a database that grew the column
+        # by migration validates exactly like one that was created with it. SQLite
+        # applies it to new rows only, which is what leaves the existing NULLs alone.
+        "VARCHAR CHECK (evidence_status IN ('pending', 'ready', 'failed'))",
+    ),
 )
 
 
