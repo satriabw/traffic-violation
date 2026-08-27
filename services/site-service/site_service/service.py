@@ -3,6 +3,7 @@ import sqlite3
 import uuid
 
 from shared import config
+from shared.db.violations import list_for_setup
 from shared.models.file import (
     FileCreate,
     FileResponse,
@@ -13,6 +14,7 @@ from shared.models.file import (
 from shared.models.versioned_document import VersionedDocument
 from shared.models.site import SiteCreate, SiteListResponse, SiteResponse
 from shared.models.source import SourceCreate, SourceMetadata, SourceResponse
+from shared.models.violation import ViolationListResponse, ViolationResponse
 from shared.s3.keys import build_key
 
 _COLUMNS = ("id", "name", "created_at", "updated_at")
@@ -382,3 +384,61 @@ def get_source(
         [site_id, source_id],
     ).fetchone()
     return _row_to_source(row) if row else None
+
+
+def _evidence_url(storage, key: str | None) -> str | None:
+    """A signed link for one evidence object, or None when there is no object.
+
+    The same shape as _row_to_file's download link and for the same reason: a presigned
+    URL expires, so it is minted at the moment of reading rather than stored beside the
+    key. A falsy key is every state except a finished cut — see ViolationResponse.
+    """
+    return storage.download_url(key) if key else None
+
+
+def _row_to_violation(row: dict, storage) -> ViolationResponse:
+    # The dict's keys are already the model's field names, so there is no column list
+    # here to fall out of step with the one shared.db.violations selects.
+    return ViolationResponse(
+        **row,
+        thumbnail_url=_evidence_url(storage, row["thumbnail_key"]),
+        clip_url=_evidence_url(storage, row["clip_key"]),
+    )
+
+
+def list_violations(
+    con: sqlite3.Connection, storage, site_id: str, limit: int, offset: int
+) -> ViolationListResponse:
+    """A page of the violations that hold under the setup this site runs now.
+
+    THE SETUP IS IMPLIED, not asked for. The calibration and configuration are resolved
+    here to the site's active versions — the same get_active_version the detection
+    endpoint calls to pin a job's versions — so the list filters on the same notion of
+    "active" that detection runs under rather than a second one free to disagree with
+    it. A caller cannot ask for a superseded setup, which is deliberate: the question
+    this answers is "what holds now", and every other question wants the detail view.
+
+    A SITE WITH NO CALIBRATION MATCHES THE VIOLATIONS THAT HAD NONE, because None is
+    what its active version resolves to and the filter is null-safe. That also sweeps in
+    anything recorded before those columns existed — the row cannot tell the two causes
+    apart, and this takes the permissive reading. See shared.db.init.
+
+    `metadata` stays None on every item. The blob is a separate table so that a page of
+    violations does not carry every track's trajectory, and nothing here joins it.
+    """
+    calibration = get_active_version(con, CALIBRATIONS, site_id)
+    configuration = get_active_version(con, CONFIGURATIONS, site_id)
+    rows, total = list_for_setup(
+        con,
+        site_id,
+        calibration.id if calibration else None,
+        configuration.id if configuration else None,
+        limit=limit,
+        offset=offset,
+    )
+    return ViolationListResponse(
+        items=[_row_to_violation(row, storage) for row in rows],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
