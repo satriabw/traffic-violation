@@ -23,6 +23,29 @@ class ViolationStatus(str, Enum):
     EXPLAINED = "explained"
 
 
+class EvidenceStatus(str, Enum):
+    """How far evidence-worker has got with one violation's thumbnail and clip.
+
+    Deliberately not folded into ViolationStatus. That one tracks the LLM explanation,
+    this one tracks a cut of the footage, and nothing sequences them — a violation can
+    be explained while its clip is still cutting. One enum over both would have to
+    enumerate the product of the two.
+
+    There is no member for "nothing will ever build this". That is NULL on the row, and
+    it means the violation predates evidence-worker: no keys, and no queued job to
+    produce them. `None` here says so, which is why every field below is optional.
+    """
+
+    # Queued, not started. Set by whoever enqueues the job, so a row is never briefly
+    # indistinguishable from one nobody asked to build.
+    PENDING = "pending"
+    # Both objects are in storage and the keys on the row resolve.
+    READY = "ready"
+    # The worker gave up. Terminal — nothing retries yet — so a reader should offer the
+    # source and frame index instead of waiting.
+    FAILED = "failed"
+
+
 class TrackSummary(BaseModel):
     """One object's path through the window that produced the violation.
 
@@ -72,11 +95,14 @@ class ViolationMetadata(BaseModel):
     # S3 object keys, not URLs — presigned links expire, so they are minted per read
     # the same way file downloads are.
     #
-    # EMPTY, on everything the worker writes, and that is settled rather than pending.
-    # Frames are re-derived from the source when somebody opens the detail view, which
-    # the row's source_id and frame_index are there to make possible. The field stays
-    # for the case that would need it — a durable artifact baked at confirmation time,
-    # or a stream, which has no source to seek back into.
+    # STILL EMPTY, on everything anything writes. The durable artifact this was held
+    # open for now exists, and it is not here: `thumbnail_key` and `clip_key` are
+    # columns on the violation row, because the list endpoint never joins this table
+    # and a thumbnail it cannot reach is a thumbnail it cannot render.
+    #
+    # What is left for this field is the case that is genuinely per-frame and genuinely
+    # a set — an explainer picking out the frames it wants to reason over, rather than
+    # the two fixed artifacts a reviewer opens. Nothing writes it yet.
     frames: list[str] = Field(default_factory=list)
 
 
@@ -133,6 +159,16 @@ class ViolationResponse(BaseModel):
     detected_at: datetime
     explanation: str | None = None
     severity: str | None = None
+    # Carried on list reads as well as detail ones, which is the point of them being
+    # columns: rendering a page of violations means a thumbnail each, and a reader that
+    # had to open every violation to find its key would defeat the pre-baking entirely.
+    #
+    # All three None together on a violation recorded before evidence-worker existed.
+    # A reader has to tell that apart from PENDING — see EvidenceStatus — because the
+    # first will never become the second.
+    thumbnail_key: str | None = None
+    clip_key: str | None = None
+    evidence_status: EvidenceStatus | None = None
     created_at: datetime
     updated_at: datetime
     # Absent on list reads, which never join the metadata table.
