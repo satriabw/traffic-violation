@@ -244,6 +244,20 @@ ADDED_COLUMNS = (
         # applies it to new rows only, which is what leaves the existing NULLs alone.
         "VARCHAR CHECK (evidence_status IN ('pending', 'ready', 'failed'))",
     ),
+    # THE WHOLE EXPLANATION, beside the two flat fields that already carry part of it.
+    # `explanation` is prose and `severity` is one word, and both are on the row because
+    # the list endpoint renders them without joining anything. What neither can hold is
+    # the rest of what an explainer returns — what the severity was grounded in, what it
+    # observed, and which evidence it distrusted — and that last one is the reason this
+    # column exists rather than the first two being deemed enough: an explainer that
+    # noticed its own inputs were unreliable has said something a reviewer needs, and
+    # with nowhere to put it that doubt either vanishes or leaks into the verdict.
+    #
+    # JSON in a TEXT column, like violation_metadata.json_blob, and for the same reason:
+    # the shape is the explainer's and it will change as the prompt does, which is not a
+    # migration anybody should have to run. NULL on every violation nothing has
+    # explained, which is all of them until somebody asks.
+    ("traffic_violations", "explanation_json", "TEXT"),
 )
 
 

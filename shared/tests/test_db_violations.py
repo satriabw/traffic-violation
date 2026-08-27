@@ -7,12 +7,22 @@ from shared.db.init import init_db
 from shared.db.violations import (
     EvidenceTarget,
     evidence_target,
+    get_with_metadata,
     list_for_setup,
     record,
     set_evidence,
+    set_explanation,
 )
 from shared.models.detection import ViolationType
-from shared.models.violation import EvidenceStatus, ViolationCreate
+from shared.models.violation import (
+    EvidenceStatus,
+    Severity,
+    TrackSummary,
+    ViolationCreate,
+    ViolationExplanation,
+    ViolationMetadata,
+    ViolationStatus,
+)
 
 from datetime import datetime, timezone
 
@@ -377,3 +387,180 @@ def test_a_violation_nobody_has_cut_evidence_for_carries_no_keys(con):
         None,
         None,
     )
+
+
+# --- reading one violation, blob and all -----------------------------------
+
+
+def test_the_detail_read_carries_the_trajectories_the_list_leaves_behind(con):
+    _source(con)
+    violation_id = record(
+        con,
+        ViolationCreate(
+            site_id="s1",
+            source_id="src1",
+            frame_index=912,
+            type=ViolationType.RED_LIGHT_RUNNING,
+            detected_at=DETECTED_AT,
+            metadata=ViolationMetadata(
+                vehicles=[
+                    TrackSummary(
+                        track_id=19,
+                        trajectory=[(1.0, 2.0), None],
+                        speed=[4.5, None],
+                        frame_idxs=[911, 912],
+                        bboxes=[(0.0, 0.0, 10.0, 10.0), (1.0, 1.0, 11.0, 11.0)],
+                    )
+                ],
+                violator_track_id=19,
+            ),
+        ),
+    )
+
+    violation = get_with_metadata(con, violation_id)
+
+    assert violation["id"] == violation_id
+    assert violation["metadata"]["violator_track_id"] == 19
+    assert violation["metadata"]["vehicles"][0]["frame_idxs"] == [911, 912]
+    # The same page read through the list carries none of that.
+    page, _ = list_for_setup(con, "s1", None, None, limit=10, offset=0)
+    assert "metadata" not in page[0]
+
+
+def test_a_violation_that_does_not_exist_reads_as_nothing(con):
+    assert get_with_metadata(con, "nope") is None
+
+
+def test_a_violation_whose_blob_is_missing_is_still_a_violation(con):
+    # `record` writes both rows in one transaction so this should not arise. If it
+    # ever does, the row is the record of what happened — answering "no such
+    # violation" would lose it.
+    _source(con)
+    violation_id = _violation(con)
+    con.execute("DELETE FROM violation_metadata WHERE traffic_violation_id = ?", [violation_id])
+
+    violation = get_with_metadata(con, violation_id)
+
+    assert violation["id"] == violation_id
+    assert violation["metadata"] is None
+
+
+def test_a_violation_nobody_has_explained_carries_no_explanation(con):
+    _source(con)
+    violation_id = _violation(con)
+
+    violation = get_with_metadata(con, violation_id)
+
+    assert violation["status"] == ViolationStatus.DETECTED.value
+    assert violation["explanation"] is None
+    assert violation["severity"] is None
+    assert violation["explanation_json"] is None
+
+
+# --- writing an explanation ------------------------------------------------
+
+
+def _explanation(**overrides):
+    return ViolationExplanation(
+        **{
+            "explanation": "Entered against a red signal.",
+            "severity": Severity.MEDIUM,
+            "severity_basis": ["signal red for 2.6s before entry"],
+            "observations": ["cross traffic moving"],
+            "evidence_concerns": ["speeds uncalibrated"],
+            "confidence": 0.6,
+            **overrides,
+        }
+    )
+
+
+def _explain(con, violation_id, explanation=None):
+    explanation = explanation or _explanation()
+    set_explanation(
+        con,
+        violation_id,
+        explanation.explanation,
+        explanation.severity.value,
+        explanation.model_dump_json(),
+    )
+    return explanation
+
+
+def test_an_explanation_lands_on_the_flat_columns_and_the_blob_together(con):
+    _source(con)
+    violation_id = _violation(con)
+
+    _explain(con, violation_id)
+
+    violation = get_with_metadata(con, violation_id)
+    assert violation["explanation"] == "Entered against a red signal."
+    assert violation["severity"] == "MEDIUM"
+    # The whole answer survives the round trip, including the field the flat columns
+    # cannot hold — which is the reason the JSON column exists.
+    stored = ViolationExplanation.model_validate_json(violation["explanation_json"])
+    assert stored.evidence_concerns == ["speeds uncalibrated"]
+    assert stored.severity_basis == ["signal red for 2.6s before entry"]
+
+
+def test_explaining_a_violation_marks_it_explained(con):
+    _source(con)
+    violation_id = _violation(con)
+
+    _explain(con, violation_id)
+
+    assert get_with_metadata(con, violation_id)["status"] == ViolationStatus.EXPLAINED.value
+
+
+def test_the_list_renders_a_severity_without_parsing_any_json(con):
+    # The whole reason `explanation` and `severity` are duplicated onto their own
+    # columns: a page of violations shows both without reaching for the blob.
+    _source(con)
+    violation_id = _violation(con)
+    _explain(con, violation_id)
+
+    page, _ = list_for_setup(con, "s1", None, None, limit=10, offset=0)
+
+    assert page[0]["severity"] == "MEDIUM"
+    assert page[0]["explanation"] == "Entered against a red signal."
+
+
+def test_explaining_a_violation_touches_its_updated_at(con):
+    _source(con)
+    violation_id = _violation(con)
+    con.execute(
+        "UPDATE traffic_violations SET updated_at = '2000-01-01 00:00:00' WHERE id = ?",
+        [violation_id],
+    )
+
+    _explain(con, violation_id)
+
+    updated_at = con.execute(
+        "SELECT updated_at FROM traffic_violations WHERE id = ?", [violation_id]
+    ).fetchone()[0]
+    assert not str(updated_at).startswith("2000")
+
+
+def test_explaining_one_violation_leaves_the_others_alone(con):
+    _source(con)
+    explained = _violation(con)
+    untouched = _violation(con)
+
+    _explain(con, explained)
+
+    other = get_with_metadata(con, untouched)
+    assert other["explanation"] is None
+    assert other["status"] == ViolationStatus.DETECTED.value
+
+
+def test_a_second_explanation_replaces_the_first(con):
+    # Nothing here refuses to overwrite. Deciding not to re-explain is the caller's,
+    # where the cost of the call is understood.
+    _source(con)
+    violation_id = _violation(con)
+    _explain(con, violation_id)
+
+    _explain(con, violation_id, _explanation(explanation="Revised.", severity=Severity.HIGH))
+
+    violation = get_with_metadata(con, violation_id)
+    assert violation["explanation"] == "Revised."
+    assert violation["severity"] == "HIGH"

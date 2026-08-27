@@ -6,10 +6,11 @@ the footage that goes with it. Two processes, one pair of tables, and the SQL th
 touches them belongs in the place they both already depend on rather than copied into
 each — a second copy of an INSERT is a second copy free to fall behind the schema.
 
-There is one reader too, and it is here for the weaker version of the same reason: the
-column set it selects has to agree with the one `record` inserts, and site-service
-holding its own copy of that list is a copy free to drift. What it does NOT do is
-decide anything — the setup it filters on arrives already resolved.
+The readers are here for the weaker version of the same reason: the column set they
+select has to agree with the one `record` inserts, and site-service holding its own
+copy of that list is a copy free to drift. What they do NOT do is decide anything —
+the setup the list filters on arrives already resolved, and the explanation the writer
+stores arrives already made.
 
 Reads of a site's calibration and configuration are NOT here. Those resolve by version
 and are only ever wanted by a job that is about to run, which is what keeps them in
@@ -21,7 +22,7 @@ import sqlite3
 import uuid
 from dataclasses import dataclass
 
-from shared.models.violation import EvidenceStatus, ViolationCreate
+from shared.models.violation import EvidenceStatus, ViolationCreate, ViolationStatus
 
 
 # Everything the list read carries, which is every column on the row and none of the
@@ -93,6 +94,43 @@ def list_for_setup(
         [*params, limit, offset],
     ).fetchall()
     return [dict(zip(_LIST_COLUMNS, row)) for row in rows], total
+
+
+def get_with_metadata(con: sqlite3.Connection, violation_id: str) -> dict | None:
+    """One violation, with the blob the list deliberately leaves behind.
+
+    THE JOIN THE LIST REFUSES. `list_for_setup` does not touch violation_metadata
+    because a page of violations carrying every track's trajectory is ~13.5KB per track
+    per row — but that is an argument about pages, not about rows. The detail view is
+    the one reader that wants the trajectories, and it wants exactly one violation's.
+    Splitting the tables is what makes this affordable here and unaffordable there.
+
+    LEFT JOIN, not JOIN. `record` writes both rows in one transaction so a violation
+    without its blob should not exist, but "should not exist" is not a reason to answer
+    "no such violation" if one ever does — the row is the record of what happened and
+    the blob is detail about it. A missing blob comes back as `metadata` None, which is
+    the same thing a caller sees for a violation whose blob is empty.
+
+    `explanation_json` comes back as the stored text, unparsed. Turning it into a model
+    is the caller's business: this module knows the column exists, and knows better
+    than to own the shape of somebody else's JSON.
+    """
+    row = con.execute(
+        f"""
+        SELECT {', '.join('v.' + column for column in _LIST_COLUMNS)},
+               v.explanation_json, m.json_blob
+        FROM traffic_violations v
+        LEFT JOIN violation_metadata m ON m.traffic_violation_id = v.id
+        WHERE v.id = ?
+        """,
+        [violation_id],
+    ).fetchone()
+    if row is None:
+        return None
+    violation = dict(zip((*_LIST_COLUMNS, "explanation_json"), row))
+    blob = row[-1]
+    violation["metadata"] = json.loads(blob) if blob else None
+    return violation
 
 
 def record(con: sqlite3.Connection, violation: ViolationCreate) -> str:
@@ -247,4 +285,49 @@ def set_evidence(
         WHERE id = ?
         """,
         [status.value, thumbnail_key, clip_key, violation_id],
+    )
+
+
+def set_explanation(
+    con: sqlite3.Connection,
+    violation_id: str,
+    explanation: str,
+    severity: str,
+    explanation_json: str,
+) -> None:
+    """Store an explanation against a violation, and mark it explained.
+
+    THREE COLUMNS FOR ONE ANSWER, and the duplication is deliberate. `explanation_json`
+    is the whole thing; `explanation` and `severity` are the two fields the list
+    endpoint renders, flat on the row so that rendering a page does not mean parsing a
+    JSON blob per violation. They are written together here precisely so they cannot
+    disagree — there is no path that sets one without the others.
+
+    `status` goes to 'explained' in the same statement. Nothing sequences this against
+    `evidence_status`: a violation can be explained while its clip is still cutting,
+    which is why those are two enums and not one.
+
+    The caller decides whether to call at all. A violation that already has an
+    explanation is not re-explained — that check belongs where the cost is understood,
+    not here, and this will overwrite quite happily if somebody means it to.
+
+    `updated_at` is bumped by hand, for the reason set_evidence gives.
+    """
+    con.execute(
+        """
+        UPDATE traffic_violations
+        SET explanation = ?,
+            severity = ?,
+            explanation_json = ?,
+            status = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        [
+            explanation,
+            severity,
+            explanation_json,
+            ViolationStatus.EXPLAINED.value,
+            violation_id,
+        ],
     )

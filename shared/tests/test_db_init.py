@@ -323,7 +323,8 @@ def test_init_db_creates_the_violation_tables():
         "thumbnail_key", "clip_key", "evidence_status",
         "calibration_id", "configuration_id",
         "type", "status", "detected_at",
-        "explanation", "severity", "created_at", "updated_at",
+        "explanation", "severity", "explanation_json",
+        "created_at", "updated_at",
     }
     assert _columns(con, "violation_metadata") == {
         "id", "traffic_violation_id", "json_blob",

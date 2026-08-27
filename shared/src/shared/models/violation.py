@@ -106,6 +106,57 @@ class ViolationMetadata(BaseModel):
     frames: list[str] = Field(default_factory=list)
 
 
+class Severity(str, Enum):
+    """How much the violation mattered, not how certain the detector was.
+
+    Three bands rather than a score, because the thing being graded is a judgement a
+    reviewer has to agree with: an explainer that says HIGH has to name what made it
+    high, and a reviewer disagreeing wants to argue with a band and its reasons rather
+    than with the difference between 0.71 and 0.68.
+
+    Severity is about the risk imposed on other people, so identical driving earns
+    different bands in different circumstances — an empty junction and a crosswalk in
+    use are not the same event. What separates them is only ever in the evidence, which
+    is why `severity_basis` below is not optional.
+    """
+
+    LOW = "LOW"
+    MEDIUM = "MEDIUM"
+    HIGH = "HIGH"
+
+
+class ViolationExplanation(BaseModel):
+    """What an explainer returns for one violation.
+
+    Stored whole in `traffic_violations.explanation_json`, with `explanation` and
+    `severity` also copied onto their own columns — those two are what the list
+    endpoint renders, and a list that had to parse a JSON blob per row to show a
+    severity chip would defeat the flat columns entirely.
+    """
+
+    # WHETHER THE DETECTION HOLDS UP, asked separately from what it was. A detector
+    # that tracked the wrong vehicle, misread a signal region, or fired on a vehicle
+    # that entered legally and was still clearing the junction produces a row that
+    # looks exactly like a real violation, and an explainer given no way to say "this
+    # one does not stand" will write a fluent account of something that did not happen.
+    flag_sustained: bool = True
+    explanation: str
+    severity: Severity
+    # WHAT THE BAND RESTS ON, and it has to be things visible in the evidence rather
+    # than the reasoning that got there. Separate from `observations` because a
+    # reviewer overturning a severity wants the two or three facts that decided it, not
+    # everything the explainer happened to notice.
+    severity_basis: list[str] = Field(default_factory=list)
+    observations: list[str] = Field(default_factory=list)
+    # WHAT THE EXPLAINER DID NOT TRUST, and the field that earns the JSON column. An
+    # explainer handed a speed derived through a calibration the violation never had
+    # will notice it is impossible; with nowhere to record that, the doubt either
+    # disappears from the record or, worse, silently grades the severity. Empty means
+    # nothing looked wrong — not that nothing was checked.
+    evidence_concerns: list[str] = Field(default_factory=list)
+    confidence: float = Field(ge=0.0, le=1.0)
+
+
 class ViolationCreate(BaseModel):
     """What the worker has when a rule fires. Everything else is defaulted."""
 
@@ -186,6 +237,14 @@ class ViolationResponse(BaseModel):
     updated_at: datetime
     # Absent on list reads, which never join the metadata table.
     metadata: ViolationMetadata | None = None
+    # The rest of the explanation, parsed back out of `explanation_json`. `explanation`
+    # and `severity` above are the same answer's two flat fields and stay populated
+    # either way, so a list read losing this loses detail and never the verdict.
+    #
+    # None on a violation nothing has explained, and also on every list read — the same
+    # two reasons `metadata` is None, and distinguishable the same way: `status` says
+    # whether an explanation exists.
+    explanation_detail: ViolationExplanation | None = None
 
 
 class ViolationListResponse(BaseModel):
