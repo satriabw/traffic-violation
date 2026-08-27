@@ -69,6 +69,21 @@ DETECTION_MODEL_PROVIDERS = [
 ]
 
 
+# --- Evidence -------------------------------------------------------------
+# NOTHING HERE SIZES A CLIP, deliberately. How much lead-up a violation's clip carries
+# is the site's `evidence_seconds`, out of its configuration document, because that is
+# the number the detector sized its ring buffer with — the record holds boxes for
+# exactly that span, and a clip cut to any other length disagrees with it. A default
+# here would be a second source of truth for one number, free to drift from the one
+# that produced the evidence. It travels on the job instead; see shared.models.evidence.
+#
+# How long one ffmpeg invocation gets. Generous: it is a range-read of a remote object
+# over somebody's network, not a decode of the whole video. What it is really for is
+# the hang — a stalled connection would otherwise park a worker on one violation for
+# good, and there is only one of them.
+EVIDENCE_CUT_TIMEOUT_SECONDS = float(os.environ.get("EVIDENCE_CUT_TIMEOUT_SECONDS", "120"))
+
+
 # --- Video probing --------------------------------------------------------
 # How long ffprobe gets to read a video's header before we give up and call the
 # attempt transient. It runs inside a request, so this is also the worst case a

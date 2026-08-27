@@ -106,6 +106,40 @@ services:
       redis:
         condition: service_healthy
 
+  # Cutting the thumbnail and the clip for each violation the detector records. Its
+  # own service rather than a thread inside `worker`, and the dependency lists are the
+  # argument: that one needs a CUDA runtime and an ONNX session, this one needs ffmpeg.
+  # It is also the durability — a job on the queue outlives a process that dies, which
+  # a background thread inside the detector would not.
+  #
+  # SCALE THIS ONE, not the detector: `docker compose up --scale evidence-worker=3`
+  # works because the queue hands each job to exactly one consumer, and nothing here
+  # touches the GPU.
+  evidence-worker:
+    image: traffic-violation-evidence-worker
+    build:
+      context: .
+      dockerfile: docker/evidence-worker.Dockerfile
+    <<: *run-as-host-user
+    # R2 above all: this is the one process that writes objects rather than signing
+    # URLs for somebody else to.
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      # The same file api and worker use. This is the third process on it and the
+      # second that writes — see workers/evidence-worker/evidence_worker/db.py.
+      TRAFFIC_DB_PATH: /repo/data/traffic_violations.sqlite
+      PYTHONPATH: /repo/shared/src:/repo/workers/evidence-worker
+    volumes: *repo-mount
+    # No restart policy, for the same reason `worker` has none: a handler that raises
+    # here means something true of the next job too — no credentials, a bucket that
+    # refuses writes — and restarting would turn a deliberate stop into a crash loop.
+    # A failed *cut* does not raise; it is written onto the violation's own row.
+    depends_on:
+      redis:
+        condition: service_healthy
+
   worker:
     image: traffic-violation-worker:gpu
     build:

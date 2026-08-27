@@ -6,7 +6,8 @@
 python3 -m venv .venv
 .venv/bin/pip install -e ./shared -e ./packages/trajectory-collector \
   -e ./packages/violation-detector -e ./packages/evidence-collector \
-  -e ./services/site-service -e ./workers/detection-worker
+  -e ./services/site-service -e ./workers/detection-worker \
+  -e ./workers/evidence-worker
 ```
 
 Note: on macOS, `pip install -e` can silently no-op — files it creates starting
@@ -16,10 +17,11 @@ with `__` get the Finder "hidden" flag, and CPython's `site.py` skips hidden
 on `PYTHONPATH` as shown below (tests already do this via `pythonpath` in
 `pyproject.toml`, no install needed for running the test suite).
 
-`ffprobe` (part of ffmpeg) must be on `PATH` — the site-service shells out to it to
-read a video's metadata when a video source is created. `brew install ffmpeg` on
-macOS, `apt-get install ffmpeg` in a container. Without it, creating a video source
-returns 502; the probe tests skip rather than fail.
+ffmpeg must be on `PATH`, for two things. site-service shells out to `ffprobe` to read
+a video's metadata when a video source is created — without it, creating a video source
+returns 502. evidence-worker shells out to `ffmpeg` itself to cut each violation's
+thumbnail and clip. `brew install ffmpeg` on macOS, `apt-get install ffmpeg` in a
+container. The tests that need either one skip rather than fail.
 
 Run tests:
 ```
@@ -38,8 +40,10 @@ printf 'DOCKER_UID=%s\nDOCKER_GID=%s\n' "$(id -u)" "$(id -g)" >> .env
 docker compose up --build
 ```
 
-Three services — `redis`, `api`, `worker` — and naming one starts just that one, so
-`docker compose up redis` is how you run the queue alone against host processes. The
+Four services — `redis`, `api`, `worker`, `evidence-worker` — and naming one starts
+just that one, so `docker compose up redis` is how you run the queue alone against
+host processes. Only `worker` wants the GPU; `evidence-worker` is `python:3.11-slim`
+plus ffmpeg and scales sideways (`--scale evidence-worker=3`). The
 API is on `127.0.0.1:8001`; reach it from another machine with
 `ssh -L 8001:localhost:8001` rather than by widening `API_BIND`, because nothing here
 authenticates anything.
@@ -77,7 +81,7 @@ to CPU at a tenth of the speed. Check the worker's first log line, and check it 
 
 ### On the host (macOS, or without Docker)
 
-Three processes, one per terminal, all from the repo root:
+Four processes, one per terminal, all from the repo root:
 
 ```
 # 1. the queue
@@ -91,6 +95,10 @@ PYTHONPATH=shared/src:services/site-service .venv/bin/uvicorn site_service.main:
 set -a; source .env; set +a
 PYTHONPATH=shared/src:packages/trajectory-collector/src:packages/violation-detector/src:packages/evidence-collector/src:workers/detection-worker \
   .venv/bin/python -m detection_worker.worker
+
+# 4. the evidence worker
+set -a; source .env; set +a
+PYTHONPATH=shared/src:workers/evidence-worker .venv/bin/python -m evidence_worker.worker
 ```
 
 Source `.env` in **each** shell that needs it. The worker reads `REDIS_URL` from the
@@ -168,7 +176,7 @@ That is the whole story now. There used to be a `dev/redis-docker.sh` holding th
 `docker run` by hand, and once compose described the service there were two spellings
 of one thing, publishing the same port and so unable to run at the same time. Naming
 the service is what makes "just the queue" and "the whole stack" the same mechanism
-rather than two — `docker compose up` starts all three, `docker compose up redis`
+rather than two — `docker compose up` starts them all, `docker compose up redis`
 starts one, and neither can drift from the other.
 
 Either way everything stays inside the repo: it writes to the gitignored `data/`,
@@ -530,6 +538,85 @@ produced. A job with no calibration produces no trajectories, so its records sim
 carry no positions — `None` beside a full set of boxes, rather than image coordinates
 standing in for metres. Nothing has to be configured for that; it is the same absence,
 arrived at without anyone deciding anything.
+
+## The evidence a violation is reviewed with
+
+The record above says what happened. What a reviewer opens is a picture and a few
+seconds of video, and those are cut by **`workers/evidence-worker/`** — a fifth
+distribution, one dependency (`shared`), and ffmpeg.
+
+One violation, one job, one message on its own Redis list:
+
+```python
+EvidenceJob(violation_id="…", evidence_seconds=5.0)
+```
+
+Everything else reachable from the id is left behind, because a violation row is never
+rewritten — its source, frame index and site are fixed at the moment the detector wrote
+them, so a late lookup gives the same answer as an early one. That is the opposite of
+`DetectionJob`, which pins its versions precisely because "what is active now" can
+change under a queued job.
+
+`evidence_seconds` is the exception, and the only one: it is the site's, out of its
+configuration document, and the row cannot answer for it. **It is also the number the
+detector sized its ring buffer with**, which is what makes the clip and the record
+describe the same interval — the blob holds boxes for exactly these frames, so a clip
+of any other length is either missing footage the record describes or showing footage
+it does not. There is no setting anywhere for how long a clip is; a default would be a
+second source of truth for one number, free to drift from the one that produced the
+evidence.
+
+The clip ends **on** the violation, like the ring buffer and for the buffer's own
+reason: what a reviewer needs is the approach, and what came after is still in the
+source for anyone who wants it. The `+ 1/fps` in `window()` is `FrameBuffer.over`'s
+`+ 1` in seconds — the frame a rule fires on is part of its window.
+
+The worker resolves the row to a video and a moment, then runs ffmpeg twice against a
+presigned URL — once for a frame, once for a stream copy of the lead-up — uploads both,
+and writes the keys back:
+
+```
+traffic_violations.thumbnail_key    evidence/{violation_id}/thumbnail.jpg
+traffic_violations.clip_key         evidence/{violation_id}/clip.mp4
+traffic_violations.evidence_status  pending | ready | failed   (NULL = predates this)
+```
+
+**Columns, not `ViolationMetadata.frames`.** The list endpoint never joins
+`violation_metadata` — that is the whole reason it is a separate table — and a
+thumbnail costing a second query per row is one the list cannot render.
+
+**Nothing is drawn on either object.** No boxes, no region outlines, no highlight on
+the vehicle. The metadata blob already holds every box and frame index, so the detail
+view draws them over the clip at read time: fix the drawing and every violation ever
+recorded improves, while the expensive half stays baked exactly once. Annotating here
+would freeze one rendering into an object and cost a decode of every frame to do it.
+
+**Why it is not a thread inside the detection worker.** That process holds the GPU, the
+one resource here that cannot be scaled sideways, and cutting a clip is ffmpeg and a
+network round trip. It also has no restart policy on purpose — a raising handler stops
+it — so a background thread would die with it silently, leaving a row that says nothing
+and nothing that knows to try again. On a queue the job outlives the process.
+
+**Why it is not done at read time**, which is where this was originally going: a page
+of violations would be a seek and a decode each, so list latency would scale with page
+size. A clip is not work an HTTP handler can do at any page size.
+
+**A failed cut does not stop the worker**, which is where it diverges from
+detection-worker's contract. The failure has somewhere to go — `evidence_status` on the
+violation's own row — so the next job still gets its turn. What does stop it is
+everything that is not about one violation: no database, no credentials, a bucket that
+refuses a write. Those are true of the next job too.
+
+Two things it costs, both taken deliberately. `-c copy` can only begin on a keyframe,
+so a clip starts at or before the requested moment by up to one GOP — more lead-up,
+never less, so it can never cut off the violation itself; `-c:v libx264` is the one-line
+fix if that ever matters more than the CPU. And a violation whose source has no probed
+frame rate is marked `failed` rather than cut at an assumed 25 or 30: a guessed rate
+seeks to the wrong second of a real video, which is evidence of something that did not
+happen.
+
+There is no retry and no dead-letter queue, the same as the detection queue. A `failed`
+row is visible, which is the difference from where this started.
 
 ## Which rules a job runs
 

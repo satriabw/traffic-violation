@@ -6,4 +6,5 @@ pythonpath = [
     "packages/evidence-collector/src",
     "services/site-service",
     "workers/detection-worker",
+    "workers/evidence-worker",
 ]
