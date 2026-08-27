@@ -3,7 +3,7 @@ import sqlite3
 import uuid
 
 from shared import config
-from shared.db.violations import get_with_metadata, list_for_setup
+from shared.db.violations import get_with_metadata, list_for_setup, set_explanation
 from shared.models.file import (
     FileCreate,
     FileResponse,
@@ -11,12 +11,14 @@ from shared.models.file import (
     FileType,
     FileUploadResponse,
 )
+from shared.models.explanation import ExplainRequest
 from shared.models.versioned_document import VersionedDocument
 from shared.models.site import SiteCreate, SiteListResponse, SiteResponse
 from shared.models.source import SourceCreate, SourceMetadata, SourceResponse
 from shared.models.violation import (
     ViolationExplanation,
     ViolationListResponse,
+    ViolationMetadata,
     ViolationResponse,
 )
 from shared.s3.keys import build_key
@@ -410,6 +412,25 @@ def _row_to_violation(row: dict, storage) -> ViolationResponse:
     )
 
 
+def _row_to_violation_detail(row: dict, storage) -> ViolationResponse:
+    """A detail row — which carries the blob and the stored explanation — as a response.
+
+    Separate from _row_to_violation because the two reads select different things:
+    the list has neither `metadata` nor `explanation_json` to translate, and giving it
+    a branch for columns it never has would be a branch nothing exercises.
+    """
+    row = dict(row)
+    explanation = row.pop("explanation_json")
+    return ViolationResponse(
+        **row,
+        explanation_detail=(
+            ViolationExplanation.model_validate_json(explanation) if explanation else None
+        ),
+        thumbnail_url=_evidence_url(storage, row["thumbnail_key"]),
+        clip_url=_evidence_url(storage, row["clip_key"]),
+    )
+
+
 def get_violation(
     con: sqlite3.Connection, storage, site_id: str, violation_id: str
 ) -> ViolationResponse | None:
@@ -435,16 +456,7 @@ def get_violation(
     row = get_with_metadata(con, violation_id)
     if row is None or row["site_id"] != site_id:
         return None
-    row = dict(row)
-    explanation = row.pop("explanation_json")
-    return ViolationResponse(
-        **row,
-        explanation_detail=(
-            ViolationExplanation.model_validate_json(explanation) if explanation else None
-        ),
-        thumbnail_url=_evidence_url(storage, row["thumbnail_key"]),
-        clip_url=_evidence_url(storage, row["clip_key"]),
-    )
+    return _row_to_violation_detail(row, storage)
 
 
 def list_violations(
@@ -483,3 +495,96 @@ def list_violations(
         limit=limit,
         offset=offset,
     )
+
+
+def _judged_configuration(
+    con: sqlite3.Connection, storage, site_id: str, configuration_id: str | None
+) -> dict | None:
+    """The configuration document this violation was judged under, if it can be read.
+
+    THE ONE IT WAS JUDGED UNDER, not the site's active one. The row pins
+    `configuration_id` precisely so the regions an explanation reasons about are the
+    regions the detector applied — re-annotate a junction and the current document
+    describes a layout this violation was never tested against.
+
+    None on anything that goes wrong, and the explainer is told the configuration is
+    missing rather than the request failing. A document that has been deleted from
+    storage, or was never uploaded, or is not valid JSON, makes for a weaker
+    explanation; it does not make the violation unexplainable, and failing the whole
+    call would be a worse answer than a hedged one. The prompt names the absence, so
+    it reaches the reader rather than being silently absorbed.
+    """
+    if configuration_id is None:
+        return None
+    document = get_version(con, CONFIGURATIONS, site_id, configuration_id)
+    if document is None:
+        return None
+    file = get_file(con, storage, document.file_id)
+    if file is None:
+        return None
+    try:
+        return storage.get_json(file.url)
+    except Exception:
+        return None
+
+
+def explain_violation(
+    con: sqlite3.Connection, storage, explainer, site_id: str, violation_id: str
+) -> ViolationResponse | None:
+    """Explain one violation, or hand back the explanation it already has.
+
+    THE CACHE IS THE POINT. An explanation costs an API call and a model's thinking
+    time, and the answer does not change — the evidence it was formed from is a row
+    nothing rewrites. So the second request for a violation is a database read, and so
+    is the thousandth. The gate is `explanation IS NOT NULL` rather than
+    `status == 'explained'`: the column is the thing being cached, and asking about it
+    directly cannot go wrong if the two ever disagree.
+
+    Nothing here locks. Two concurrent first-time requests for the same violation will
+    both call, and the second write wins — the cost is one wasted call, on a race that
+    needs two readers to open the same unexplained violation within a few seconds of
+    each other. A lock, or a row reserved before the call, is machinery this does not
+    yet earn.
+
+    NO FORCE. There is no way to ask for a re-explanation, deliberately: every caller
+    that wanted one would be spending money, and the endpoint that offers it should be
+    the one that says so. Until then an explanation is written once.
+    """
+    row = get_with_metadata(con, violation_id)
+    if row is None or row["site_id"] != site_id:
+        return None
+    if row["explanation"] is not None:
+        return _row_to_violation_detail(row, storage)
+
+    site = get_site(con, site_id)
+    answer = explainer.explain(
+        ExplainRequest(
+            violation_type=row["type"],
+            detected_at=row["detected_at"],
+            site_name=site.name if site else site_id,
+            frame_index=row["frame_index"],
+            # Passed through as the id rather than a flag: the prompt withholds the
+            # motion data when this is None, because a violation judged under no
+            # calibration has no valid pixel-to-world mapping behind its numbers.
+            calibration_id=row["calibration_id"],
+            configuration=_judged_configuration(
+                con, storage, site_id, row["configuration_id"]
+            ),
+            metadata=(
+                ViolationMetadata.model_validate(row["metadata"])
+                if row["metadata"] is not None
+                else None
+            ),
+        )
+    )
+    set_explanation(
+        con,
+        violation_id,
+        answer.explanation.explanation,
+        answer.explanation.severity.value,
+        answer.explanation.model_dump_json(),
+    )
+    # Re-read rather than patching the row in memory: `set_explanation` also moves
+    # `status` and `updated_at`, and a response assembled from the pre-write row would
+    # disagree with the database it just wrote.
+    return get_violation(con, storage, site_id, violation_id)

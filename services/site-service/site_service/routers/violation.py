@@ -6,6 +6,7 @@ from shared.models.violation import ViolationListResponse, ViolationResponse
 
 from site_service import service
 from site_service.db import get_db
+from site_service.llm import Explainer, ExplainerRefused, ExplainerUnavailable, get_explainer
 from site_service.routers.source import require_site
 from site_service.storage import Storage
 
@@ -14,6 +15,9 @@ from site_service.storage import Storage
 # rather than asked for.
 router = APIRouter(prefix="/sites/{site_id}/violations", tags=["violations"])
 DbConnection = Annotated[sqlite3.Connection, Depends(get_db)]
+# Injected like the database and the storage client, so a test substitutes a fake
+# through dependency_overrides and no test can reach llm-service or spend a key.
+ExplainerDep = Annotated[Explainer, Depends(get_explainer)]
 
 
 @router.get("", response_model=ViolationListResponse)
@@ -55,6 +59,40 @@ def get_violation(site_id: str, violation_id: str, con: DbConnection, storage: S
     """
     require_site(con, site_id)
     violation = service.get_violation(con, storage, site_id, violation_id)
+    if violation is None:
+        raise HTTPException(status_code=404, detail="Violation not found")
+    return violation
+
+
+@router.post("/{violation_id}/explain", response_model=ViolationResponse)
+def explain_violation(
+    site_id: str,
+    violation_id: str,
+    con: DbConnection,
+    storage: Storage,
+    explainer: ExplainerDep,
+):
+    """Explain one violation, or hand back the explanation it already has.
+
+    A POST because the first one writes and spends money. Every one after it is a
+    database read — the explanation is stored on the row and the evidence it was formed
+    from does not change, so there is nothing for a second call to improve. That makes
+    this safe to call on every page load, which is the point of it not being a GET: a
+    GET that did the same would spend the first call on a browser's prefetch.
+
+    Returns the same shape the detail endpoint does, so a client can POST once and
+    render the result without a second request.
+
+    503 and 502 come straight from llm-service's own split and mean the same things
+    here: 503 is worth retrying, 502 is not.
+    """
+    require_site(con, site_id)
+    try:
+        violation = service.explain_violation(con, storage, explainer, site_id, violation_id)
+    except ExplainerUnavailable as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    except ExplainerRefused as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
     if violation is None:
         raise HTTPException(status_code=404, detail="Violation not found")
     return violation

@@ -705,6 +705,54 @@ distinguishing them would confirm the violation is real and belongs to somebody 
 `null` when there is none. Asking for one is a POST, because it spends money and writes;
 a GET that quietly called a model would do both on a browser's prefetch.
 
+### Explaining a violation
+
+```
+POST /api/v1/sites/{site_id}/violations/{violation_id}/explain
+```
+
+Returns the same shape as the detail endpoint, with `explanation`, `severity` and
+`explanation_detail` filled in.
+
+**The first call costs an API call; every one after it is a database read.** The
+explanation is stored on the row, and the evidence it was formed from is a row nothing
+rewrites — so there is nothing for a second call to improve. That is what makes this
+safe to call on every page load, and it is why the gate is `explanation IS NOT NULL`
+rather than `status = 'explained'`: the column is the thing being cached.
+
+**A POST, not a GET**, because the first one writes and spends money. A GET that did the
+same would spend it on a browser's prefetch.
+
+There is no way to ask for a re-explanation. An explanation is written once; a caller
+that wanted a fresh one would be spending money, and the endpoint that offers that
+should be the one that says so.
+
+Nothing locks. Two concurrent first-time requests for the same violation both call and
+the second write wins — one wasted call, on a race that needs two readers to open the
+same unexplained violation within seconds of each other.
+
+**What llm-service is told, and what it is not.** It gets the violation's type, when it
+was detected, the site's name, the frame index, the configuration document the violation
+was *judged under* (not the site's current one — re-annotate a junction and today's
+document describes a layout this violation was never tested against), and a summary of
+every track the detector held. It is not told the violation's id or the site's id: it
+reads no database and writes to none, and keeping the identifiers out is what makes that
+true rather than merely intended.
+
+**The motion data is withheld when the violation has no calibration pinned.** This is the
+one decision the whole thing turns on. Without a calibration there is no valid
+pixel-to-world mapping, and the speeds on the row are roughly nine times too high. A
+model handed them grades severity on them. The trajectory is not an escape — it comes out
+of the same broken mapping, one integration apart, so recomputing from it reproduces the
+same answer while feeling like a second opinion. The prompt bans the *conclusion* rather
+than a list of fields, because there is always another field carrying the same
+information.
+
+`503` means try again — llm-service is down, rate limited, or unreachable. `502` means
+do not: the request was rejected and will be rejected identically next time, which
+includes the two sides disagreeing about `LLM_SERVICE_TOKEN`. A failed explanation leaves
+the violation unexplained, so the next request tries again rather than caching a failure.
+
 ## Which rules a job runs
 
 Which rules a job runs is the intersection of two things. The site's configuration says

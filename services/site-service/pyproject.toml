@@ -5,6 +5,9 @@ requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.110",
     "uvicorn>=0.29",
+    # The call to llm-service. Was a dev-only dependency for fastapi.testclient
+    # until site-service had somewhere of its own to call.
+    "httpx>=0.27",
     "shared",
 ]
 
