@@ -185,3 +185,33 @@ def test_a_site_with_no_violations_is_an_empty_page_not_an_error(con, storage):
 
     assert page.items == []
     assert page.total == 0
+
+
+# --- the detail read applies no setup filter ----------------------------------
+
+
+def test_a_violation_the_list_hides_is_still_readable_by_id(con, storage):
+    # The list answers "what holds under the setup this site runs now" and drops a
+    # violation judged under a superseded calibration. The detail read answers "what
+    # is this violation", and a reader holding an id is entitled to it either way —
+    # the row carries the ids it was judged under, so they can see for themselves.
+    superseded = _calibration(con)
+    violation_id = _violation(con, calibration_id=superseded)
+    _calibration(con)  # a second version, which is now the active one
+
+    assert _list(con, storage).items == []
+
+    violation = service.get_violation(con, storage, "s1", violation_id)
+    assert violation is not None
+    assert violation.calibration_id == superseded
+
+
+def test_the_detail_read_refuses_another_sites_violation(con, storage):
+    con.execute("INSERT INTO sites (id, name) VALUES ('s2', 'Junction 6')")
+    violation_id = _violation(con)
+
+    assert service.get_violation(con, storage, "s2", violation_id) is None
+
+
+def test_the_detail_read_of_a_missing_violation_is_none(con, storage):
+    assert service.get_violation(con, storage, "s1", "nope") is None

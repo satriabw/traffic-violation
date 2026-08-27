@@ -1,8 +1,8 @@
 import sqlite3
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query
-from shared.models.violation import ViolationListResponse
+from fastapi import APIRouter, Depends, HTTPException, Query
+from shared.models.violation import ViolationListResponse, ViolationResponse
 
 from site_service import service
 from site_service.db import get_db
@@ -34,8 +34,27 @@ def list_violations(
 
     Every item carries its thumbnail and clip as signed links, minted per read. None of
     them carries the metadata blob: rendering a page of violations does not need every
-    track's trajectory, and the boxes belong to whoever draws over the clip in a detail
-    view that does not exist yet.
+    track's trajectory, and the boxes belong to whoever draws over the clip — which is
+    the detail endpoint below, and the only reader that pays for them.
     """
     require_site(con, site_id)
     return service.list_violations(con, storage, site_id, limit=limit, offset=offset)
+
+
+@router.get("/{violation_id}", response_model=ViolationResponse)
+def get_violation(site_id: str, violation_id: str, con: DbConnection, storage: Storage):
+    """One violation, with the metadata blob the list deliberately does not carry.
+
+    THE READ NEVER EXPLAINS ANYTHING. It returns whatever explanation exists on the row
+    and None when there is none — asking for one is a POST, because it spends money and
+    writes. A GET that quietly called a model would do both on a browser's prefetch.
+
+    404 covers both "no such violation" and "not this site's violation", and the two are
+    deliberately indistinguishable: a different answer for the second would confirm the
+    id is real and belongs to somebody else.
+    """
+    require_site(con, site_id)
+    violation = service.get_violation(con, storage, site_id, violation_id)
+    if violation is None:
+        raise HTTPException(status_code=404, detail="Violation not found")
+    return violation

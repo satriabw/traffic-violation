@@ -3,7 +3,7 @@ import sqlite3
 import uuid
 
 from shared import config
-from shared.db.violations import list_for_setup
+from shared.db.violations import get_with_metadata, list_for_setup
 from shared.models.file import (
     FileCreate,
     FileResponse,
@@ -14,7 +14,11 @@ from shared.models.file import (
 from shared.models.versioned_document import VersionedDocument
 from shared.models.site import SiteCreate, SiteListResponse, SiteResponse
 from shared.models.source import SourceCreate, SourceMetadata, SourceResponse
-from shared.models.violation import ViolationListResponse, ViolationResponse
+from shared.models.violation import (
+    ViolationExplanation,
+    ViolationListResponse,
+    ViolationResponse,
+)
 from shared.s3.keys import build_key
 
 _COLUMNS = ("id", "name", "created_at", "updated_at")
@@ -401,6 +405,43 @@ def _row_to_violation(row: dict, storage) -> ViolationResponse:
     # here to fall out of step with the one shared.db.violations selects.
     return ViolationResponse(
         **row,
+        thumbnail_url=_evidence_url(storage, row["thumbnail_key"]),
+        clip_url=_evidence_url(storage, row["clip_key"]),
+    )
+
+
+def get_violation(
+    con: sqlite3.Connection, storage, site_id: str, violation_id: str
+) -> ViolationResponse | None:
+    """One violation, with everything the list leaves out.
+
+    SCOPED TO THE SITE IN THE PATH, and the check is not a formality. The violation id
+    is a uuid and the route is nested, so a caller holding an id from one site could
+    otherwise read it through another site's URL — and every reader that trusts the
+    path to mean what it says would be wrong. A mismatch is None here and 404 at the
+    router, deliberately the same answer as an id that does not exist: telling the two
+    apart would confirm the violation is real and belongs to somebody else.
+
+    NO SETUP FILTER, unlike the list. That one answers "what holds under the setup this
+    site runs now" and hides violations judged under a superseded calibration; this
+    answers "what is this violation", and a reader who has an id in their hand is
+    entitled to it whether or not it still describes the current setup. The row carries
+    the ids it was judged under, so a reader can see for themselves.
+
+    The metadata blob comes back here and nowhere else. `explanation_json` is parsed
+    into `explanation_detail` on the way out rather than handed over as text — the
+    column is storage, the model is the contract.
+    """
+    row = get_with_metadata(con, violation_id)
+    if row is None or row["site_id"] != site_id:
+        return None
+    row = dict(row)
+    explanation = row.pop("explanation_json")
+    return ViolationResponse(
+        **row,
+        explanation_detail=(
+            ViolationExplanation.model_validate_json(explanation) if explanation else None
+        ),
         thumbnail_url=_evidence_url(storage, row["thumbnail_key"]),
         clip_url=_evidence_url(storage, row["clip_key"]),
     )
