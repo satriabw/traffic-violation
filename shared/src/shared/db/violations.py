@@ -331,3 +331,67 @@ def set_explanation(
             violation_id,
         ],
     )
+
+
+def set_explanation_status(
+    con: sqlite3.Connection, violation_id: str, status: ViolationStatus
+) -> None:
+    """Move a violation's explanation status without touching the answer.
+
+    The counterpart to `set_explanation`, which writes a status and three columns
+    together because they are one answer. This writes the status alone, for the two
+    transitions that carry no answer with them: accepting a request ('pending'), and
+    giving up on one ('failed').
+
+    THE EXPLANATION COLUMNS ARE LEFT ALONE, and on the failure path that matters. A
+    violation explained once, re-requested, and failed the second time still has its
+    first answer on the row — clearing it would throw away something true because a
+    later attempt went wrong. Nothing here can produce a row that says 'explained' with
+    no explanation, or 'failed' having quietly deleted one.
+
+    `updated_at` is bumped by hand, for the reason set_evidence gives.
+    """
+    con.execute(
+        """
+        UPDATE traffic_violations
+        SET status = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        [status.value, violation_id],
+    )
+
+
+def fail_pending_explanations(con: sqlite3.Connection) -> int:
+    """Mark every violation still waiting on an explanation as failed. Returns how many.
+
+    Run once at startup, and only meaningful because the actor's mailbox lives in
+    memory. A violation accepted but not finished when the process stopped has nothing
+    left to finish it: the message died with the thread. The row still says 'pending',
+    which is a promise nothing is keeping, and a client polling it would wait for an
+    answer that is never coming.
+
+    'failed' rather than back to 'detected'. Reverting would be true in a narrow sense —
+    no explanation was produced — but it would erase the fact that somebody asked, and a
+    user who requested one and waited would find no trace of the request. Failed says
+    what happened, and a POST asks again.
+
+    IT ASSUMES ONE SITE-SERVICE, and that assumption is the whole of its correctness. A
+    starting process cannot tell a row abandoned by its own predecessor from one another
+    replica is working on right now, so a second instance booting would mark a live
+    explanation failed — the actor would then write the real answer over it a minute
+    later, and a client polling in between would be told the wrong thing twice.
+
+    That is acceptable only because the mailbox is already per-process: a second replica
+    would each hold half the in-flight work in memory with no way to see the other's,
+    which is a bigger problem than this line and the one that would have to be solved
+    first. Whatever solves it — a durable queue, or a lease column naming the owner —
+    is also what makes this safe to run.
+    """
+    return con.execute(
+        """
+        UPDATE traffic_violations
+        SET status = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE status = ?
+        """,
+        [ViolationStatus.FAILED.value, ViolationStatus.PENDING.value],
+    ).rowcount

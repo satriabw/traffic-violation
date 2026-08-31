@@ -1,12 +1,12 @@
 import sqlite3
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from shared.models.violation import ViolationListResponse, ViolationResponse
 
 from site_service import service
 from site_service.db import get_db
-from site_service.llm import Explainer, ExplainerRefused, ExplainerUnavailable, get_explainer
+from site_service.actor import Explain, ExplanationActor, get_actor
 from site_service.routers.source import require_site
 from site_service.storage import Storage
 
@@ -17,7 +17,7 @@ router = APIRouter(prefix="/sites/{site_id}/violations", tags=["violations"])
 DbConnection = Annotated[sqlite3.Connection, Depends(get_db)]
 # Injected like the database and the storage client, so a test substitutes a fake
 # through dependency_overrides and no test can reach llm-service or spend a key.
-ExplainerDep = Annotated[Explainer, Depends(get_explainer)]
+ActorDep = Annotated[ExplanationActor, Depends(get_actor)]
 
 
 @router.get("", response_model=ViolationListResponse)
@@ -64,35 +64,54 @@ def get_violation(site_id: str, violation_id: str, con: DbConnection, storage: S
     return violation
 
 
-@router.post("/{violation_id}/explain", response_model=ViolationResponse)
+@router.post(
+    "/{violation_id}/explain", response_model=ViolationResponse, status_code=202
+)
 def explain_violation(
     site_id: str,
     violation_id: str,
     con: DbConnection,
     storage: Storage,
-    explainer: ExplainerDep,
+    actor: ActorDep,
+    response: Response,
 ):
-    """Explain one violation, or hand back the explanation it already has.
+    """Ask for one violation to be explained, and say what state it is in now.
 
-    A POST because the first one writes and spends money. Every one after it is a
-    database read — the explanation is stored on the row and the evidence it was formed
-    from does not change, so there is nothing for a second call to improve. That makes
-    this safe to call on every page load, which is the point of it not being a GET: a
-    GET that did the same would spend the first call on a browser's prefetch.
+    202 BECAUSE NOTHING IS FINISHED. The explanation is a call to a model that thinks
+    before it answers — tens of seconds — and holding a connection open through it parks
+    a request thread and blocks whatever is waiting on the other end. So this accepts the
+    work, hands it to the actor, and returns the violation with `status` set to pending.
+    The client polls that status, on this violation or in the site's list, which already
+    carries it for every row.
 
-    Returns the same shape the detail endpoint does, so a client can POST once and
-    render the result without a second request.
+    200 WHEN THERE WAS NOTHING TO DO, which is the honest code for a violation that is
+    already explained or already pending: no work was accepted, because none was needed.
+    A client that only looks at the body cannot tell the difference and does not need to
+    — the status says which it is either way.
 
-    503 and 502 come straight from llm-service's own split and mean the same things
-    here: 503 is worth retrying, 502 is not.
+    STILL A POST, and still safe to call on every page load. The first one spends money
+    and every one after it does not: an explained violation is handed back from the row,
+    and a pending one is left alone rather than queued twice. A GET that did the same
+    would spend the first call on a browser's prefetch.
+
+    ASKING AGAIN IS THE RETRY. A violation whose explanation failed is accepted again
+    here; nothing retries on its own.
+
+    NO 503 OR 502 ANY MORE. Those mapped llm-service's own split for a caller that was
+    waiting on the answer, and there is no such caller now. A provider that is
+    unreachable or refuses lands on the row as `failed`, where the client polling finds
+    it alongside everything else it is already watching.
     """
     require_site(con, site_id)
-    try:
-        violation = service.explain_violation(con, storage, explainer, site_id, violation_id)
-    except ExplainerUnavailable as error:
-        raise HTTPException(status_code=503, detail=str(error)) from error
-    except ExplainerRefused as error:
-        raise HTTPException(status_code=502, detail=str(error)) from error
-    if violation is None:
+    accepted = service.request_explanation(con, storage, site_id, violation_id)
+    if accepted is None:
         raise HTTPException(status_code=404, detail="Violation not found")
+
+    violation, send = accepted
+    if not send:
+        response.status_code = 200
+        return violation
+    # After request_explanation, never before: it writes 'pending' first so a fast actor
+    # cannot finish and be overwritten by the status that says it has not started.
+    actor.send(Explain(site_id=site_id, violation_id=violation_id))
     return violation

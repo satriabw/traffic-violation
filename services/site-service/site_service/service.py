@@ -1,9 +1,15 @@
 import json
+import logging
 import sqlite3
 import uuid
 
 from shared import config
-from shared.db.violations import get_with_metadata, list_for_setup, set_explanation
+from shared.db.violations import (
+    get_with_metadata,
+    list_for_setup,
+    set_explanation,
+    set_explanation_status,
+)
 from shared.models.file import (
     FileCreate,
     FileResponse,
@@ -20,8 +26,13 @@ from shared.models.violation import (
     ViolationListResponse,
     ViolationMetadata,
     ViolationResponse,
+    ViolationStatus,
 )
 from shared.s3.keys import build_key
+
+from site_service.llm import ExplainerRefused, ExplainerUnavailable
+
+logger = logging.getLogger(__name__)
 
 _COLUMNS = ("id", "name", "created_at", "updated_at")
 
@@ -549,61 +560,122 @@ def _footage_fps(con: sqlite3.Connection, site_id: str, source_id: str | None) -
     return source.metadata.fps
 
 
-def explain_violation(
-    con: sqlite3.Connection, storage, explainer, site_id: str, violation_id: str
-) -> ViolationResponse | None:
-    """Explain one violation, or hand back the explanation it already has.
+def request_explanation(
+    con: sqlite3.Connection, storage, site_id: str, violation_id: str
+) -> tuple[ViolationResponse, bool] | None:
+    """Decide whether this violation needs explaining, and mark it accepted if so.
 
-    THE CACHE IS THE POINT. An explanation costs an API call and a model's thinking
+    Returns the violation and whether the caller should hand it to the actor. None when
+    there is no such violation at this site.
+
+    NOTHING HERE CALLS A MODEL. This runs on a request thread and does four reads and at
+    most one write, which is what lets the endpoint answer immediately; the call itself
+    happens in `perform_explanation` on the actor's thread.
+
+    THE CACHE IS STILL THE POINT. An explanation costs an API call and a model's thinking
     time, and the answer does not change — the evidence it was formed from is a row
-    nothing rewrites. So the second request for a violation is a database read, and so
-    is the thousandth. The gate is `explanation IS NOT NULL` rather than
+    nothing rewrites. So the second request for a violation is a database read, and so is
+    the thousandth. The gate is `explanation IS NOT NULL` rather than
     `status == 'explained'`: the column is the thing being cached, and asking about it
     directly cannot go wrong if the two ever disagree.
 
-    Nothing here locks. Two concurrent first-time requests for the same violation will
-    both call, and the second write wins — the cost is one wasted call, on a race that
-    needs two readers to open the same unexplained violation within a few seconds of
-    each other. A lock, or a row reserved before the call, is machinery this does not
-    yet earn.
+    A VIOLATION ALREADY PENDING IS NOT SENT AGAIN. It is in the mailbox or in flight, and
+    a second message would buy a duplicate model call for work already happening. This is
+    also why a client may poll this endpoint as freely as it polls the list.
 
-    NO FORCE. There is no way to ask for a re-explanation, deliberately: every caller
-    that wanted one would be spending money, and the endpoint that offers it should be
-    the one that says so. Until then an explanation is written once.
+    A FAILED ONE IS SENT AGAIN, and that is the whole retry mechanism. Nothing retries on
+    its own; asking again is what asks again. It does not contradict the no-force rule
+    below — retrying something that produced no answer is not re-explaining something
+    that did.
+
+    NO FORCE. There is still no way to ask for a violation with an explanation to be
+    explained a second time: every caller that wanted one would be spending money, and
+    the endpoint that offers it should be the one that says so.
+
+    `PENDING` IS WRITTEN BEFORE THE MESSAGE IS SENT, and the caller must keep that order.
+    Send first and a fast actor can finish and write 'explained' before this write lands,
+    leaving a completed answer buried under a status that says it is still coming. It is
+    the ordering `queue_evidence` already takes for the same reason.
     """
     row = get_with_metadata(con, violation_id)
     if row is None or row["site_id"] != site_id:
         return None
-    if row["explanation"] is not None:
-        return _row_to_violation_detail(row, storage)
+    if row["explanation"] is not None or row["status"] == ViolationStatus.PENDING.value:
+        return _row_to_violation_detail(row, storage), False
+
+    set_explanation_status(con, violation_id, ViolationStatus.PENDING)
+    # Re-read rather than patching the row in memory: the write moved `status` and
+    # `updated_at`, and a response assembled from the pre-write row would disagree with
+    # the database it just wrote.
+    violation = get_violation(con, storage, site_id, violation_id)
+    # get_violation cannot return None here — the row was just read and just written —
+    # but the type says it can, and asserting that in the caller is worse than here.
+    assert violation is not None
+    return violation, True
+
+
+def perform_explanation(
+    con: sqlite3.Connection, storage, explainer, site_id: str, violation_id: str
+) -> None:
+    """Explain one violation and write the result. What the actor's thread runs.
+
+    Everything the explainer needs is read here rather than carried on the message, so a
+    violation that waited in the mailbox is described as it is when the work starts. It
+    also keeps the metadata blob — ~13.5KB per track — out of a mailbox it would
+    otherwise sit in.
+
+    EVERY FAILURE LANDS ON THE ROW. There is no caller to raise to: this runs on a thread
+    nobody is waiting on, so an exception that escaped would be a log line and a violation
+    stuck saying 'pending' forever. Both failure modes the explainer distinguishes end up
+    the same way here, because the difference between them was about whether an HTTP
+    caller should retry, and there is no HTTP caller any more. What is worth retrying is
+    now a question the person looking at the row answers, by asking again.
+
+    A violation that vanished between being accepted and being handled writes nothing —
+    the row is gone, and there is nothing to mark.
+    """
+    row = get_with_metadata(con, violation_id)
+    if row is None or row["site_id"] != site_id:
+        logger.warning("violation %s disappeared before it could be explained", violation_id)
+        return
 
     site = get_site(con, site_id)
-    answer = explainer.explain(
-        ExplainRequest(
-            violation_type=row["type"],
-            detected_at=row["detected_at"],
-            site_name=site.name if site else site_id,
-            frame_index=row["frame_index"],
-            # So the explanation can say "2.6 seconds in" rather than naming a frame.
-            fps=_footage_fps(con, site_id, row["source_id"]),
-            # Whether there is a clip to go and look at, which is the difference between
-            # "worth pulling the footage to read the plate" being advice and being a
-            # suggestion the clerk cannot act on.
-            evidence_status=row["evidence_status"],
-            # Passed through as the id rather than a flag: the prompt withholds the
-            # motion data when this is None, because a violation judged under no
-            # calibration has no valid pixel-to-world mapping behind its numbers.
-            calibration_id=row["calibration_id"],
-            configuration=_judged_configuration(
-                con, storage, site_id, row["configuration_id"]
-            ),
-            metadata=(
-                ViolationMetadata.model_validate(row["metadata"])
-                if row["metadata"] is not None
-                else None
-            ),
-        )
+    request = ExplainRequest(
+        violation_type=row["type"],
+        detected_at=row["detected_at"],
+        site_name=site.name if site else site_id,
+        frame_index=row["frame_index"],
+        # So the explanation can say "2.6 seconds in" rather than naming a frame.
+        fps=_footage_fps(con, site_id, row["source_id"]),
+        # Whether there is a clip to go and look at, which is the difference between
+        # "worth pulling the footage to read the plate" being advice and being a
+        # suggestion the clerk cannot act on.
+        evidence_status=row["evidence_status"],
+        # Passed through as the id rather than a flag: the prompt withholds the
+        # motion data when this is None, because a violation judged under no
+        # calibration has no valid pixel-to-world mapping behind its numbers.
+        calibration_id=row["calibration_id"],
+        configuration=_judged_configuration(
+            con, storage, site_id, row["configuration_id"]
+        ),
+        metadata=(
+            ViolationMetadata.model_validate(row["metadata"])
+            if row["metadata"] is not None
+            else None
+        ),
     )
+
+    try:
+        answer = explainer.explain(request)
+    except (ExplainerUnavailable, ExplainerRefused) as error:
+        # Where a timeout arrives, too: the explainer maps httpx's RequestError — which
+        # ReadTimeout is — onto ExplainerUnavailable. A model that thought for longer
+        # than the timeout allows is indistinguishable from one that never answered, and
+        # for the person waiting they are the same thing.
+        logger.warning("explaining violation %s failed: %s", violation_id, error)
+        set_explanation_status(con, violation_id, ViolationStatus.FAILED)
+        return
+
     set_explanation(
         con,
         violation_id,
@@ -611,7 +683,4 @@ def explain_violation(
         answer.explanation.severity.value,
         answer.explanation.model_dump_json(),
     )
-    # Re-read rather than patching the row in memory: `set_explanation` also moves
-    # `status` and `updated_at`, and a response assembled from the pre-write row would
-    # disagree with the database it just wrote.
-    return get_violation(con, storage, site_id, violation_id)
+    logger.info("violation %s explained by %s", violation_id, answer.model)
