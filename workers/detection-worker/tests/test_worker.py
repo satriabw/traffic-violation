@@ -193,6 +193,21 @@ class FakeStore:
         return f"v-{len(self.saved)}"
 
 
+class FakeSourceStatus:
+    """Records the run's status transitions instead of writing them.
+
+    A list rather than a last-value, because the order is the thing being asserted: a
+    source that ends 'completed' having never said 'processing' would look identical
+    otherwise, and that is exactly the bug worth catching.
+    """
+
+    def __init__(self):
+        self.transitions: list[str] = []
+
+    def __call__(self, source_id: str, status) -> None:
+        self.transitions.append(status.value)
+
+
 def _handler(
     sign=None,
     read=None,
@@ -200,6 +215,7 @@ def _handler(
     load_context=None,
     save=None,
     queue_evidence=None,
+    set_status=None,
 ):
     return make_handler(
         # A site with neither document is the default here: these tests are about
@@ -208,6 +224,7 @@ def _handler(
         new_analyzer or _analyzers(),
         save or FakeStore(),
         queue_evidence=queue_evidence or (lambda violation_id, seconds: None),
+        set_status=set_status or (lambda source_id, status: None),
         sign=sign or (lambda key: "u"),
         read=read if read is not None else _reader_of(frame_count=0),
     )
@@ -797,3 +814,78 @@ def test_a_job_where_nothing_fired_queues_nothing():
     )(_job("job-1"))
 
     assert queued == []
+
+
+def _reader_that_fails():
+    """A reader that dies the way an expired presigned url does, mid-job."""
+
+    def read(url, frame_range):
+        raise VideoUnavailable("expired url")
+        yield  # pragma: no cover — makes this a generator, as read_frames is
+
+    return read
+
+
+# --- what the source says while a job runs -----------------------------------------
+#
+# Detection is asynchronous, so between the 202 and the first violation the site's
+# violation list is empty — and an empty list is what a site with no violations returns.
+# These three writes are the only thing that tells those apart.
+
+
+def test_a_job_that_finishes_leaves_its_source_completed():
+    status = FakeSourceStatus()
+
+    _handler(set_status=status)(_job("job-1"))
+
+    assert status.transitions == ["processing", "completed"]
+
+
+def test_processing_is_written_before_the_context_is_resolved():
+    """The first thing, before anything slow or anything that can fail.
+
+    A job that dies resolving its own calibration has still visibly started, which is
+    what stops a run that failed early from looking like one that was never asked for.
+    """
+    status = FakeSourceStatus()
+
+    def load_context(job):
+        raise RuntimeError("no calibration")
+
+    with pytest.raises(RuntimeError):
+        _handler(load_context=load_context, set_status=status)(_job("job-1"))
+
+    assert status.transitions == ["processing", "failed"]
+
+
+def test_a_job_that_raises_marks_the_source_failed_and_still_raises():
+    """The worker's contract is kept, not traded away.
+
+    A raising handler stops the process — losing a job silently is worse than stopping
+    loudly — and that is unchanged. The source records the failure on the way down so a
+    run reads as failed rather than as still running for good.
+    """
+    status = FakeSourceStatus()
+    handler = _handler(
+        read=_reader_that_fails(), set_status=status
+    )
+
+    with pytest.raises(VideoUnavailable):
+        handler(_job("job-1"))
+
+    assert status.transitions == ["processing", "failed"]
+
+
+def test_a_source_is_never_left_saying_it_is_still_being_analysed():
+    # Whatever happens to a job, the run stops claiming to be in progress. This is the
+    # property the front end depends on; the two tests above are how it is reached.
+    for build in (
+        lambda status: _handler(set_status=status),
+        lambda status: _handler(read=_reader_that_fails(), set_status=status),
+    ):
+        status = FakeSourceStatus()
+        try:
+            build(status)(_job("job-1"))
+        except Exception:
+            pass
+        assert status.transitions[-1] != "processing"
