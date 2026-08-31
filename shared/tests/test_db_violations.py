@@ -16,6 +16,9 @@ from shared.db.violations import (
 from shared.models.detection import ViolationType
 from shared.models.violation import (
     EvidenceStatus,
+    EvidenceStrength,
+    LicensePlateAssessment,
+    PlateRecoverability,
     Severity,
     TrackSummary,
     ViolationCreate,
@@ -463,11 +466,17 @@ def test_a_violation_nobody_has_explained_carries_no_explanation(con):
 def _explanation(**overrides):
     return ViolationExplanation(
         **{
-            "explanation": "Entered against a red signal.",
+            "explanation": "A vehicle drove into the junction after the signal had turned red.",
             "severity": Severity.MEDIUM,
-            "severity_basis": ["signal red for 2.6s before entry"],
-            "observations": ["cross traffic moving"],
-            "evidence_concerns": ["speeds uncalibrated"],
+            "severity_basis": ["other traffic was moving through at the time"],
+            "evidence_strength": EvidenceStrength.WEAK,
+            "evidence_basis": ["the record cannot confirm the signal was red"],
+            "license_plate": LicensePlateAssessment(
+                recoverability=PlateRecoverability.INCONCLUSIVE,
+                reasoning="The vehicle stays distant and there is no plate recognition here.",
+            ),
+            "observations": ["Several objects counted as vehicles never move at all."],
+            "evidence_concerns": ["Disregard any speed shown — the calibration is faulty."],
             "confidence": 0.6,
             **overrides,
         }
@@ -493,13 +502,19 @@ def test_an_explanation_lands_on_the_flat_columns_and_the_blob_together(con):
     _explain(con, violation_id)
 
     violation = get_with_metadata(con, violation_id)
-    assert violation["explanation"] == "Entered against a red signal."
+    assert violation["explanation"] == (
+        "A vehicle drove into the junction after the signal had turned red."
+    )
     assert violation["severity"] == "MEDIUM"
     # The whole answer survives the round trip, including the field the flat columns
     # cannot hold — which is the reason the JSON column exists.
     stored = ViolationExplanation.model_validate_json(violation["explanation_json"])
-    assert stored.evidence_concerns == ["speeds uncalibrated"]
-    assert stored.severity_basis == ["signal red for 2.6s before entry"]
+    assert stored.evidence_concerns == [
+        "Disregard any speed shown — the calibration is faulty."
+    ]
+    assert stored.evidence_strength is EvidenceStrength.WEAK
+    assert stored.license_plate is not None
+    assert stored.severity_basis == ["other traffic was moving through at the time"]
 
 
 def test_explaining_a_violation_marks_it_explained(con):
@@ -521,7 +536,9 @@ def test_the_list_renders_a_severity_without_parsing_any_json(con):
     page, _ = list_for_setup(con, "s1", None, None, limit=10, offset=0)
 
     assert page[0]["severity"] == "MEDIUM"
-    assert page[0]["explanation"] == "Entered against a red signal."
+    assert page[0]["explanation"] == (
+        "A vehicle drove into the junction after the signal had turned red."
+    )
 
 
 def test_explaining_a_violation_touches_its_updated_at(con):

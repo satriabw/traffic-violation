@@ -10,6 +10,9 @@ from shared.db.violations import record, set_evidence, set_explanation
 from shared.models.detection import ViolationType
 from shared.models.violation import (
     EvidenceStatus,
+    EvidenceStrength,
+    LicensePlateAssessment,
+    PlateRecoverability,
     Severity,
     TrackSummary,
     ViolationCreate,
@@ -253,11 +256,17 @@ def test_an_explained_violation_carries_the_whole_answer_back():
     site_id = _site()
     violation_id = _with_tracks(site_id)
     explanation = ViolationExplanation(
-        explanation="Entered against a red signal.",
+        explanation="A vehicle drove into the junction after the signal had turned red.",
         severity=Severity.MEDIUM,
-        severity_basis=["one pedestrian track on the scene"],
-        observations=["two tracks recorded"],
-        evidence_concerns=["speeds uncalibrated"],
+        severity_basis=["other traffic was moving through at the time"],
+        evidence_strength=EvidenceStrength.WEAK,
+        evidence_basis=["the record cannot confirm the signal was red; the footage can"],
+        license_plate=LicensePlateAssessment(
+            recoverability=PlateRecoverability.INCONCLUSIVE,
+            reasoning="The vehicle stays distant and there is no plate recognition here.",
+        ),
+        observations=["Several objects counted as vehicles never move at all."],
+        evidence_concerns=["Disregard any speed shown — the camera calibration is faulty."],
         confidence=0.6,
     )
     set_explanation(
@@ -271,12 +280,21 @@ def test_an_explained_violation_carries_the_whole_answer_back():
     body = _detail(site_id, violation_id).json()
 
     assert body["status"] == ViolationStatus.EXPLAINED.value
-    assert body["explanation"] == "Entered against a red signal."
+    assert body["explanation"] == (
+        "A vehicle drove into the junction after the signal had turned red."
+    )
     assert body["severity"] == "MEDIUM"
     # The field the flat columns cannot hold, parsed back into the model rather than
     # handed over as text.
-    assert body["explanation_detail"]["evidence_concerns"] == ["speeds uncalibrated"]
-    assert body["explanation_detail"]["severity_basis"] == ["one pedestrian track on the scene"]
+    assert body["explanation_detail"]["evidence_concerns"] == [
+        "Disregard any speed shown — the camera calibration is faulty."
+    ]
+    assert body["explanation_detail"]["evidence_strength"] == "WEAK"
+    assert (
+        body["explanation_detail"]["license_plate"]["recoverability"]
+        == "inconclusive"
+    )
+    assert body["explanation_detail"]["severity_basis"] == ["other traffic was moving through at the time"]
 
 
 def test_reading_a_violation_never_explains_it():

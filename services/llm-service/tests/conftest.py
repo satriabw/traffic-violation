@@ -1,7 +1,13 @@
 import pytest
 from fastapi.testclient import TestClient
 from shared import config
-from shared.models.violation import Severity, ViolationExplanation
+from shared.models.violation import (
+    EvidenceStrength,
+    LicensePlateAssessment,
+    PlateRecoverability,
+    Severity,
+    ViolationExplanation,
+)
 
 from llm_service.main import app, get_current_provider
 
@@ -20,10 +26,16 @@ class FakeProvider:
 
     def __init__(self, explanation=None, error=None):
         self.explanation = explanation or ViolationExplanation(
-            explanation="Entered against a red signal.",
+            explanation="A vehicle drove into the junction after the signal had turned red.",
             severity=Severity.MEDIUM,
-            severity_basis=["two other vehicle tracks present"],
-            observations=["three tracks on the scene"],
+            severity_basis=["other traffic was moving through at the time"],
+            evidence_strength=EvidenceStrength.WEAK,
+            evidence_basis=["the record cannot confirm the signal was red; the footage can"],
+            license_plate=LicensePlateAssessment(
+                recoverability=PlateRecoverability.INCONCLUSIVE,
+                reasoning="The vehicle stays distant and there is no plate recognition here.",
+            ),
+            observations=["Several objects counted as vehicles never move at all."],
             evidence_concerns=[],
             confidence=0.6,
         )

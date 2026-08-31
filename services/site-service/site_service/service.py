@@ -528,6 +528,27 @@ def _judged_configuration(
         return None
 
 
+def _footage_fps(con: sqlite3.Connection, site_id: str, source_id: str | None) -> float | None:
+    """The frame rate of the footage this violation came out of, if anything knows it.
+
+    Only so the explanation can talk in seconds instead of frame numbers — the clerk
+    reading it has a video player, not a debugger. `fps` rather than `nominal_fps`
+    deliberately: SourceMetadata keeps the two apart precisely because they disagree on
+    variable-rate footage, and the measured rate is the one that turns an index into an
+    offset.
+
+    None on every way this can fail — no source recorded, source deleted, never probed.
+    The prompt then places the event without a number, which is better than placing it
+    with one nobody can interpret.
+    """
+    if source_id is None:
+        return None
+    source = get_source(con, site_id, source_id)
+    if source is None or source.metadata is None:
+        return None
+    return source.metadata.fps
+
+
 def explain_violation(
     con: sqlite3.Connection, storage, explainer, site_id: str, violation_id: str
 ) -> ViolationResponse | None:
@@ -563,6 +584,12 @@ def explain_violation(
             detected_at=row["detected_at"],
             site_name=site.name if site else site_id,
             frame_index=row["frame_index"],
+            # So the explanation can say "2.6 seconds in" rather than naming a frame.
+            fps=_footage_fps(con, site_id, row["source_id"]),
+            # Whether there is a clip to go and look at, which is the difference between
+            # "worth pulling the footage to read the plate" being advice and being a
+            # suggestion the clerk cannot act on.
+            evidence_status=row["evidence_status"],
             # Passed through as the id rather than a flag: the prompt withholds the
             # motion data when this is None, because a violation judged under no
             # calibration has no valid pixel-to-world mapping behind its numbers.
