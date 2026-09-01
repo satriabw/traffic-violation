@@ -21,7 +21,9 @@ import logging
 from typing import Any, Callable, Iterable
 
 from shared.models.detection import DetectionJob, FrameRange
+from shared.models.source import SourceStatus
 from shared.models.violation import ViolationCreate
+from shared.db.sources import fail_processing_sources, set_source_status
 from shared.queue.client import evidence_from_config, from_config
 from shared.s3.client import presigned_get
 
@@ -39,6 +41,7 @@ def make_handler(
     new_analyzer: Callable[[DetectionJob, context.JobContext], FrameAnalyzer],
     save: Callable[[ViolationCreate], str],
     queue_evidence: Callable[[str, float], None],
+    set_status: Callable[[str, SourceStatus], None],
     sign: Callable[[str], str] = presigned_get,
     read: Callable[[str, FrameRange], Iterable[tuple[int, Any]]] = read_frames,
 ) -> Callable[[DetectionJob], None]:
@@ -57,7 +60,7 @@ def make_handler(
     database handle `save` writes through, for the same reason.
     """
 
-    def handle(job: DetectionJob) -> None:
+    def analyse(job: DetectionJob) -> None:
         # Before any decoding: resolving context is cheap and fails fast, and a job
         # naming a calibration that is not there should not first spend minutes
         # reading frames. Pinned to the versions in the message, never to whatever is
@@ -206,6 +209,36 @@ def make_handler(
             [t.value for t in job.types],
         )
 
+    def handle(job: DetectionJob) -> None:
+        """Run one job, and leave the source saying what became of it.
+
+        THE STATUS IS THE ONLY THING A USER CAN SEE WHILE THIS RUNS. Detection is
+        asynchronous, so between the 202 and the first violation the site's list is
+        empty — and an empty list is exactly what a site with no violations returns.
+        Without these three writes the two are indistinguishable, and somebody watching
+        a run in progress is told there is nothing to find.
+
+        'processing' goes first, before the context is resolved and before a frame is
+        decoded, so it appears when the worker picks the job up rather than after the
+        slowest thing it does. A job that dies resolving its own calibration has still
+        visibly started.
+
+        THE RE-RAISE KEEPS THIS WORKER'S CONTRACT. A raising handler stops the process,
+        deliberately — losing a job silently is worse than stopping loudly — and that is
+        unchanged. The only difference is that the source records the failure on its way
+        down, so the run reads as failed rather than as still running forever.
+
+        Both writes are best-effort in the sense that a process killed outright makes
+        neither. That is what the sweep in main() is for.
+        """
+        set_status(job.source.source_id, SourceStatus.PROCESSING)
+        try:
+            analyse(job)
+        except Exception:
+            set_status(job.source.source_id, SourceStatus.FAILED)
+            raise
+        set_status(job.source.source_id, SourceStatus.COMPLETED)
+
     return handle
 
 
@@ -251,6 +284,16 @@ def main() -> None:
     # one is: before the queue is consumed, so a worker that cannot reach it says so
     # rather than discovering it on the first violation of a long job.
     evidence_queue = evidence_from_config()
+    # Any source still saying 'processing' belongs to a worker that is gone: this one
+    # holds no job yet, so nothing it can see is live. The row would otherwise go on
+    # claiming an analysis is running and show a user "analysing..." for good.
+    stranded = fail_processing_sources(con)
+    if stranded:
+        logger.warning(
+            "marked %d source(s) failed: they were still being analysed when a worker "
+            "last stopped",
+            stranded,
+        )
     logger.info("detection-worker waiting for jobs")
     run(
         from_config(),
@@ -260,6 +303,7 @@ def main() -> None:
             queue_evidence=lambda violation_id, seconds: violations.queue_evidence(
                 con, evidence_queue, violation_id, seconds
             ),
+            set_status=lambda source_id, status: set_source_status(con, source_id, status),
             new_analyzer=lambda job, job_context: make_analyzer(
                 model,
                 job.source.fps,
