@@ -18,21 +18,28 @@ from llm_service.prompt import build_prompt
 
 
 def _track(track_id, first, last, *, speed=6.0, travel=0.0, width=200.0):
-    """One object's window, described by the three things the prompt actually reads.
+    """One object's window, described by the things the prompt actually reads.
 
-    `travel` is per-frame drift of the box, which is how the scene summary tells traffic
-    apart from a signal head bolted to a pole.
+    `travel` is how far the object goes across its whole life, in metres on the ground,
+    which is how the scene summary tells traffic apart from a signal head bolted to a
+    pole. The default is the signal head; `_unplaced` below is the third case, a track
+    the job never projected at all.
     """
     count = last - first + 1
+    step = travel / (count - 1) if count > 1 else 0.0
     return TrackSummary(
         track_id=track_id,
         frame_idxs=list(range(first, last + 1)),
-        bboxes=[
-            (travel * i, 100.0, travel * i + width, 250.0) for i in range(count)
-        ],
+        bboxes=[(0.0, 100.0, width, 250.0)] * count,
         speed=[speed] * count,
-        trajectory=[None] * count,
+        trajectory=[(step * i, 0.0) for i in range(count)],
     )
+
+
+def _unplaced(track_id, first, last, **kwargs):
+    """The same track on a job with no calibration: seen, but never put on the ground."""
+    track = _track(track_id, first, last, **kwargs)
+    return track.model_copy(update={"trajectory": [None] * len(track.frame_idxs)})
 
 
 def _request(**overrides):
@@ -194,6 +201,57 @@ def test_objects_that_never_move_are_separated_from_traffic():
 
     assert "Of 4 objects the camera counted as vehicles in this clip, 3 never move" in prompt
     assert "overstates how busy the junction was" in prompt
+
+
+def test_movement_is_measured_on_the_ground_rather_than_in_the_image():
+    """The reason this stopped being pixels.
+
+    A box that slides right across the frame while its ground position holds still is what
+    a mounted camera does to a fixed object it is panning past — and in the other
+    direction, a car receding down its lane crosses almost no pixels at all. Image
+    movement answers a question about the picture; the clerk is being told about the road.
+    """
+    drifting = TrackSummary(
+        track_id=2,
+        frame_idxs=list(range(160)),
+        bboxes=[(5.0 * i, 100.0, 5.0 * i + 200.0, 250.0) for i in range(160)],
+        speed=[6.0] * 160,
+        trajectory=[(11.0, 4.0)] * 160,
+    )
+    prompt = build_prompt(
+        _request(
+            metadata=ViolationMetadata(
+                vehicles=[_track(1, 0, 159, travel=20.0), drifting], violator_track_id=1
+            )
+        )
+    )
+
+    assert "Of 2 objects the camera counted as vehicles in this clip, 1 never moves" in prompt
+    assert "No other vehicle was moving through at that moment." in prompt
+
+
+def test_a_vehicle_never_placed_on_the_ground_is_not_reported_as_stopped():
+    """The gap the metres opened, and the one thing that must not fill it.
+
+    Nothing projects on a job with no calibration, so the whole scene arrives unplaced.
+    "Did not move" is then a claim about the road that this record cannot support, and it
+    is the claim that feeds the count severity is graded on.
+    """
+    vehicles = [_unplaced(1, 0, 159)] + [_unplaced(10 + i, 0, 159) for i in range(3)]
+    prompt = build_prompt(
+        _request(
+            calibration_id=None,
+            metadata=ViolationMetadata(vehicles=vehicles, violator_track_id=1),
+        )
+    )
+
+    assert "3 other vehicles were there at that moment with no position on the ground" in prompt
+    assert "cannot be said from this record" in prompt
+    assert "No other vehicle was moving through" not in prompt
+    # The static prose says "traffic that never move"; what must not appear is the
+    # counted line built from these tracks.
+    assert "never move at all" not in prompt
+    assert "upper bound on how busy the junction was" in prompt
 
 
 def test_somebody_on_foot_at_the_moment_reaches_the_model():

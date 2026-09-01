@@ -8,10 +8,14 @@ two independent arms to screen twenty-six tracks for implausible speeds; one ans
 the other seven, and the true figure is nine. A miscount lands in a document supporting
 enforcement against a real person, and nothing downstream can catch it.
 
-EVERYTHING HERE READS `bboxes` AND `frame_idxs`, NEVER `trajectory` OR `speed`, except
-where the point is to catch those two failing. Image-space pixels need no calibration, so
-they survive one being absent — `TrackSummary.trajectory` is entirely None on a job with
-no calibration — and they survive one being broken, which on this camera it is.
+MOVEMENT IS MEASURED ON THE GROUND, IN METRES, off `trajectory`. Pixels needed no
+calibration and that was their whole appeal, but they answer about the image rather than
+the road: a car receding down its lane crosses very few of them, and a near object
+shuffling in place crosses many. The projection is an estimate and this camera's is a poor
+one, but it is an estimate of the thing being asked about. Where there is no ground plane
+the answer is None and the caller says so — never a distance measured somewhere else,
+which is the hundred-fold error `TrackSummary.trajectory` warns about arriving by a
+different door.
 """
 
 from shared.models.violation import TrackSummary, ViolationMetadata
@@ -39,21 +43,25 @@ def moment(frame_index: int | None, fps: float | None) -> str:
     return f"{at:.1f} seconds into the footage"
 
 
-def travel(track: TrackSummary) -> float:
-    """How far this object's centre moved across its whole life, in the image.
+def travel(track: TrackSummary) -> float | None:
+    """How far this object moved across its whole life, on the ground, in metres.
 
-    Deliberately not a speed and deliberately not in metres: it answers "did this thing
-    move at all", which needs no calibration and survives one being broken.
+    Manhattan against the first fix — |dx| + |dy| — rather than straight-line. It costs a
+    subtraction and no square root, and it can only overstate, by at most half again on a
+    perfect diagonal, which is inside the margin `STATIC_METRES` carries anyway.
+
+    Deliberately not a speed: it answers "did this thing go anywhere", which one broken
+    frame cannot swing the way it swings a derivative.
+
+    None, never 0.0, when nothing was projected — a job with no calibration has no ground
+    plane, so every entry in `trajectory` is None. "Did not move" and "was never measured"
+    are different findings and the caller has to say different things about them.
     """
-    boxes = track.bboxes
-    if len(boxes) < 2:
-        return 0.0
-    first = ((boxes[0][0] + boxes[0][2]) / 2, (boxes[0][1] + boxes[0][3]) / 2)
-    return max(
-        (((box[0] + box[2]) / 2 - first[0]) ** 2 + ((box[1] + box[3]) / 2 - first[1]) ** 2)
-        ** 0.5
-        for box in boxes
-    )
+    fixes = [point for point in track.trajectory if point is not None]
+    if len(fixes) < 2:
+        return None
+    first = fixes[0]
+    return max(abs(x - first[0]) + abs(y - first[1]) for x, y in fixes)
 
 
 def present(track: TrackSummary, frame_index: int | None) -> bool:

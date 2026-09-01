@@ -17,7 +17,7 @@ from llm_service.constant import (
     PLATE_MARGINAL_PX,
     PLATE_RATIO,
     PLATE_READABLE_PX,
-    STATIC_PX,
+    STATIC_METRES,
 )
 
 
@@ -184,21 +184,37 @@ def scene(request: ExplainRequest) -> str:
     # Present at the moment AND actually traffic. The stationary ones are counted
     # separately below, over the whole clip rather than this instant, because what the
     # clerk needs to know about them is that the headline count is inflated.
-    moving = sum(
-        1
+    #
+    # THREE ANSWERS, NOT TWO. A vehicle nothing projected onto the ground is not a
+    # vehicle that stood still, and folding the two together turns a gap in the record
+    # into a statement about the road.
+    others_there = [
+        track
         for track in request.metadata.vehicles
         if track.track_id != request.metadata.violator_track_id
         and helper.present(track, frame_index)
-        and helper.travel(track) >= STATIC_PX
-    )
+    ]
+    distances = [helper.travel(track) for track in others_there]
+    moving = sum(1 for metres in distances if metres is not None and metres >= STATIC_METRES)
+    unplaced = sum(1 for metres in distances if metres is None)
 
     if moving:
         lines.append(
             f"  - {moving} {others}vehicle{'s were' if moving != 1 else ' was'} moving "
             "through the junction at that moment."
         )
-    else:
+    elif not unplaced:
         lines.append(f"  - No {others}vehicle was moving through at that moment.")
+
+    if unplaced:
+        many = unplaced != 1
+        lines.append(
+            f"  - {'A further ' if moving else ''}{unplaced} {others}vehicle"
+            f"{'s were' if many else ' was'} there at that moment with no position on the "
+            f"ground recorded, so whether {'they were' if many else 'it was'} moving or "
+            f"standing still cannot be said from this record. Do not read "
+            f"{'them' if many else 'it'} as stopped."
+        )
 
     on_foot = [
         track
@@ -234,9 +250,12 @@ def scene(request: ExplainRequest) -> str:
     # Signal housings and other roadside fixtures get tracked and filed as vehicles, so
     # the headline number describes the scene badly.
     total = len(request.metadata.vehicles)
-    never_moved = sum(
-        1 for track in request.metadata.vehicles if helper.travel(track) < STATIC_PX
-    )
+    measured = [
+        metres
+        for metres in (helper.travel(track) for track in request.metadata.vehicles)
+        if metres is not None
+    ]
+    never_moved = sum(1 for metres in measured if metres < STATIC_METRES)
     if never_moved:
         lines.append(
             f"  - Of {total} objects the camera counted as vehicles in this clip, "
@@ -244,6 +263,16 @@ def scene(request: ExplainRequest) -> str:
             f"{'Those are' if never_moved != 1 else 'That is'} most likely fixed "
             "roadside equipment — signal heads and the like — miscounted as traffic, so "
             "the headline vehicle count overstates how busy the junction was."
+        )
+    elif not measured:
+        # The warning still has to land. Without a ground plane the fixtures cannot be
+        # picked out of the count, which makes the count worth less, not more.
+        lines.append(
+            f"  - The camera counted {total} objects as vehicles in this clip, and "
+            "nothing in this record places any of them on the ground. Fixed roadside "
+            "equipment — signal heads and the like — gets tracked and filed as traffic "
+            "here, and none of it can be separated out, so treat that figure as an upper "
+            "bound on how busy the junction was rather than as a number of vehicles."
         )
 
     return "WHO ELSE WAS THERE, at the moment the vehicle was flagged:\n" + "\n".join(lines)
