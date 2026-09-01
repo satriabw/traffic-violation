@@ -671,14 +671,39 @@ it.
 **No item carries the metadata blob.** `violation_metadata` is a separate table so that
 a page of violations does not drag every track's trajectory along at ~13.5KB per track,
 and the thumbnail the list actually wants is a column on the row for the same reason.
-A detail endpoint serving the boxes for one violation — what a reviewer needs to draw
-over the clip — is the obvious next piece and does not exist yet.
+The boxes a reviewer needs to draw over the clip come from the detail endpoint below,
+which is the only reader that pays for them.
 
 Ordering is `detected_at DESC`, with the id breaking ties. The tiebreak is not
 decoration: one frame can fire a rule for more than one track, so violations sharing a
 `detected_at` are ordinary, and an ORDER BY they all tie on lets SQLite return them in
 any order it likes per statement — two pages read that way repeat one violation and skip
 another.
+
+### One violation, in full
+
+```
+GET /api/v1/sites/{site_id}/violations/{violation_id}
+```
+
+The same shape as a list item, plus the two things a page of them cannot afford:
+`metadata`, with every track the detector held when the rule fired, and
+`explanation_detail`, with the whole of whatever an explainer said about it.
+
+**No setup filter, unlike the list.** That one answers "what holds under the setup this
+site runs now" and hides a violation judged under a superseded calibration. This answers
+"what is this violation", and a reader holding an id is entitled to it either way — the
+row carries the ids it was judged under, so they can see for themselves which setup it
+was. A violation the list has stopped showing still resolves here.
+
+**Scoped to the site in the path.** The id is a uuid and the route is nested, so without
+the check a caller holding an id from one site could read it through another's URL. A
+mismatch is a 404, and deliberately the same 404 as an id that does not exist —
+distinguishing them would confirm the violation is real and belongs to somebody else.
+
+**Reading never explains.** The response carries whatever explanation is on the row and
+`null` when there is none. Asking for one is a POST, because it spends money and writes;
+a GET that quietly called a model would do both on a browser's prefetch.
 
 ## Which rules a job runs
 
