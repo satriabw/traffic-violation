@@ -1,9 +1,12 @@
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from shared import config
 from shared.config import API_V1_PREFIX
+from shared.db.violations import fail_pending_explanations
 
+from site_service.actor import start_actor, stop_actor
 from site_service.db import get_db, init_app_db
 from site_service.routers.calibration import router as calibration_router
 from site_service.routers.configuration import router as configuration_router
@@ -12,6 +15,8 @@ from site_service.routers.file import router as file_router
 from site_service.routers.site import router as site_router
 from site_service.routers.source import router as source_router
 from site_service.routers.violation import router as violation_router
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -27,7 +32,25 @@ async def lifespan(app: FastAPI):
             "before starting, e.g. `set -a; source .env; set +a`."
         )
     init_app_db()
+    # Anything left 'pending' belongs to a process that is gone: the actor's mailbox
+    # lives in memory, so a violation accepted but unfinished when this service last
+    # stopped has nothing to finish it. The row would otherwise promise an answer
+    # forever to whoever is polling it.
+    stranded = fail_pending_explanations(get_db())
+    if stranded:
+        logger.warning(
+            "marked %d violation(s) failed: they were still awaiting an explanation "
+            "when this service last stopped",
+            stranded,
+        )
+    # Started here rather than lazily on the first request, so the thread exists before
+    # anything can send to it and its lifetime is the app's — and so nothing can bring
+    # one into existence as a side effect of serving a request.
+    start_actor()
     yield
+    # Drains what it can rather than dropping it; whatever it cannot is what the next
+    # startup marks failed.
+    stop_actor()
 
 
 app = FastAPI(title="site-service", lifespan=lifespan)

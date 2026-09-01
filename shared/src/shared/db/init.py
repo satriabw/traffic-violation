@@ -178,9 +178,23 @@ CREATE TABLE IF NOT EXISTS traffic_violations (
     type VARCHAR NOT NULL CHECK (
         type IN ('red_light_running', 'pedestrian_right_of_way')
     ),
-    -- 'explained' is the LLM having filled in explanation and severity, which happens
-    -- on demand at read time rather than here. The worker only ever writes 'detected'.
-    status VARCHAR NOT NULL DEFAULT 'detected' CHECK (status IN ('detected', 'explained')),
+    -- HOW FAR THE EXPLANATION HAS GOT, and the only thing a client polls for it.
+    -- 'detected' is the worker's write, and the only one it ever makes. The other
+    -- three belong to site-service: 'pending' the moment a request is accepted and
+    -- handed to the explanation actor, then 'explained' or 'failed' once that actor is
+    -- done with it.
+    --
+    -- 'failed' rather than reverting to 'detected' on a failure. A violation somebody
+    -- asked about and got no answer for is not in the same state as one nobody has
+    -- opened, and a reader unable to tell them apart would show a user no trace of a
+    -- request they made and waited on.
+    --
+    -- SEPARATE FROM `evidence_status` ABOVE, which tracks the cut of the footage. The
+    -- two move independently and one enum over both would have to enumerate the
+    -- product of the two.
+    status VARCHAR NOT NULL DEFAULT 'detected' CHECK (
+        status IN ('detected', 'pending', 'explained', 'failed')
+    ),
     -- When the violation happened in the footage, not when the row was written. The
     -- two differ by however long the job sat in the queue, and only this one is
     -- meaningful to anyone looking at the video.
@@ -275,6 +289,117 @@ def _add_missing_columns(con: sqlite3.Connection) -> None:
             con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
 
+# What the widened `status` CHECK looks like once it is in place, with whitespace
+# collapsed. Matching on the *desired* state rather than the old one is what makes the
+# migration below idempotent and makes a freshly created database skip it outright.
+_WIDENED_STATUS_CHECK = "status IN ('detected', 'pending', 'explained', 'failed')"
+
+
+def _status_check_is_widened(con: sqlite3.Connection) -> bool:
+    row = con.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'traffic_violations'"
+    ).fetchone()
+    if row is None or row[0] is None:
+        # No table yet, so nothing to migrate — init_db is about to create it with the
+        # CHECK already widened.
+        return True
+    return _WIDENED_STATUS_CHECK in " ".join(row[0].split())
+
+
+def _widen_status_check(con: sqlite3.Connection) -> None:
+    """Let `status` hold 'pending' and 'failed', on a database created before it could.
+
+    THE ONLY THING IN THIS MODULE THAT IS NOT ADD COLUMN, and it is here because SQLite
+    cannot alter a CHECK constraint. Explaining a violation stopped being something that
+    happens inside the request that asked for it, so the column needs two states it was
+    never built to hold, and the constraint that was catching bad writes is also what
+    refuses the good ones now.
+
+    SQLite's own documented procedure: build the table beside the old one, copy every row
+    across by name, drop, rename. The rules it comes with are followed exactly, and each
+    one earns its line —
+
+    `foreign_keys` is toggled OUTSIDE the transaction, because the pragma is a no-op
+    inside one. With it on, dropping the old table would either fail or cascade into
+    violation_metadata, whose rows reference it; with it off, those rows are untouched
+    and end up pointing at the new table once it takes the old one's name.
+
+    Columns are copied BY NAME, never `SELECT *`. A database built by CREATE and one
+    grown by ALTER hold the same columns in different orders, and positional copying
+    would quietly transpose them — putting a clip key in a severity, on the table this
+    system exists to keep.
+
+    ADDED_COLUMNS is re-applied to the new table before anything is copied, because the
+    CREATE above does not carry all of them — `explanation_json` exists only as a
+    migration. Building from the CREATE alone would produce a table with nowhere to put
+    it, and every explanation already written would be dropped on the way across.
+
+    `foreign_key_check` runs before the commit rather than after it, so a migration that
+    would orphan a row fails while the transaction can still be rolled back.
+    """
+    if _status_check_is_widened(con):
+        return
+
+    con.execute("PRAGMA foreign_keys = OFF")
+    try:
+        con.execute("BEGIN")
+        try:
+            con.execute(
+                TRAFFIC_VIOLATIONS_TABLE.replace(
+                    "traffic_violations", "traffic_violations_new", 1
+                )
+            )
+            for table, column, ddl in ADDED_COLUMNS:
+                if table == "traffic_violations":
+                    present = {
+                        row[1]
+                        for row in con.execute("PRAGMA table_info(traffic_violations_new)")
+                    }
+                    if column not in present:
+                        con.execute(
+                            f"ALTER TABLE traffic_violations_new ADD COLUMN {column} {ddl}"
+                        )
+
+            old = [row[1] for row in con.execute("PRAGMA table_info(traffic_violations)")]
+            new = {
+                row[1] for row in con.execute("PRAGMA table_info(traffic_violations_new)")
+            }
+            # The intersection, in the old table's order. Anything the old table has and
+            # the new one does not would be a column deliberately removed from the
+            # schema, and dropping it here is the only way this ever loses data — so the
+            # set is asserted rather than assumed.
+            carried = [column for column in old if column in new]
+            missing = [column for column in old if column not in new]
+            if missing:
+                raise RuntimeError(
+                    "refusing to migrate traffic_violations: the new schema has no "
+                    f"column for {', '.join(missing)}, and the data would be lost"
+                )
+
+            columns = ", ".join(carried)
+            con.execute(
+                f"INSERT INTO traffic_violations_new ({columns}) "
+                f"SELECT {columns} FROM traffic_violations"
+            )
+            con.execute("DROP TABLE traffic_violations")
+            con.execute("ALTER TABLE traffic_violations_new RENAME TO traffic_violations")
+            # DROP TABLE took the index with it.
+            con.execute(TRAFFIC_VIOLATIONS_INDEX)
+
+            broken = con.execute("PRAGMA foreign_key_check").fetchall()
+            if broken:
+                raise RuntimeError(
+                    f"refusing to migrate traffic_violations: {len(broken)} row(s) "
+                    "would be left referencing nothing"
+                )
+            con.execute("COMMIT")
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
+    finally:
+        con.execute("PRAGMA foreign_keys = ON")
+
+
 def init_db(con: sqlite3.Connection) -> None:
     # files first — every other table references it.
     con.execute(FILES_TABLE)
@@ -288,3 +413,6 @@ def init_db(con: sqlite3.Connection) -> None:
     # After every CREATE, so a fresh database has the tables to inspect and finds
     # nothing missing. An existing one picks up whatever it was built before.
     _add_missing_columns(con)
+    # And after that, never before: the rebuild copies whatever columns the table has,
+    # so every migration that adds one has to have run first or its data is left behind.
+    _widen_status_check(con)

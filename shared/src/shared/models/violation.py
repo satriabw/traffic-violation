@@ -16,11 +16,36 @@ from shared.models.detection import ViolationType
 
 
 class ViolationStatus(str, Enum):
-    # Written by the worker. Everything the detector knows is already in the row.
+    """How far the explanation has got, and the only thing a client polls.
+
+    Four states rather than two, because explaining is no longer something that happens
+    inside the request that asked for it. A caller now gets an answer immediately and
+    watches this to find out what became of the work — so every outcome needs a name it
+    can be shown under, including the ones that are nobody's fault.
+
+    The shape is EvidenceStatus's, deliberately: that enum already models "somebody
+    asked, it is running, it worked, it did not" for the thumbnail and clip, and having
+    the two move in the same vocabulary is what lets a reader treat them the same way.
+    They stay separate enums because they still track different work and nothing
+    sequences them.
+    """
+
+    # Written by the worker. Everything the detector knows is already in the row, and
+    # nobody has asked for an explanation.
     DETECTED = "detected"
-    # An LLM has since filled in explanation and severity. Set at read time, on
-    # demand, by whoever asked for the detail view — never by the worker.
+    # Accepted and handed to the actor — in its mailbox, or in flight. Written before
+    # the message is sent, never after; see request_explanation.
+    PENDING = "pending"
+    # An LLM has filled in explanation and severity.
     EXPLAINED = "explained"
+    # The call failed, timed out, or died with the process that was making it. Terminal
+    # — nothing retries on its own, and a POST is how it gets asked again.
+    #
+    # Distinct from DETECTED, which it would be tempting to revert to. A violation
+    # somebody asked about and did not get an answer for is not in the same state as one
+    # nobody has opened, and a reader that could not tell them apart would show a user
+    # no trace of a request they made and waited on.
+    FAILED = "failed"
 
 
 class EvidenceStatus(str, Enum):

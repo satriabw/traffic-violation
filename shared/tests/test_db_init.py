@@ -568,3 +568,182 @@ def test_a_violation_cannot_have_two_metadata_blobs():
             "INSERT INTO violation_metadata (id, traffic_violation_id, json_blob)"
             " VALUES ('m2', 'v1', '{}')"
         )
+
+
+# --- widening the status CHECK ----------------------------------------------------
+#
+# The one migration in this module that is not ADD COLUMN. It rebuilds the table
+# violations live on, so what it must never do is lose a row, a column, or an index —
+# and each of those is worth a test of its own rather than one that checks "it ran".
+
+# The table exactly as it was before explaining became asynchronous: two statuses, and
+# no explanation_json, which arrived later as a migration. Written out rather than
+# generated so the test still describes a real historical schema after the DDL above
+# moves on again.
+_OLD_TRAFFIC_VIOLATIONS = """
+CREATE TABLE traffic_violations (
+    id VARCHAR PRIMARY KEY,
+    site_id VARCHAR NOT NULL REFERENCES sites(id),
+    source_id VARCHAR REFERENCES site_sources(id),
+    frame_index INTEGER,
+    thumbnail_key VARCHAR,
+    clip_key VARCHAR,
+    evidence_status VARCHAR CHECK (evidence_status IN ('pending', 'ready', 'failed')),
+    calibration_id VARCHAR REFERENCES camera_calibrations(id),
+    configuration_id VARCHAR REFERENCES configurations(id),
+    type VARCHAR NOT NULL CHECK (
+        type IN ('red_light_running', 'pedestrian_right_of_way')
+    ),
+    status VARCHAR NOT NULL DEFAULT 'detected' CHECK (status IN ('detected', 'explained')),
+    detected_at TIMESTAMP NOT NULL,
+    explanation VARCHAR,
+    severity VARCHAR,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+
+def _old_database():
+    """A database on the pre-async schema, with one violation and its metadata."""
+    con = get_connection(":memory:")
+    # Everything except the violations table, which is created in its older shape.
+    con.execute(init.FILES_TABLE)
+    con.execute(init.SITES_TABLE)
+    con.execute(init.SITE_SOURCES_TABLE)
+    con.execute(init.CAMERA_CALIBRATIONS_TABLE)
+    con.execute(init.CONFIGURATIONS_TABLE)
+    con.execute(_OLD_TRAFFIC_VIOLATIONS)
+    con.execute(init.TRAFFIC_VIOLATIONS_INDEX)
+    con.execute(init.VIOLATION_METADATA_TABLE)
+
+    con.execute("INSERT INTO sites (id, name) VALUES ('site-1', 'Junction 5')")
+    con.execute(
+        "INSERT INTO traffic_violations (id, site_id, type, status, detected_at, "
+        "explanation, severity) VALUES ('v-1', 'site-1', 'red_light_running', "
+        "'explained', '2026-08-21 10:00:00', 'A vehicle went through.', 'MEDIUM')"
+    )
+    con.execute(
+        "INSERT INTO violation_metadata (traffic_violation_id, json_blob) "
+        "VALUES ('v-1', '{\"vehicles\": []}')"
+    )
+    return con
+
+
+def test_an_old_database_cannot_hold_the_new_statuses():
+    # The premise. Without this the migration below could be testing nothing.
+    con = _old_database()
+
+    with pytest.raises(sqlite3.IntegrityError):
+        con.execute("UPDATE traffic_violations SET status = 'pending' WHERE id = 'v-1'")
+
+
+def test_init_db_widens_the_status_check_on_an_old_database():
+    con = _old_database()
+
+    init_db(con)
+
+    con.execute("UPDATE traffic_violations SET status = 'pending' WHERE id = 'v-1'")
+    assert con.execute(
+        "SELECT status FROM traffic_violations WHERE id = 'v-1'"
+    ).fetchone()[0] == "pending"
+
+
+def test_the_rebuild_still_rejects_a_status_nobody_defined():
+    # The constraint is widened, not dropped — it is what caught the write that started
+    # this, and a table that accepted anything would not have.
+    con = _old_database()
+    init_db(con)
+
+    with pytest.raises(sqlite3.IntegrityError):
+        con.execute("UPDATE traffic_violations SET status = 'banana' WHERE id = 'v-1'")
+
+
+def test_the_rebuild_carries_every_row_across():
+    con = _old_database()
+
+    init_db(con)
+
+    row = con.execute(
+        "SELECT id, site_id, type, status, explanation, severity FROM traffic_violations"
+    ).fetchall()
+    assert row == [
+        ("v-1", "site-1", "red_light_running", "explained", "A vehicle went through.", "MEDIUM")
+    ]
+
+
+def test_the_rebuild_keeps_columns_that_exist_only_as_migrations():
+    """explanation_json is not in the CREATE — it arrived as an ADD COLUMN.
+
+    A rebuild that copied only what the CREATE describes would silently drop every
+    explanation already stored, which is the single worst thing this migration could do.
+    """
+    con = _old_database()
+    init_db(con)
+    con.execute(
+        "UPDATE traffic_violations SET explanation_json = '{\"severity\": \"LOW\"}' "
+        "WHERE id = 'v-1'"
+    )
+
+    # Running it again is a no-op, but the assertion is that the column and its contents
+    # survive whatever init_db does to the table.
+    init_db(con)
+
+    assert con.execute(
+        "SELECT explanation_json FROM traffic_violations WHERE id = 'v-1'"
+    ).fetchone()[0] == '{"severity": "LOW"}'
+
+
+def test_the_rebuild_leaves_the_metadata_rows_pointing_at_their_violations():
+    # violation_metadata references the table being dropped and recreated. Foreign keys
+    # are off during the swap, so the check afterwards is what proves nothing was orphaned.
+    con = _old_database()
+
+    init_db(con)
+
+    assert con.execute("PRAGMA foreign_key_check").fetchall() == []
+    assert con.execute(
+        "SELECT traffic_violation_id FROM violation_metadata"
+    ).fetchall() == [("v-1",)]
+
+
+def test_the_rebuild_puts_the_index_back():
+    # DROP TABLE takes its indexes with it, and the list endpoint filters on exactly
+    # the pair this one covers.
+    con = _old_database()
+
+    init_db(con)
+
+    assert con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'index' "
+        "AND name = 'idx_traffic_violations_site_detected'"
+    ).fetchone() is not None
+
+
+def test_the_rebuild_turns_foreign_keys_back_on():
+    con = _old_database()
+
+    init_db(con)
+
+    assert con.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+
+
+def test_the_rebuild_does_not_run_twice():
+    con = _old_database()
+    init_db(con)
+    before = con.execute(
+        "SELECT sql FROM sqlite_master WHERE name = 'traffic_violations'"
+    ).fetchone()[0]
+
+    init_db(con)
+
+    after = con.execute(
+        "SELECT sql FROM sqlite_master WHERE name = 'traffic_violations'"
+    ).fetchone()[0]
+    assert before == after
+
+
+def test_a_fresh_database_needs_no_rebuild():
+    con = _fresh()
+
+    assert init._status_check_is_widened(con)
