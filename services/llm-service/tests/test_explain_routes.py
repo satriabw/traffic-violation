@@ -12,7 +12,18 @@ REQUEST = {
     "frame_index": 159,
     "calibration_id": None,
     "configuration": {"violations": ["rlr_violation"]},
-    "metadata": {"vehicles": [{"track_id": 19, "frame_idxs": [45, 159]}], "violator_track_id": 19},
+    "fps": 60.0,
+    "metadata": {
+        "vehicles": [
+            {
+                "track_id": 19,
+                "frame_idxs": [45, 159],
+                # Enough box movement to read as traffic rather than as a signal head.
+                "bboxes": [[0.0, 0.0, 200.0, 150.0], [400.0, 0.0, 600.0, 150.0]],
+            }
+        ],
+        "violator_track_id": 19,
+    },
 }
 
 
@@ -27,7 +38,12 @@ def test_explaining_a_violation_returns_the_provider_s_answer(client):
     assert response.status_code == 200
     body = response.json()
     assert body["explanation"]["severity"] == Severity.MEDIUM.value
-    assert body["explanation"]["explanation"] == "Entered against a red signal."
+    assert body["explanation"]["explanation"] == (
+        "A vehicle drove into the junction after the signal had turned red."
+    )
+    # The clerk-facing fields travel with it.
+    assert body["explanation"]["evidence_strength"] == "WEAK"
+    assert body["explanation"]["license_plate"]["recoverability"] == "inconclusive"
     # The model is reported alongside, so a stored explanation can be traced to what
     # produced it rather than to the setting that asked for it.
     assert body["model"] == "fake-model-1"
@@ -53,19 +69,21 @@ def test_a_violation_with_no_calibration_is_described_without_its_speeds(client,
     _post(client)
 
     _, prompt = provider.calls[0]
-    assert "WITHHELD" in prompt
+    assert "SPEED AND DISTANCE: unusable" in prompt
+    assert "no camera calibration set up" in prompt
     # The ban is on the conclusion rather than on a list of fields, because there is
     # always another field carrying the same information.
     assert "ban on the conclusion" in prompt
-    assert "bounding boxes included" in prompt
 
 
-def test_a_violation_judged_under_a_calibration_keeps_its_speeds(client, provider):
+def test_a_violation_judged_under_a_working_calibration_keeps_its_speeds(client, provider):
+    # Plausible speeds under a pinned calibration stay usable. The id itself does not
+    # travel: it identifies a row, and the clerk reading this cannot do anything with it.
     _post(client, {**REQUEST, "calibration_id": "cal-1"})
 
     _, prompt = provider.calls[0]
-    assert "WITHHELD" not in prompt
-    assert "cal-1" in prompt
+    assert "SPEED AND DISTANCE: available" in prompt
+    assert "cal-1" not in prompt
 
 
 def test_the_prompt_says_there_are_no_images(client, provider):
@@ -74,16 +92,21 @@ def test_the_prompt_says_there_are_no_images(client, provider):
     _post(client)
 
     _, prompt = provider.calls[0]
-    assert "There is no imagery" in prompt
+    assert "no imagery" in prompt
+    assert "must not write as though you can" in prompt
 
 
-def test_the_prompt_carries_the_scene_the_detector_recorded(client, provider):
+def test_the_prompt_carries_the_scene_without_carrying_its_identifiers(client, provider):
+    # The scene reaches the model as counts and roles. The track id and the frame index
+    # behind them do not — a clerk cannot act on either, so the model is never given the
+    # vocabulary to repeat them.
     _post(client)
 
     _, prompt = provider.calls[0]
-    assert "convicted track 19" in prompt
-    assert "Vehicles on the scene: 1" in prompt
-    assert "Pedestrians on the scene: 0" in prompt
+    assert "Nobody on foot was there at that moment." in prompt
+    assert "2.6 seconds into the footage" in prompt
+    assert "track 19" not in prompt
+    assert "159" not in prompt
 
 
 @pytest.mark.parametrize(

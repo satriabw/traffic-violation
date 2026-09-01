@@ -125,8 +125,82 @@ class Severity(str, Enum):
     HIGH = "HIGH"
 
 
+class EvidenceStrength(str, Enum):
+    """How much of the case the record itself settles, as against the detector's word.
+
+    Not the same question as `Severity`, and the two are graded independently: a clerk
+    can be looking at a serious event the record barely supports, or a trivial one it
+    establishes completely. Conflating them is the mistake this enum exists to make
+    difficult.
+
+    STRONG IS CURRENTLY UNREACHABLE, and that is a fact about the pipeline rather than
+    about any case. The detector computes the things that actually convict — which
+    signal governed the lane, when it turned red, which crossing somebody was standing
+    in — and keeps none of them; see `violation_detector.context` beside
+    `Violation`, which carries a type, a track id and a frame. Until that changes, no
+    explanation can confirm the element the offence turns on, and the honest ceiling is
+    MEDIUM. The band is defined anyway because the fix is a schema change rather than a
+    redesign, and a reviewer reading MEDIUM everywhere deserves to know it is the system
+    talking and not their case.
+    """
+
+    # The record establishes the offence on its own terms.
+    STRONG = "STRONG"
+    # Consistent with the flag, with something load-bearing taken on trust.
+    MEDIUM = "MEDIUM"
+    # The record cannot get past the detector's assertion; the footage has to settle it.
+    WEAK = "WEAK"
+
+
+class PlateRecoverability(str, Enum):
+    """What could still be done about the plate — never what it says.
+
+    There is no plate anywhere in this system: no ANPR, no OCR, no column, nothing that
+    ever reads one. So this is a routing judgement for whoever picks the violation up,
+    and the three values are three different next actions rather than three degrees of
+    legibility.
+
+    A ten-arm study put this under deliberate pressure — "the case is held up", "partial
+    reads are useful" — and got thirteen refusals out of thirteen. The guard is cheap and
+    the thing it guards against is naming an innocent registered owner off a fabricated
+    read, so it stays.
+    """
+
+    # Worth putting through recognition, if recognition ever exists here.
+    ANPR_RERUN = "anpr_rerun"
+    # Worth pulling the footage and reading by eye.
+    MANUAL_READ = "manual_read"
+    # Nothing in the record settles it either way.
+    INCONCLUSIVE = "inconclusive"
+
+
+class LicensePlateAssessment(BaseModel):
+    """Whether the plate is worth chasing, and why."""
+
+    recoverability: PlateRecoverability
+    # WRITTEN FOR THE PERSON REVIEWING THE CASE, which rules out the measurements it
+    # would be natural to quote. "Small and distant in frame" is the finding; the pixel
+    # width behind it is how the finding was reached and belongs nowhere near a clerk.
+    reasoning: str
+
+
 class ViolationExplanation(BaseModel):
-    """What an explainer returns for one violation.
+    """A note to the clerk who has to decide what happens to one violation.
+
+    NOT A REPORT ABOUT THE RECORD, which is what it used to be and why it read like a
+    machine describing its own input. The reader is a person who will approve the
+    violation, reject it, hold it, or send it back for reprocessing, and who is looking
+    at footage while they do. Everything here is written for them.
+
+    THE CONTRACT ON EVERY STRING FIELD BELOW: no track ids, no frame indices, no pixel
+    measurements. A clerk does not know what a track id is and should not have to; the
+    row already carries `id`, `source_id` and `frame_index` for the supervisor auditing
+    the decision afterwards, so nothing is lost by keeping them out of the prose. The
+    enforcement is upstream rather than here — the prompt is not given the identifiers
+    in the first place, because a vocabulary the model never sees is one it cannot use.
+
+    Times, not frames. The source's frame rate turns one into the other, and seconds are
+    what somebody scrubbing a clip actually needs.
 
     Stored whole in `traffic_violations.explanation_json`, with `explanation` and
     `severity` also copied onto their own columns — those two are what the list
@@ -139,6 +213,11 @@ class ViolationExplanation(BaseModel):
     # that entered legally and was still clearing the junction produces a row that
     # looks exactly like a real violation, and an explainer given no way to say "this
     # one does not stand" will write a fluent account of something that did not happen.
+    #
+    # ONLY AN ACTIVE CONTRADICTION FLIPS THIS. Something the record merely fails to
+    # settle lowers `evidence_strength` and says so; it is not a rejection, because
+    # rejecting is the clerk's to do and "we cannot tell from here" is not the same
+    # statement as "this did not happen".
     flag_sustained: bool = True
     explanation: str
     severity: Severity
@@ -147,12 +226,35 @@ class ViolationExplanation(BaseModel):
     # reviewer overturning a severity wants the two or three facts that decided it, not
     # everything the explainer happened to notice.
     severity_basis: list[str] = Field(default_factory=list)
+    # HOW MUCH OF THIS THE RECORD ITSELF SETTLES, which is the first thing a clerk wants
+    # and the thing the old shape had nowhere to put.
+    #
+    # None means an explanation written before this field existed, never a grade the
+    # explainer declined to give — the same thing None means on `calibration_id` and
+    # `evidence_status`. It has to default, because `explanation_json` is parsed straight
+    # back into this model and rows explained under the old shape are still read.
+    evidence_strength: EvidenceStrength | None = None
+    # The two or three things carrying that band, in the clerk's terms: what the footage
+    # would have to settle, what the record already establishes.
+    evidence_basis: list[str] = Field(default_factory=list)
+    # None on an explanation written before this existed, and on one where nothing about
+    # the plate could be assessed at all.
+    license_plate: LicensePlateAssessment | None = None
+    # ANYTHING ELSE WORTH THE CLERK'S ATTENTION, and the bar is high on purpose: a line
+    # earns its place only if a clerk could not get it by reading the file themselves.
+    # A count is not a finding. Two facts that mean something once connected — objects
+    # counted as traffic that never move, a person detected for a twentieth of a second
+    # — are exactly what this is for.
     observations: list[str] = Field(default_factory=list)
-    # WHAT THE EXPLAINER DID NOT TRUST, and the field that earns the JSON column. An
-    # explainer handed a speed derived through a calibration the violation never had
-    # will notice it is impossible; with nowhere to record that, the doubt either
-    # disappears from the record or, worse, silently grades the severity. Empty means
-    # nothing looked wrong — not that nothing was checked.
+    # WHAT NOT TO TRUST, phrased as what to do about it. An explainer handed speeds
+    # derived through a calibration that is producing hundreds of km/h will notice they
+    # are impossible; with nowhere to record that, the doubt either disappears from the
+    # record or, worse, silently grades the severity. Empty means nothing looked wrong —
+    # not that nothing was checked.
+    #
+    # The mechanism stays out. "Ignore any speed on this record, the camera's distance
+    # calibration is faulty" is the useful sentence; how many tracks failed which
+    # threshold is how that was worked out, and is not the clerk's problem.
     evidence_concerns: list[str] = Field(default_factory=list)
     confidence: float = Field(ge=0.0, le=1.0)
 

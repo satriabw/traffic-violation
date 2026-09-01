@@ -15,6 +15,9 @@ from shared.db.violations import record
 from shared.models.detection import ViolationType
 from shared.models.explanation import ExplainResponse
 from shared.models.violation import (
+    EvidenceStrength,
+    LicensePlateAssessment,
+    PlateRecoverability,
     Severity,
     TrackSummary,
     ViolationCreate,
@@ -48,11 +51,17 @@ class FakeExplainer:
         self.error = error
         self.requests = []
         self.answer = ViolationExplanation(
-            explanation="Entered against a red signal.",
+            explanation="A vehicle drove into the junction after the signal had turned red.",
             severity=Severity.MEDIUM,
-            severity_basis=["one pedestrian track on the scene"],
-            observations=["two tracks recorded"],
-            evidence_concerns=["speeds uncalibrated"],
+            severity_basis=["other traffic was moving through at the time"],
+            evidence_strength=EvidenceStrength.WEAK,
+            evidence_basis=["the record cannot confirm the signal was red; the footage can"],
+            license_plate=LicensePlateAssessment(
+                recoverability=PlateRecoverability.INCONCLUSIVE,
+                reasoning="The vehicle stays distant and there is no plate recognition here.",
+            ),
+            observations=["Several objects counted as vehicles never move at all."],
+            evidence_concerns=["Disregard any speed shown — the camera calibration is faulty."],
             confidence=0.6,
         )
 
@@ -130,11 +139,21 @@ def test_explaining_an_unexplained_violation_calls_the_explainer_and_stores_it(e
     assert response.status_code == 200
     assert explainer.calls == 1
     body = response.json()
-    assert body["explanation"] == "Entered against a red signal."
+    assert body["explanation"] == (
+        "A vehicle drove into the junction after the signal had turned red."
+    )
     assert body["severity"] == Severity.MEDIUM.value
     assert body["status"] == ViolationStatus.EXPLAINED.value
     # The whole answer, not just the two flat fields.
-    assert body["explanation_detail"]["evidence_concerns"] == ["speeds uncalibrated"]
+    assert body["explanation_detail"]["evidence_concerns"] == [
+        "Disregard any speed shown — the camera calibration is faulty."
+    ]
+    # The clerk-facing additions survive the round trip through the stored blob.
+    assert body["explanation_detail"]["evidence_strength"] == "WEAK"
+    assert (
+        body["explanation_detail"]["license_plate"]["recoverability"]
+        == "inconclusive"
+    )
 
 
 def test_a_second_request_reads_the_database_instead_of_calling_again(explainer):
