@@ -91,6 +91,35 @@ EVIDENCE_CUT_TIMEOUT_SECONDS = float(os.environ.get("EVIDENCE_CUT_TIMEOUT_SECOND
 VIDEO_PROBE_TIMEOUT_SECONDS = float(os.environ.get("VIDEO_PROBE_TIMEOUT_SECONDS", "20"))
 
 
+# --- Explanation ----------------------------------------------------------
+# llm-service turns one violation into an explanation. Its own service rather than a
+# module inside site-service because the provider behind it is going to change and the
+# thing that changes should be swappable on its own — and because an API call that can
+# take a minute does not belong in the same process as the endpoints that have to stay
+# responsive.
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+
+# Which provider llm-service loads. One value today; the point of the setting is that
+# adding a second means a file in llm_service.providers and a new string here, not a
+# change to anything that calls it.
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "claude")
+LLM_MODEL = os.environ.get("LLM_MODEL", "claude-opus-5")
+
+# Where site-service finds llm-service. The compose service name, because that is the
+# only place it is reachable from: llm-service publishes no port — see docker-compose.
+LLM_SERVICE_URL = os.environ.get("LLM_SERVICE_URL", "http://llm-service:8002").rstrip("/")
+
+# A shared secret, sent by site-service and checked by llm-service. Not defence against
+# an attacker inside the network so much as a statement of who the caller is meant to
+# be: unpublishing the port keeps the service off the host, and this keeps it from
+# answering anything else on the compose network that happens to find it.
+LLM_SERVICE_TOKEN = os.environ.get("LLM_SERVICE_TOKEN", "")
+
+# How long site-service waits on one explanation. Generous, because the model thinks
+# before it answers and the whole call is one round trip that either lands or does not.
+LLM_TIMEOUT_SECONDS = float(os.environ.get("LLM_TIMEOUT_SECONDS", "120"))
+
+
 def missing_s3_settings() -> list[str]:
     """Names of the object-storage settings that have no value.
 
@@ -105,6 +134,27 @@ def missing_s3_settings() -> list[str]:
             ("S3_BUCKET", S3_BUCKET),
             ("S3_ACCESS_KEY_ID", S3_ACCESS_KEY_ID),
             ("S3_SECRET_ACCESS_KEY", S3_SECRET_ACCESS_KEY),
+        )
+        if not value
+    ]
+
+
+def missing_llm_settings() -> list[str]:
+    """Names of the explanation settings that have no value.
+
+    The same shape as missing_s3_settings, and read by llm-service at startup for the
+    same reason: a key that is missing should stop the service on the way up with the
+    name of what is missing, not surface as a 401 from the provider on the first
+    violation somebody asks about.
+
+    LLM_MODEL and LLM_PROVIDER have working defaults and do not appear. LLM_SERVICE_URL
+    is site-service's setting, not this one's.
+    """
+    return [
+        name
+        for name, value in (
+            ("ANTHROPIC_API_KEY", ANTHROPIC_API_KEY),
+            ("LLM_SERVICE_TOKEN", LLM_SERVICE_TOKEN),
         )
         if not value
     ]
