@@ -17,28 +17,41 @@
 # No ffmpeg apt package here, unlike the API image: the worker never shells out to
 # ffprobe. It opens video through cv2.VideoCapture, and the opencv-python-headless
 # wheel carries its own ffmpeg libraries.
-FROM python:3.11-slim AS cpu
+FROM python:3.11-slim-bookworm AS cpu-builder
 
 WORKDIR /repo
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 
+# Each package its own layer, in dependency order, so a change to detection-worker
+# doesn't reinstall the three packages underneath it.
 COPY shared/ shared/
+RUN pip install --no-cache-dir ./shared
 COPY packages/trajectory-collector/ packages/trajectory-collector/
+RUN pip install --no-cache-dir ./packages/trajectory-collector
 COPY packages/violation-detector/ packages/violation-detector/
+RUN pip install --no-cache-dir ./packages/violation-detector
 COPY packages/evidence-collector/ packages/evidence-collector/
+RUN pip install --no-cache-dir ./packages/evidence-collector
 COPY workers/detection-worker/ workers/detection-worker/
-
-# One invocation, so `shared` and `trajectory-collector` resolve from the local
-# directories rather than being looked for on PyPI.
-RUN pip install --no-cache-dir \
-        ./shared ./packages/trajectory-collector ./packages/violation-detector \
-        ./packages/evidence-collector \
-        ./workers/detection-worker
+RUN pip install --no-cache-dir ./workers/detection-worker
 
 # Fail the build rather than the first job. An image whose cv2 cannot load its shared
 # libraries looks perfectly healthy until a worker has already claimed work.
 RUN python -c "import cv2, onnxruntime, supervision, trajectory_collector, violation_detector"
 
-ENV PYTHONUNBUFFERED=1
+
+FROM python:3.11-slim-bookworm AS cpu
+
+RUN useradd --create-home --uid 1000 appuser
+WORKDIR /repo
+
+COPY --from=cpu-builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1
+
+USER appuser
+
 CMD ["python", "-m", "detection_worker.worker"]
 
 
@@ -47,7 +60,7 @@ CMD ["python", "-m", "detection_worker.worker"]
 # CUDA's minor-version compatibility with a newer runtime. The `runtime` flavour
 # (not `base`) is what carries cuBLAS, cuFFT and cuRAND, which the CUDA execution
 # provider loads alongside cuDNN.
-FROM nvidia/cuda:12.2.2-runtime-ubuntu22.04 AS gpu
+FROM nvidia/cuda:12.2.2-runtime-ubuntu22.04 AS gpu-builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -59,11 +72,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends software-properties-common gnupg \
     && add-apt-repository -y ppa:deadsnakes/ppa \
     && apt-get update \
-    && apt-get install -y --no-install-recommends \
-        python3.11 python3.11-venv \
-        # cv2 links libgthread even in the headless build, which the CUDA images do
-        # not carry.
-        libglib2.0-0 \
+    && apt-get install -y --no-install-recommends python3.11 python3.11-venv \
     && rm -rf /var/lib/apt/lists/*
 
 # A venv, purely so the site-packages path is one predictable string: LD_LIBRARY_PATH
@@ -76,15 +85,15 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 WORKDIR /repo
 
 COPY shared/ shared/
+RUN pip install --no-cache-dir ./shared
 COPY packages/trajectory-collector/ packages/trajectory-collector/
+RUN pip install --no-cache-dir ./packages/trajectory-collector
 COPY packages/violation-detector/ packages/violation-detector/
+RUN pip install --no-cache-dir ./packages/violation-detector
 COPY packages/evidence-collector/ packages/evidence-collector/
+RUN pip install --no-cache-dir ./packages/evidence-collector
 COPY workers/detection-worker/ workers/detection-worker/
-
-RUN pip install --no-cache-dir \
-        ./shared ./packages/trajectory-collector ./packages/violation-detector \
-        ./packages/evidence-collector \
-        ./workers/detection-worker
+RUN pip install --no-cache-dir ./workers/detection-worker
 
 # onnxruntime-gpu replaces onnxruntime rather than joining it. Both distributions
 # install the same `onnxruntime` package directory, so having the two in one
@@ -125,11 +134,37 @@ providers = ort.get_available_providers(); \
 assert 'CUDAExecutionProvider' in providers, providers; \
 print('providers:', providers)"
 
-ENV PYTHONUNBUFFERED=1
 
-# The reason this image exists. Overridable per environment, and the CPU entry stays
-# in the list so a worker whose GPU has gone missing keeps working slowly rather than
-# refusing to start — the same ordering shared/config.py documents.
-ENV DETECTION_MODEL_PROVIDERS="CUDAExecutionProvider,CPUExecutionProvider"
+FROM nvidia/cuda:12.2.2-runtime-ubuntu22.04 AS gpu
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# The apt repo config and signing key come from the builder rather than from
+# add-apt-repository again, so the final image never needs
+# software-properties-common — nothing here adds a repo, only installs a package
+# from one already on disk.
+COPY --from=gpu-builder /etc/apt/sources.list.d/ /etc/apt/sources.list.d/
+COPY --from=gpu-builder /etc/apt/trusted.gpg.d/ /etc/apt/trusted.gpg.d/
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        python3.11 \
+        # cv2 links libgthread even in the headless build, which the CUDA images do
+        # not carry.
+        libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd --create-home --uid 1000 appuser
+WORKDIR /repo
+
+COPY --from=gpu-builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    LD_LIBRARY_PATH="/opt/venv/lib/python3.11/site-packages/nvidia/cudnn/lib:/opt/venv/lib/python3.11/site-packages/nvidia/cublas/lib:${LD_LIBRARY_PATH}" \
+    # The reason this image exists. Overridable per environment, and the CPU entry
+    # stays in the list so a worker whose GPU has gone missing keeps working slowly
+    # rather than refusing to start — the same ordering shared/config.py documents.
+    DETECTION_MODEL_PROVIDERS="CUDAExecutionProvider,CPUExecutionProvider"
+
+USER appuser
 
 CMD ["python", "-m", "detection_worker.worker"]

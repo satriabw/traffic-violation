@@ -3,8 +3,29 @@
 # directory, so the context has to be the repository.
 #
 #   docker build -f docker/api.Dockerfile -t traffic-violation-api .
-#
-FROM python:3.11-slim
+
+FROM python:3.11-slim-bookworm AS builder
+
+WORKDIR /repo
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# shared and site-service installed in separate layers, so a change to one doesn't
+# invalidate the other's cache. Not editable: this image runs on its own — development
+# gets the working tree back through a bind mount and PYTHONPATH instead, see
+# docker-compose.yml.
+COPY shared/ shared/
+RUN pip install --no-cache-dir ./shared
+
+COPY services/site-service/ services/site-service/
+RUN pip install --no-cache-dir ./services/site-service \
+    # uvicorn --reload needs a file watcher and refuses to start without one. Only
+    # the compose dev override uses it; it lives here so that override needs no
+    # second image.
+    watchfiles
+
+
+FROM python:3.11-slim-bookworm
 
 # ffprobe, and only for that: creating a video source shells out to it to read the
 # object's header, and without it the endpoint returns 502. `ffmpeg` is the package
@@ -17,23 +38,16 @@ RUN apt-get update \
 # The same path compose bind-mounts the repo at, so an installed copy and a mounted
 # one never disagree about where the repo root is. Relative settings like
 # TRAFFIC_DB_PATH's `./data` default resolve against it exactly as they do on the host.
+RUN useradd --create-home --uid 1000 appuser \
+    && mkdir -p /repo \
+    && chown appuser:appuser /repo
 WORKDIR /repo
 
-# Both distributions, in one pip invocation so `shared` resolves from the local
-# directory rather than being looked for on PyPI. Not editable: the image is meant to
-# run on its own, and development gets the working tree back through a bind mount and
-# PYTHONPATH instead — see docker-compose.yml.
-COPY shared/ shared/
-COPY services/site-service/ services/site-service/
-RUN pip install --no-cache-dir ./shared ./services/site-service \
-    # uvicorn --reload needs a file watcher, and refuses to start without one. Only
-    # the compose command uses it; it is here so the dev override does not need a
-    # second image.
-    watchfiles
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1
 
-# Unbuffered, because the interesting output of a container is its log and a buffered
-# stream shows up minutes late — or not at all, if the process is killed.
-ENV PYTHONUNBUFFERED=1
+USER appuser
 
 # 0.0.0.0 inside the container is not a network exposure decision: the container has
 # its own stack, and what it is reachable from is the publish address in
