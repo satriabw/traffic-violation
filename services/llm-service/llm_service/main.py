@@ -10,6 +10,7 @@ this service will happily explain the same violation twice, because it has no wa
 know it is the same one and no business having one.
 """
 
+import logging
 from contextlib import asynccontextmanager
 from typing import Annotated
 
@@ -17,10 +18,28 @@ import anthropic
 from fastapi import Depends, FastAPI, Header, HTTPException
 from shared import config
 from shared.config import API_V1_PREFIX
+from shared.logging import configure_logging
 from shared.models.explanation import ExplainRequest, ExplainResponse
 
 from llm_service import prompt as prompt_builder
 from llm_service.providers import Provider, get_provider
+
+# The name this service is known by, in the logs and in its own OpenAPI document.
+SERVICE_NAME = "llm-service"
+
+configure_logging(SERVICE_NAME, config.LOG_LEVEL)
+logger = logging.getLogger(__name__)
+
+# One constant per provider failure branch, rather than the message written inline at
+# the call site. A log message is read by whoever is on call — it is what a saved
+# search or an alert on "the explanation provider is down" matches — so it is defined
+# once here, and the tests assert on these constants rather than on their text.
+# Rewording one is then a change to a name with known readers, not a string edit that
+# quietly stops matching.
+PROVIDER_RATE_LIMITED = "explanation provider rate limited"
+PROVIDER_UNREACHABLE = "cannot reach explanation provider"
+PROVIDER_UNAVAILABLE = "explanation provider unavailable"
+PROVIDER_REJECTED = "explanation provider rejected the request"
 
 # Built once at startup rather than per request: constructing a provider means
 # constructing an HTTP client, and doing that per violation would throw away
@@ -71,7 +90,7 @@ def get_current_provider() -> Provider:
     return _provider
 
 
-app = FastAPI(title="llm-service", lifespan=lifespan)
+app = FastAPI(title=SERVICE_NAME, lifespan=lifespan)
 
 
 @app.post(
@@ -92,16 +111,23 @@ def explain(
     the SDK already does, and a second layer of it would multiply the wait a caller
     is holding a connection open through.
     """
+    # violation_type and site_name only, never a violation/site id — see
+    # shared.models.explanation.ExplainRequest on why this service is never given one.
+    log_context = {"violation_type": request.violation_type, "site_name": request.site_name}
     text = prompt_builder.build_prompt(request)
     try:
         explanation = provider.explain(prompt_builder.SYSTEM, text)
     except anthropic.RateLimitError as error:
+        logger.warning(PROVIDER_RATE_LIMITED, exc_info=True, extra=log_context)
         raise HTTPException(status_code=503, detail="Explanation provider is rate limited") from error
     except anthropic.APIConnectionError as error:
+        logger.warning(PROVIDER_UNREACHABLE, exc_info=True, extra=log_context)
         raise HTTPException(status_code=503, detail="Cannot reach the explanation provider") from error
     except anthropic.APIStatusError as error:
         if error.status_code >= 500:
+            logger.warning(PROVIDER_UNAVAILABLE, exc_info=True, extra=log_context)
             raise HTTPException(status_code=503, detail="Explanation provider is unavailable") from error
+        logger.warning(PROVIDER_REJECTED, exc_info=True, extra=log_context)
         raise HTTPException(
             status_code=502, detail=f"Explanation provider rejected the request: {error.message}"
         ) from error

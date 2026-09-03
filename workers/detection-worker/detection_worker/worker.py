@@ -20,10 +20,12 @@ Everything here is per-job. Per-frame work lives in `detection_worker.analysis`.
 import logging
 from typing import Any, Callable, Iterable
 
+from shared import config
 from shared.models.detection import DetectionJob, FrameRange
 from shared.models.source import SourceStatus
 from shared.models.violation import ViolationCreate
 from shared.db.sources import fail_processing_sources, set_source_status
+from shared.logging import configure_logging
 from shared.queue.client import evidence_from_config, from_config
 from shared.s3.client import presigned_get
 
@@ -32,6 +34,10 @@ from detection_worker.analysis.frame_analyzer import FrameAnalyzer, make_analyze
 from detection_worker.db import get_db
 from detection_worker.detection.model import from_config as model_from_config
 from detection_worker.video.reader import read_frames
+
+# The name this worker is known by, in the logs and in the line it prints on the
+# way up. Defined once so the two cannot drift apart.
+SERVICE_NAME = "detection-worker"
 
 logger = logging.getLogger(__name__)
 
@@ -270,7 +276,7 @@ def run(
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    configure_logging(SERVICE_NAME, config.LOG_LEVEL)
     # Before the queue is touched, so a missing or unreadable model file stops the
     # worker while it still has no claim on any job. Loading it here is also what
     # makes it once-per-process: every analyzer the loop below builds reuses this
@@ -294,7 +300,7 @@ def main() -> None:
             "last stopped",
             stranded,
         )
-    logger.info("detection-worker waiting for jobs")
+    logger.info("%s waiting for jobs", SERVICE_NAME)
     run(
         from_config(),
         make_handler(

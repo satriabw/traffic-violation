@@ -1,7 +1,11 @@
+import logging
+
 import anthropic
 import httpx
 import pytest
 from shared.models.violation import Severity
+
+from llm_service import main
 
 TOKEN = "test-token"
 
@@ -109,40 +113,70 @@ def test_the_prompt_carries_the_scene_without_carrying_its_identifiers(client, p
     assert "159" not in prompt
 
 
-@pytest.mark.parametrize(
-    "error, expected",
-    [
-        (
-            anthropic.RateLimitError(
-                "rate limited",
-                response=httpx.Response(429, request=httpx.Request("POST", "https://x")),
-                body=None,
-            ),
-            503,
+# (what the provider raised, the status it maps to, the line it logs). One list for
+# both tests below, because a failure branch is only right when it does both.
+PROVIDER_FAILURES = [
+    (
+        anthropic.RateLimitError(
+            "rate limited",
+            response=httpx.Response(429, request=httpx.Request("POST", "https://x")),
+            body=None,
         ),
-        (anthropic.APIConnectionError(request=httpx.Request("POST", "https://x")), 503),
-        (
-            anthropic.InternalServerError(
-                "boom",
-                response=httpx.Response(500, request=httpx.Request("POST", "https://x")),
-                body=None,
-            ),
-            503,
+        503,
+        main.PROVIDER_RATE_LIMITED,
+    ),
+    (
+        anthropic.APIConnectionError(request=httpx.Request("POST", "https://x")),
+        503,
+        main.PROVIDER_UNREACHABLE,
+    ),
+    (
+        anthropic.InternalServerError(
+            "boom",
+            response=httpx.Response(500, request=httpx.Request("POST", "https://x")),
+            body=None,
         ),
-        (
-            anthropic.BadRequestError(
-                "bad",
-                response=httpx.Response(400, request=httpx.Request("POST", "https://x")),
-                body=None,
-            ),
-            502,
+        503,
+        main.PROVIDER_UNAVAILABLE,
+    ),
+    (
+        anthropic.BadRequestError(
+            "bad",
+            response=httpx.Response(400, request=httpx.Request("POST", "https://x")),
+            body=None,
         ),
-    ],
-)
-def test_provider_failures_split_into_retryable_and_not(client_for, error, expected):
+        502,
+        main.PROVIDER_REJECTED,
+    ),
+]
+
+
+@pytest.mark.parametrize("error, expected, message", PROVIDER_FAILURES)
+def test_provider_failures_split_into_retryable_and_not(client_for, error, expected, message):
     # 503 says "this will work later", 502 says "it will not". A caller that cannot
     # tell them apart either retries forever or gives up on an outage.
     assert _post(client_for(error)).status_code == expected
+
+
+@pytest.mark.parametrize("error, expected, message", PROVIDER_FAILURES)
+def test_a_provider_failure_is_logged_before_it_becomes_a_status(
+    client_for, caplog, error, expected, message
+):
+    # The caller only ever sees the status, so the log line is the only record of which
+    # provider failure it was. Asserted against the module's constants rather than
+    # against their text: an alert is pinned to the constant, and a reworded message
+    # that nothing else has to follow is then not a test failure.
+    with caplog.at_level(logging.WARNING, logger="llm_service.main"):
+        _post(client_for(error))
+
+    logged = [record for record in caplog.records if record.name == "llm_service.main"]
+    assert [record.getMessage() for record in logged] == [message]
+    # The context travels as fields, and stops at what this service is allowed to know:
+    # no violation or site id, because it is never given one.
+    assert logged[0].violation_type == "red_light_running"
+    assert logged[0].site_name == "Junction 5"
+    # exc_info=True, so what the provider actually raised reaches the line too.
+    assert logged[0].exc_info is not None
 
 
 def test_health_needs_no_token(client):

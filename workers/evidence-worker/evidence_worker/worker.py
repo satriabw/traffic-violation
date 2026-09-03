@@ -29,7 +29,9 @@ import os
 import tempfile
 from typing import Callable
 
+from shared import config
 from shared.db.violations import EvidenceTarget, evidence_target, set_evidence
+from shared.logging import configure_logging
 from shared.models.evidence import EvidenceJob
 from shared.models.violation import EvidenceStatus
 from shared.queue.client import evidence_from_config
@@ -38,6 +40,10 @@ from shared.s3.keys import build_key
 
 from evidence_worker import cut
 from evidence_worker.db import get_db
+
+# The name this worker is known by, in the logs and in the line it prints on the
+# way up. Defined once so the two cannot drift apart.
+SERVICE_NAME = "evidence-worker"
 
 logger = logging.getLogger(__name__)
 
@@ -196,11 +202,11 @@ def run(
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    configure_logging(SERVICE_NAME, config.LOG_LEVEL)
     # Before the queue is touched, so a database that is missing or has no schema stops
     # the worker while it still has no claim on any job.
     con = get_db()
-    logger.info("evidence-worker waiting for jobs")
+    logger.info("%s waiting for jobs", SERVICE_NAME)
     run(evidence_from_config(), make_handler(con))
 
 
