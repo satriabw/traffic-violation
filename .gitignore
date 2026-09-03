@@ -13,3 +13,8 @@ build/
 traffic-violation-lld-reference.md
 .env
 *.onnx
+# Local-only fix for networks that block outbound UDP/53 (Docker's build resolver
+# can't fall back to TCP the way the host can). See docker/README or ask before
+# assuming this is needed elsewhere.
+docker-compose.override.yml
+research/*
