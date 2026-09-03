@@ -12,6 +12,9 @@ Nothing here assumes where the line ends up. JSON on stdout is what every option
 without extra plumbing: GKE's node-level Cloud Logging agent auto-parses it, and it is
 exactly the input Filebeat/Fluentd expect if this ends up shipped into a self-run
 ELK/EFK stack instead.
+
+The one thing this has to do beyond installing a formatter is take the server's own
+loggers off their private handlers — see _SERVER_LOGGERS.
 """
 
 import json
@@ -47,9 +50,31 @@ class JSONFormatter(logging.Formatter):
         return json.dumps(payload, default=str)
 
 
+# The loggers that arrive already holding handlers of their own. uvicorn dictConfigs
+# these when its Config is built, which is before it imports the app module — so by the
+# time configure_logging runs they have a text formatter, a stream, and propagate=False,
+# and the request log is the one part of a service's output this formatter never sees.
+# Handing them back to the root logger is what makes a service's output one stream in
+# one shape, access lines included.
+#
+# Named explicitly rather than found by walking logging.root.manager.loggerDict: this
+# is uvicorn's published logging config, and a sweep over every configured logger would
+# also strip handlers from a library that means to have its own.
+_SERVER_LOGGERS = ("uvicorn", "uvicorn.error", "uvicorn.access")
+
+
 def configure_logging(service: str, level: str = "INFO") -> None:
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(JSONFormatter(service))
     root = logging.getLogger()
     root.handlers = [handler]
     root.setLevel(level)
+    for name in _SERVER_LOGGERS:
+        server_logger = logging.getLogger(name)
+        server_logger.handlers = []
+        server_logger.propagate = True
+        # NOTSET, not `level`: propagation consults a handler's level and the emitting
+        # logger's, never an ancestor's, so a logger left at uvicorn's own INFO would
+        # keep emitting access lines through the root handler no matter what LOG_LEVEL
+        # said. Cleared, it inherits — and LOG_LEVEL is the only knob again.
+        server_logger.setLevel(logging.NOTSET)

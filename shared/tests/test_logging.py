@@ -1,9 +1,13 @@
+import io
 import json
 import logging
+import logging.config
 import sys
 import uuid
 
-from shared.logging import JSONFormatter
+import pytest
+
+from shared.logging import JSONFormatter, configure_logging
 
 
 def _format(record: logging.LogRecord, service: str = "test-service") -> dict:
@@ -70,3 +74,95 @@ def test_a_non_json_serialisable_extra_value_does_not_raise():
     payload = _format(record)
 
     assert payload["job_id"] == str(record.job_id)
+
+
+# The shape uvicorn's own LOGGING_CONFIG leaves behind: its three loggers each holding a
+# handler, the two it configures with handlers kept off the root logger. Rebuilt here
+# rather than imported from uvicorn.config, because uvicorn is a service dependency and
+# shared/ is tested without one — the behaviour under test is a logger with a handler
+# and propagate=False, whoever put it there.
+UVICORN_LOGGING_CONFIG = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "handlers": {"default": {"class": "logging.StreamHandler"}},
+    "loggers": {
+        "uvicorn": {"handlers": ["default"], "level": "INFO", "propagate": False},
+        "uvicorn.error": {"level": "INFO"},
+        "uvicorn.access": {"handlers": ["default"], "level": "INFO", "propagate": False},
+    },
+}
+
+SERVER_LOGGERS = ["uvicorn", "uvicorn.error", "uvicorn.access"]
+
+
+@pytest.fixture
+def logging_state():
+    """Undo what configure_logging does to the process, for the tests that call it."""
+    root = logging.getLogger()
+    saved_root = (root.handlers[:], root.level)
+    saved = [(logging.getLogger(n), logging.getLogger(n).handlers[:],
+              logging.getLogger(n).propagate, logging.getLogger(n).level)
+             for n in SERVER_LOGGERS]
+    yield
+    root.handlers, root.level = saved_root
+    for logger, handlers, propagate, level in saved:
+        logger.handlers, logger.propagate, logger.level = handlers, propagate, level
+
+
+@pytest.fixture
+def configured(logging_state):
+    """Configure logging the way a service does, after uvicorn already has.
+
+    The order is the point: uvicorn builds its Config — and dictConfigs its loggers —
+    before it imports the app module, so configure_logging always runs second and has
+    to undo what it finds.
+    """
+    logging.config.dictConfig(UVICORN_LOGGING_CONFIG)
+    stream = io.StringIO()
+
+    def configure(level: str = "INFO") -> io.StringIO:
+        configure_logging("site-service", level)
+        # Point the installed handler somewhere readable: it holds sys.stdout from
+        # before capsys, and the formatter is what these tests are about, not the fd.
+        logging.getLogger().handlers[0].setStream(stream)
+        return stream
+
+    return configure
+
+
+def _lines(stream: io.StringIO) -> list[dict]:
+    return [json.loads(line) for line in stream.getvalue().splitlines()]
+
+
+def test_the_servers_own_lines_are_formatted_like_everything_else(configured):
+    # Without this the access log — the only record of what a caller actually asked for
+    # — stays plain text on uvicorn's own handler, in a stream of JSON.
+    stream = configured()
+
+    logging.getLogger("uvicorn.access").info('%s - "%s %s" %d', "127.0.0.1", "GET", "/x", 200)
+    logging.getLogger("uvicorn.error").info("Application startup complete.")
+
+    assert [line["message"] for line in _lines(stream)] == [
+        '127.0.0.1 - "GET /x" 200',
+        "Application startup complete.",
+    ]
+    # And they arrive attributed to the service, like any other line.
+    assert {line["service"] for line in _lines(stream)} == {"site-service"}
+
+
+def test_the_servers_lines_are_not_also_written_by_its_own_handler(configured):
+    configured()
+
+    assert all(logging.getLogger(name).handlers == [] for name in SERVER_LOGGERS)
+    assert all(logging.getLogger(name).propagate for name in SERVER_LOGGERS)
+
+
+def test_log_level_governs_the_servers_lines_too(configured):
+    # uvicorn pins these loggers at INFO, and propagation never consults an ancestor's
+    # level — so left alone they would go on emitting access lines under LOG_LEVEL=WARNING.
+    stream = configured("WARNING")
+
+    logging.getLogger("uvicorn.access").info('%s - "%s %s" %d', "127.0.0.1", "GET", "/x", 200)
+    logging.getLogger("uvicorn.error").warning("Invalid HTTP request received.")
+
+    assert [line["message"] for line in _lines(stream)] == ["Invalid HTTP request received."]
