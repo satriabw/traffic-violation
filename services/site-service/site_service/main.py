@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from shared import config
 from shared.config import API_V1_PREFIX
 from shared.db.violations import fail_pending_explanations
+from shared.logging import configure_logging
 
 from site_service.actor import start_actor, stop_actor
 from site_service.db import get_db, init_app_db
@@ -16,6 +17,10 @@ from site_service.routers.site import router as site_router
 from site_service.routers.source import router as source_router
 from site_service.routers.violation import router as violation_router
 
+# The name this service is known by, in the logs and in its own OpenAPI document.
+SERVICE_NAME = "site-service"
+
+configure_logging(SERVICE_NAME, config.LOG_LEVEL)
 logger = logging.getLogger(__name__)
 
 
@@ -53,7 +58,7 @@ async def lifespan(app: FastAPI):
     stop_actor()
 
 
-app = FastAPI(title="site-service", lifespan=lifespan)
+app = FastAPI(title=SERVICE_NAME, lifespan=lifespan)
 app.include_router(site_router, prefix=API_V1_PREFIX)
 app.include_router(calibration_router, prefix=API_V1_PREFIX)
 app.include_router(configuration_router, prefix=API_V1_PREFIX)

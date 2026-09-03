@@ -10,6 +10,10 @@ DB_PATH = os.environ.get("TRAFFIC_DB_PATH", "./data/traffic_violations.sqlite")
 # container name. The gateway routes on this prefix but must not rewrite it.
 API_V1_PREFIX = "/api/v1"
 
+# Passed straight to shared.logging.configure_logging. A name, not a level constant,
+# because os.environ hands back a string and logging.Logger.setLevel accepts one.
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
+
 
 # --- Object storage -------------------------------------------------------
 # Cloudflare R2 in practice, but nothing here is R2-specific: any S3-compatible
